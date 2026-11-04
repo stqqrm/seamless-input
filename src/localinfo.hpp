@@ -8,7 +8,7 @@ struct LocalAddress {
     int prefix;          // subnet prefix length, e.g. 24
 };
 
-// Non-loopback, up, IPv4 addresses of this machine.
+// Non-loopback, up, IPv4 addresses of this machine (virtual/docker interfaces skipped on Linux).
 std::vector<LocalAddress> GetLocalAddresses();
 
 // IPv4 neighbours currently in the OS ARP cache (hosts that answered on-link).

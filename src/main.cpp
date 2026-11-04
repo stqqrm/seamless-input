@@ -6,6 +6,7 @@
 #include <algorithm>
 #include <chrono>
 #include <cmath>
+#include <cstdint>
 #include <cstdio>
 #include <functional>
 #include <map>
@@ -181,10 +182,10 @@ private:
 class MainFrame : public wxFrame {
 public:
     MainFrame()
-        : wxFrame(nullptr, wxID_ANY, "Virtual Windows", wxDefaultPosition, wxSize(900, 700)),
+        : wxFrame(nullptr, wxID_ANY, "seamless-input", wxDefaultPosition, wxSize(900, 700)),
           host_(wxGetHostName())
     {
-        SetTitle("Virtual Windows - " + host_);
+        SetTitle("seamless-input - " + host_);
         local_ = GetLocalAddresses();
 
         auto* root = new wxBoxSizer(wxVERTICAL);
@@ -203,6 +204,9 @@ public:
         auto* bottom = new wxBoxSizer(wxHORIZONTAL);
 
         auto* left = new wxBoxSizer(wxVERTICAL);
+        searchLbl_ = new wxStaticText(this, wxID_ANY, "");
+        left->Add(searchLbl_, 0, wxBOTTOM, 4);
+
         list_ = new wxListCtrl(this, wxID_ANY, wxDefaultPosition, wxDefaultSize,
                                wxLC_REPORT | wxLC_SINGLE_SEL);
         list_->InsertColumn(0, "Name", wxLIST_FORMAT_LEFT, 200);
@@ -214,8 +218,10 @@ public:
         target_ = new wxTextCtrl(this, wxID_ANY, "", wxDefaultPosition, wxDefaultSize, wxTE_PROCESS_ENTER);
         target_->SetHint("target IP");
         auto* go = new wxButton(this, wxID_ANY, "Go");
+        scanBtn_ = new wxButton(this, wxID_ANY, "Scan LAN");
         row->Add(target_, 1, wxRIGHT, 6);
-        row->Add(go, 0);
+        row->Add(go, 0, wxRIGHT, 6);
+        row->Add(scanBtn_, 0);
         left->Add(row, 0, wxEXPAND | wxTOP, 6);
 
         log_ = new wxTextCtrl(this, wxID_ANY, "", wxDefaultPosition, wxDefaultSize,
@@ -230,10 +236,15 @@ public:
         list_->Bind(wxEVT_LIST_ITEM_SELECTED, &MainFrame::OnListSelected, this);
         go->Bind(wxEVT_BUTTON, [this](wxCommandEvent&) { Activate(target_->GetValue().ToStdString()); });
         target_->Bind(wxEVT_TEXT_ENTER, [this](wxCommandEvent&) { Activate(target_->GetValue().ToStdString()); });
+        scanBtn_->Bind(wxEVT_BUTTON, [this](wxCommandEvent&) { StartScan(); });
         Bind(wxEVT_CLOSE_WINDOW, &MainFrame::OnClose, this);
-        timer_.SetOwner(this);
-        Bind(wxEVT_TIMER, &MainFrame::OnTimer, this);
+
+        timer_.SetOwner(this, kTimerId);
+        Bind(wxEVT_TIMER, &MainFrame::OnTimer, this, kTimerId);
         timer_.Start(1000);
+
+        animTimer_.SetOwner(this, kAnimTimerId);
+        Bind(wxEVT_TIMER, [this](wxTimerEvent&) { ++animStep_; UpdateSearchLabel(); }, kAnimTimerId);
 
         canvas_->onPeerMoved = [this](int id, double x, double y) { SendPos(id, x, y); };
 
@@ -254,19 +265,35 @@ public:
         cb.onBeacon = [this](const std::string& ip, const std::string& host, bool server) {
             CallAfter([this, ip, host, server] { OnBeacon(ip, host, server); });
         };
+        cb.onScanHost = [this](const std::string& ip, bool server) {
+            CallAfter([this, ip, server] { OnScanHost(ip, server); });
+        };
+        cb.onHostName = [this](const std::string& ip, const std::string& name) {
+            CallAfter([this, ip, name] { OnHostName(ip, wxString::FromUTF8(name)); });
+        };
+        cb.onScanDone = [this]() { CallAfter([this] { OnScanDone(); }); };
         net_ = std::make_unique<Network>(host_.ToStdString(), std::move(cb));
 
         RebuildList();
         Log("Ready. Click an entry in the list to connect / start a server.");
         net_->Start();
+        StartScan();
         Centre();
     }
 
 private:
+    static constexpr int kTimerId     = 9000;
+    static constexpr int kAnimTimerId = 9001;
+
     struct Entry { wxString name; std::string ip; wxString status; bool local; };
     struct Discovered {
         std::string host;
         bool server;
+        std::chrono::steady_clock::time_point seen;
+    };
+    struct Scanned {
+        wxString name;
+        bool server = false;
         std::chrono::steady_clock::time_point seen;
     };
 
@@ -296,6 +323,54 @@ private:
     {
         net_->Send(id, "POS " + std::to_string(std::lround(x * 1000)) + " " +
                            std::to_string(std::lround(y * 1000)));
+    }
+
+    // ------------------------------------------------------------------- scan
+    void StartScan()
+    {
+        if (scanning_) return;
+        std::vector<std::pair<std::string, int>> nets;
+        for (const auto& a : local_) nets.emplace_back(a.ip, a.prefix);
+        if (nets.empty()) { Log("No network interface to scan"); return; }
+        scanning_ = true;
+        scanBtn_->Enable(false);
+        scanBtn_->SetLabel("Scanning...");
+        animStep_ = 0;
+        UpdateSearchLabel();
+        animTimer_.Start(300);
+        net_->Scan(nets);
+    }
+
+    void UpdateSearchLabel()
+    {
+        const int n = animStep_ % 3 + 1;
+        wxString dots = wxString("...").Left(n);
+        searchLbl_->SetLabel(wxString::Format("searching %s   (%d found)", dots, (int)scan_.size()));
+    }
+
+    void OnScanDone()
+    {
+        scanning_ = false;
+        animTimer_.Stop();
+        searchLbl_->SetLabel(wxString::Format("Scan complete: %d host(s) found", (int)scan_.size()));
+        scanBtn_->SetLabel("Scan LAN");
+        scanBtn_->Enable(true);
+    }
+
+    void OnScanHost(const std::string& ip, bool server)
+    {
+        auto& s = scan_[ip];
+        s.server = server;
+        s.seen = std::chrono::steady_clock::now();
+        RebuildList();
+    }
+
+    void OnHostName(const std::string& ip, const wxString& name)
+    {
+        auto it = scan_.find(ip);
+        if (it == scan_.end()) return;
+        it->second.name = name;
+        RebuildList();
     }
 
     // ------------------------------------------------------- network results
@@ -348,7 +423,12 @@ private:
             if (now - it->second.seen > std::chrono::seconds(7)) { it = disc_.erase(it); removed = true; }
             else ++it;
         }
+        for (auto it = scan_.begin(); it != scan_.end();) {
+            if (now - it->second.seen > std::chrono::seconds(400)) { it = scan_.erase(it); removed = true; }
+            else ++it;
+        }
         if (removed) RebuildList();
+        if (++tick_ % 120 == 0) StartScan();   // periodic rescan
     }
 
     // -------------------------------------------------------------------- GUI
@@ -359,12 +439,27 @@ private:
             return false;
         };
 
+        auto key = [](const std::string& ip) {
+            unsigned a = 0, b = 0, c = 0, d = 0;
+            std::sscanf(ip.c_str(), "%u.%u.%u.%u", &a, &b, &c, &d);
+            return (std::uint32_t)((a << 24) | (b << 16) | (c << 8) | d);
+        };
+
+        // remote hosts: scan results first, UDP beacons override (they know the real host name)
+        std::map<std::uint32_t, Entry> remote;
+        for (const auto& kv : scan_) {
+            const auto& s = kv.second;
+            remote[key(kv.first)] = {s.name.empty() ? wxString("(unknown)") : s.name, kv.first,
+                                     s.server ? "Server running" : "Online", false};
+        }
+        for (const auto& kv : disc_)
+            remote[key(kv.first)] = {wxString::FromUTF8(kv.second.host), kv.first,
+                                     kv.second.server ? "Server running" : "No server", false};
+
         entries_.clear();
         for (const auto& a : local_)
             entries_.push_back({host_ + " (" + wxString::FromUTF8(a.ifname) + ")", a.ip, "This machine", true});
-        for (const auto& kv : disc_)
-            entries_.push_back({wxString::FromUTF8(kv.second.host), kv.first,
-                                kv.second.server ? "Server running" : "No server", false});
+        for (auto& kv : remote) entries_.push_back(kv.second);
 
         rebuilding_ = true;
         list_->Freeze();
@@ -389,6 +484,7 @@ private:
     void OnClose(wxCloseEvent&)
     {
         timer_.Stop();
+        animTimer_.Stop();
         net_->Stop();   // joins the asio thread: no more callbacks after this
         Destroy();
     }
@@ -397,15 +493,22 @@ private:
     std::vector<LocalAddress> local_;
     std::vector<Entry> entries_;
     std::map<std::string, Discovered> disc_;
+    std::map<std::string, Scanned> scan_;
     std::map<int, std::string> connected_;
     std::string selectedIp_;
     bool rebuilding_ = false;
+    bool scanning_ = false;
+    int tick_ = 0;
+    int animStep_ = 0;
 
     Canvas* canvas_ = nullptr;
     wxListCtrl* list_ = nullptr;
     wxTextCtrl* target_ = nullptr;
     wxTextCtrl* log_ = nullptr;
+    wxButton* scanBtn_ = nullptr;
+    wxStaticText* searchLbl_ = nullptr;
     wxTimer timer_;
+    wxTimer animTimer_;
     std::unique_ptr<Network> net_;
 };
 

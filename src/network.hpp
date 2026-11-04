@@ -32,6 +32,7 @@ public:
     void Start();
     void Stop();
 
+    // Own address: start the server. Otherwise connect; if nobody listens, start our own server.
     void Select(const std::string& ip, bool isLocalAddress);
     void Send(int id, const std::string& line);
 

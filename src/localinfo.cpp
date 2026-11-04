@@ -76,6 +76,14 @@ std::vector<std::string> ReadArpTable()
     return out;
 }
 #else
+static bool IsVirtualInterface(const std::string& n)
+{
+    static const char* prefixes[] = {"docker", "veth", "br-", "virbr", "vboxnet", "vmnet", "lxcbr", "cni", "flannel"};
+    for (const char* p : prefixes)
+        if (n.rfind(p, 0) == 0) return true;
+    return false;
+}
+
 std::vector<LocalAddress> GetLocalAddresses()
 {
     std::vector<LocalAddress> out;
@@ -85,6 +93,7 @@ std::vector<LocalAddress> GetLocalAddresses()
     for (auto* p = ifa; p; p = p->ifa_next) {
         if (!p->ifa_addr || p->ifa_addr->sa_family != AF_INET) continue;
         if (!(p->ifa_flags & IFF_UP) || (p->ifa_flags & IFF_LOOPBACK)) continue;
+        if (IsVirtualInterface(p->ifa_name)) continue;
         auto* sin = reinterpret_cast<sockaddr_in*>(p->ifa_addr);
         char s[INET_ADDRSTRLEN];
         if (!inet_ntop(AF_INET, &sin->sin_addr, s, sizeof s)) continue;

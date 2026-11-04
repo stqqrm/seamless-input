@@ -25,18 +25,20 @@ using boost::system::error_code;
 namespace {
 
 struct SessionEvents {
-    std::function<void(int, const std::string&, const std::string&, bool)> ready;
+    // returns false to reject the session (duplicate peer)
+    std::function<bool(int, std::uint32_t, const std::string&, const std::string&, bool)> ready;
     std::function<void(int, const std::string&)> line;
     std::function<void(int, bool)> closed;
 };
 
 // One TCP connection, line based protocol:
-//   HELLO <name>
+//   HELLO <instance> <name>
 //   POS <x*1000> <y*1000>
 class Session : public std::enable_shared_from_this<Session> {
 public:
-    Session(tcp::socket sock, int id, bool incoming, std::string myName, SessionEvents ev)
-        : sock_(std::move(sock)), id_(id), incoming_(incoming),
+    Session(tcp::socket sock, int id, bool incoming, std::uint32_t myInstance,
+            std::string myName, SessionEvents ev)
+        : sock_(std::move(sock)), id_(id), incoming_(incoming), myInstance_(myInstance),
           myName_(std::move(myName)), ev_(std::move(ev)), buf_(4096) {}
 
     void Start()
@@ -45,7 +47,7 @@ public:
         sock_.set_option(tcp::no_delay(true), ec);
         auto ep = sock_.remote_endpoint(ec);
         if (!ec) addr_ = ep.address().to_string();
-        Send("HELLO " + myName_);
+        Send("HELLO " + std::to_string(myInstance_) + " " + myName_);
         DoRead();
     }
 
@@ -97,19 +99,24 @@ private:
 
     void Handle(const std::string& l)
     {
-        if (!ready_) {
-            if (l.rfind("HELLO ", 0) == 0) {
-                ready_ = true;
-                ev_.ready(id_, l.substr(6), addr_, incoming_);
-            }
-            return;   // ignore anything before the handshake
-        }
-        ev_.line(id_, l);
+        if (ready_) { ev_.line(id_, l); return; }
+
+        if (l.rfind("HELLO ", 0) != 0) return;   // ignore anything before the handshake
+        std::istringstream is(l.substr(6));
+        std::uint32_t inst = 0;
+        if (!(is >> inst) || inst == 0) return;
+        std::string name;
+        std::getline(is >> std::ws, name);
+        if (name.empty()) name = addr_;
+
+        if (!ev_.ready(id_, inst, name, addr_, incoming_)) { Close(); return; }
+        ready_ = true;
     }
 
     tcp::socket sock_;
     int id_;
     bool incoming_;
+    std::uint32_t myInstance_;
     std::string myName_;
     SessionEvents ev_;
     asio::streambuf buf_;
@@ -136,8 +143,12 @@ struct Network::Impl {
     std::array<char, 512> udpBuf{};
 
     std::map<int, std::shared_ptr<Session>> sessions;
-    std::shared_ptr<tcp::socket> pendingSock;
-    std::shared_ptr<asio::steady_timer> pendingTimer;
+    std::map<std::uint32_t, int> byInstance;            // peer instance -> session id
+    std::set<std::uint32_t> connectingInst;
+    std::set<std::string> connectingIp;
+    std::set<std::shared_ptr<tcp::socket>> connSocks;
+    std::set<std::uint32_t> knownInst;                  // peers whose beacon we have seen
+    std::map<std::uint32_t, std::chrono::steady_clock::time_point> lastTry;
 
     int nextId = 1;
     bool serverRunning = false;
@@ -150,10 +161,16 @@ struct Network::Impl {
         std::set<std::shared_ptr<tcp::socket>> socks;
         std::size_t next = 0;
         int active = 0;
+        int open = 0, refused = 0, silent = 0, other = 0;
+        std::string firstOtherErr;
     };
     std::shared_ptr<ScanState> scan;
 
-    std::uint32_t instance = std::random_device{}();
+    std::uint32_t instance = [] {
+        std::uint32_t v = 0;
+        while (v == 0) v = std::random_device{}();
+        return v;
+    }();
     std::thread th;
 
     // ---------------------------------------------------------------- helpers
@@ -162,7 +179,7 @@ struct Network::Impl {
     // ----------------------------------------------------------------- server
     void StartServer()
     {
-        if (serverRunning) { Status("Server already running"); return; }
+        if (serverRunning) return;
         error_code ec;
         tcp::endpoint ep(tcp::v4(), kTcpPort);
         acceptor.open(ep.protocol(), ec);
@@ -176,7 +193,7 @@ struct Network::Impl {
             return;
         }
         serverRunning = true;
-        Status("Server listening on TCP port " + std::to_string(kTcpPort));
+        Status("Listening on TCP port " + std::to_string(kTcpPort));
         DoAccept();
     }
 
@@ -190,37 +207,41 @@ struct Network::Impl {
     }
 
     // ----------------------------------------------------------------- client
-    void Connect(const std::string& ip)
+    // inst == 0 for a manual connect (peer id unknown until HELLO).
+    void Connect(const std::string& ip, std::uint32_t inst, bool manual)
     {
-        if (pendingSock) { Status("A connection attempt is already in progress"); return; }
+        if (connectingIp.count(ip)) { if (manual) Status("Already connecting to " + ip); return; }
         for (auto& kv : sessions)
-            if (kv.second->RemoteAddr() == ip) { Status("Already connected to " + ip); return; }
+            if (kv.second->RemoteAddr() == ip) { if (manual) Status("Already connected to " + ip); return; }
+        if (inst && (byInstance.count(inst) || connectingInst.count(inst))) return;
 
         error_code ec;
         auto addr = asio::ip::make_address(ip, ec);
         if (ec) { Status("Invalid address: " + ip); return; }
 
         Status("Connecting to " + ip + " ...");
-        pendingSock  = std::make_shared<tcp::socket>(io);
-        pendingTimer = std::make_shared<asio::steady_timer>(io, std::chrono::seconds(2));
-        auto sock  = pendingSock;
-        auto timer = pendingTimer;
+        connectingIp.insert(ip);
+        if (inst) connectingInst.insert(inst);
+
+        auto sock  = std::make_shared<tcp::socket>(io);
+        auto timer = std::make_shared<asio::steady_timer>(io, std::chrono::seconds(3));
+        connSocks.insert(sock);
 
         timer->async_wait([sock](error_code e) {
             if (!e) { error_code ig; sock->close(ig); }   // timeout -> abort connect
         });
 
-        sock->async_connect(tcp::endpoint(addr, kTcpPort), [this, ip, sock, timer](error_code e) {
+        sock->async_connect(tcp::endpoint(addr, kTcpPort), [this, ip, inst, sock, timer](error_code e) {
             timer->cancel();
-            pendingSock.reset();
-            pendingTimer.reset();
+            connSocks.erase(sock);
+            connectingIp.erase(ip);
+            if (inst) connectingInst.erase(inst);
             if (stopping) return;
             if (!e) {
                 Status("Connected to " + ip);
                 AddSession(tcp::socket(std::move(*sock)), false);
             } else {
-                Status("No server at " + ip + " (" + e.message() + ") - starting our own");
-                StartServer();
+                Status("Cannot connect to " + ip + " (" + e.message() + ")");
             }
         });
     }
@@ -229,22 +250,38 @@ struct Network::Impl {
     {
         const int id = nextId++;
         SessionEvents ev;
-        ev.ready = [this](int i, const std::string& name, const std::string& addr, bool inc) {
-            if (!stopping && cb.onPeerReady) cb.onPeerReady(i, name, addr, inc);
+        ev.ready = [this](int i, std::uint32_t inst, const std::string& name,
+                          const std::string& addr, bool inc) -> bool {
+            if (stopping) return false;
+            if (byInstance.count(inst)) {            // already linked to this peer
+                Status("Duplicate connection to " + name + " dropped");
+                return false;
+            }
+            byInstance[inst] = i;
+            if (cb.onPeerReady) cb.onPeerReady(i, name, addr, inc);
+            return true;
         };
         ev.line = [this](int i, const std::string& l) {
             if (!stopping && cb.onMessage) cb.onMessage(i, l);
         };
         ev.closed = [this](int i, bool wasReady) {
             sessions.erase(i);
+            for (auto it = byInstance.begin(); it != byInstance.end();) {
+                if (it->second == i) it = byInstance.erase(it); else ++it;
+            }
             if (!stopping && wasReady && cb.onPeerLost) cb.onPeerLost(i);
         };
-        auto session = std::make_shared<Session>(std::move(s), id, incoming, host, std::move(ev));
+        auto session = std::make_shared<Session>(std::move(s), id, incoming, instance, host, std::move(ev));
         sessions[id] = session;
         session->Start();
     }
 
     // -------------------------------------------------------------- discovery
+    std::string BeaconMsg() const
+    {
+        return "WXV1 " + std::to_string(instance) + " " + (serverRunning ? "1" : "0") + " " + host;
+    }
+
     void StartDiscovery()
     {
         error_code ec;
@@ -260,13 +297,41 @@ struct Network::Impl {
     void SendBeacon()
     {
         if (stopping || !udpSock.is_open()) return;
-        auto msg = std::make_shared<std::string>(
-            "WXV1 " + std::to_string(instance) + " " + (serverRunning ? "1" : "0") + " " + host);
+        auto msg = std::make_shared<std::string>(BeaconMsg());
         udpSock.async_send_to(asio::buffer(*msg),
                               udp::endpoint(asio::ip::address_v4::broadcast(), kDiscoveryPort),
                               [msg](error_code, std::size_t) {});
         beaconTimer.expires_after(std::chrono::seconds(2));
         beaconTimer.async_wait([this](error_code ec) { if (!ec) SendBeacon(); });
+    }
+
+    // Direct beacon to one host (works across subnets / where broadcast is blocked).
+    void SendBeaconTo(const std::string& ip)
+    {
+        if (stopping || !udpSock.is_open()) return;
+        error_code ec;
+        auto a = asio::ip::make_address(ip, ec);
+        if (ec) return;
+        auto msg = std::make_shared<std::string>(BeaconMsg());
+        udpSock.async_send_to(asio::buffer(*msg), udp::endpoint(a, kDiscoveryPort),
+                              [msg](error_code, std::size_t) {});
+    }
+
+    // A seamless-input instance announced itself. The LOWER instance id connects
+    // to the higher one, so each pair gets exactly one connection (full mesh).
+    void OnPeerBeacon(const std::string& ip, std::uint32_t id, bool srv)
+    {
+        if (knownInst.insert(id).second) SendBeaconTo(ip);   // new peer: answer directly
+        if (!srv || instance > id) return;
+        if (byInstance.count(id) || connectingInst.count(id)) return;
+
+        auto now = std::chrono::steady_clock::now();
+        auto it = lastTry.find(id);
+        if (it != lastTry.end() && now - it->second < std::chrono::seconds(10)) return;
+        lastTry[id] = now;
+
+        Status("Found seamless-input peer at " + ip + " - connecting automatically");
+        Connect(ip, id, false);
     }
 
     void DoReceive()
@@ -280,8 +345,11 @@ struct Network::Impl {
                 int srv = 0;
                 is >> magic >> id >> srv;
                 std::getline(is >> std::ws, h);
-                if (!is.fail() && magic == "WXV1" && id != instance && cb.onBeacon)
-                    cb.onBeacon(udpFrom.address().to_string(), h, srv != 0);
+                if (!is.fail() && magic == "WXV1" && id != instance) {
+                    const std::string ip = udpFrom.address().to_string();
+                    if (cb.onBeacon) cb.onBeacon(ip, h, srv != 0);
+                    OnPeerBeacon(ip, id, srv != 0);
+                }
             }
             DoReceive();
         });
@@ -302,12 +370,14 @@ struct Network::Impl {
             auto a = asio::ip::make_address_v4(n.first, ec);
             if (ec) continue;
             int prefix = n.second;
-            if (prefix > 30) continue;           // /31, /32: no hosts to scan
-            if (prefix < 22) prefix = 24;        // don't scan huge networks
+            if (prefix > 30) { Status("Skipping " + n.first + "/" + std::to_string(prefix) + " (too small)"); continue; }
+            if (prefix < 16) prefix = 16;        // allow up to a /16 (65k addresses)
             const std::uint32_t ip   = a.to_uint();
             const std::uint32_t mask = ~std::uint32_t(0) << (32 - prefix);
             const std::uint32_t net  = ip & mask;
             const std::uint32_t bc   = net | ~mask;
+            Status("Scanning " + asio::ip::address_v4(net).to_string() + "/" +
+                   std::to_string(prefix) + " (from " + n.first + ")");
             for (std::uint32_t h = net + 1; h < bc; ++h) {
                 asio::ip::address_v4 ha(h);
                 if (own.count(ha.to_string()) || !seen.insert(h).second) continue;
@@ -321,13 +391,13 @@ struct Network::Impl {
             return;
         }
         scan = st;
-        Status("Scanning " + std::to_string(st->targets.size()) + " addresses ...");
+        Status("Probing " + std::to_string(st->targets.size()) + " addresses ...");
         PumpScan(st);
     }
 
     void PumpScan(const std::shared_ptr<ScanState>& st)
     {
-        while (!stopping && st->active < 64 && st->next < st->targets.size())
+        while (!stopping && st->active < 256 && st->next < st->targets.size())
             Probe(st, st->targets[st->next++]);
         if (st->active == 0 && (stopping || st->next >= st->targets.size()))
             FinishScan(st);
@@ -337,7 +407,7 @@ struct Network::Impl {
     {
         ++st->active;
         auto sock  = std::make_shared<tcp::socket>(io);
-        auto timer = std::make_shared<asio::steady_timer>(io, std::chrono::milliseconds(1500));
+        auto timer = std::make_shared<asio::steady_timer>(io, std::chrono::milliseconds(600));
         st->socks.insert(sock);
 
         timer->async_wait([sock](error_code e) {
@@ -348,11 +418,16 @@ struct Network::Impl {
             --st->active;
             st->socks.erase(sock);
             if (!stopping) {
-                // connected  -> host up, our server is running
-                // refused    -> host up, no server
-                // anything else (timeout, unreachable) -> not reported here (ARP may still catch it)
-                if (!e || e == asio::error::connection_refused)
-                    Report(st, ep.address().to_string(), !e);
+                const std::string ip = ep.address().to_string();
+                if (!e)                                        { ++st->open;    Report(st, ip, true);  }
+                else if (e == asio::error::connection_refused) { ++st->refused; Report(st, ip, false); }
+                else if (e == asio::error::operation_aborted ||
+                         e == asio::error::host_unreachable ||
+                         e == asio::error::timed_out)          { ++st->silent; }
+                else {
+                    ++st->other;
+                    if (st->firstOtherErr.empty()) st->firstOtherErr = e.message();
+                }
             }
             error_code ig;
             sock->close(ig);
@@ -364,6 +439,7 @@ struct Network::Impl {
     {
         st->reported.insert(ip);
         if (cb.onScanHost) cb.onScanHost(ip, server);
+        SendBeaconTo(ip);   // if it runs seamless-input it will answer and the mesh forms
     }
 
     void FinishScan(const std::shared_ptr<ScanState>& st)
@@ -372,10 +448,19 @@ struct Network::Impl {
             // Firewalled hosts drop our SYN but still answered ARP.
             std::set<std::string> inScope;
             for (auto& t : st->targets) inScope.insert(t.address().to_string());
+            int viaArp = 0;
             for (auto& ip : ReadArpTable())
-                if (inScope.count(ip) && !st->reported.count(ip)) Report(st, ip, false);
+                if (inScope.count(ip) && !st->reported.count(ip)) { Report(st, ip, false); ++viaArp; }
 
-            Status("Scan finished: " + std::to_string(st->reported.size()) + " host(s) found");
+            std::string msg = "Scan finished: " + std::to_string(st->reported.size()) + " host(s) found ("
+                + std::to_string(st->open) + " with server, "
+                + std::to_string(st->refused) + " online, "
+                + std::to_string(viaArp) + " via ARP, "
+                + std::to_string(st->silent) + " silent)";
+            if (st->other)
+                msg += ", " + std::to_string(st->other) + " errors (" + st->firstOtherErr + ")";
+            Status(msg);
+
             ResolveNames({st->reported.begin(), st->reported.end()});
             if (cb.onScanDone) cb.onScanDone();
         }
@@ -410,13 +495,12 @@ struct Network::Impl {
     {
         stopping = true;
         *alive = false;
-        { error_code ig; if (scan) for (auto& s : scan->socks) s->close(ig); }
         error_code ec;
+        if (scan) for (auto& s : scan->socks) s->close(ec);
+        for (auto& s : connSocks) s->close(ec);
         acceptor.close(ec);
         udpSock.close(ec);
         beaconTimer.cancel();
-        if (pendingSock)  pendingSock->close(ec);
-        if (pendingTimer) pendingTimer->cancel();
         auto copy = sessions;
         for (auto& kv : copy) kv.second->Close();
     }
@@ -431,7 +515,10 @@ void Network::Start()
 {
     if (d_->th.joinable()) return;
     d_->th = std::thread([this] { d_->io.run(); });
-    asio::post(d_->io, [this] { d_->StartDiscovery(); });
+    asio::post(d_->io, [this] {
+        d_->StartServer();      // every instance always listens
+        d_->StartDiscovery();
+    });
 }
 
 void Network::Stop()
@@ -445,8 +532,12 @@ void Network::Stop()
 void Network::Select(const std::string& ip, bool isLocalAddress)
 {
     asio::post(d_->io, [this, ip, isLocalAddress] {
-        if (isLocalAddress) d_->StartServer();
-        else                d_->Connect(ip);
+        if (isLocalAddress) {
+            d_->StartServer();   // no-op if already listening
+            d_->Status("This machine is already listening");
+        } else {
+            d_->Connect(ip, 0, true);
+        }
     });
 }
 
