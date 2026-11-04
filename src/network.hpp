@@ -1,4 +1,5 @@
 #pragma once
+#include <cstdint>
 #include <functional>
 #include <memory>
 #include <string>
@@ -11,7 +12,9 @@ inline constexpr unsigned short kDiscoveryPort = 45455;
 // All callbacks are invoked on a non-GUI thread.
 struct NetCallbacks {
     std::function<void(const std::string& msg)> onStatus;
-    std::function<void(int id, const std::string& name, const std::string& addr, bool incoming)> onPeerReady;
+    // 'instance' is the peer's unique id (also used to identify its audio stream).
+    std::function<void(int id, std::uint32_t instance, const std::string& name,
+                       const std::string& addr, bool incoming)> onPeerReady;
     std::function<void(int id)> onPeerLost;
     std::function<void(int id, const std::string& line)> onMessage;
     // UDP discovery beacon from another instance on the LAN.
@@ -31,6 +34,8 @@ public:
 
     void Start();
     void Stop();
+
+    std::uint32_t Instance() const;   // this process' unique id
 
     // Own address: start the server. Otherwise connect; if nobody listens, start our own server.
     void Select(const std::string& ip, bool isLocalAddress);

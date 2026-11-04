@@ -258,7 +258,7 @@ struct Network::Impl {
                 return false;
             }
             byInstance[inst] = i;
-            if (cb.onPeerReady) cb.onPeerReady(i, name, addr, inc);
+            if (cb.onPeerReady) cb.onPeerReady(i, inst, name, addr, inc);
             return true;
         };
         ev.line = [this](int i, const std::string& l) {
@@ -553,3 +553,5 @@ void Network::Scan(const std::vector<std::pair<std::string, int>>& nets)
 {
     asio::post(d_->io, [this, nets] { d_->StartScan(nets); });
 }
+
+std::uint32_t Network::Instance() const { return d_->instance; }

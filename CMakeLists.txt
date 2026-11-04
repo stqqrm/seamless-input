@@ -2,11 +2,13 @@ cmake_minimum_required(VERSION 3.21)
 
 project(seamless-input
     VERSION 1.0.0
-    DESCRIPTION "Seamless input between operating systems"
+    DESCRIPTION "Seamless input sharing across LAN"
     LANGUAGES C CXX
 )
 
+# --------------------------------------------------
 # C++ configuration
+# --------------------------------------------------
 
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -16,7 +18,34 @@ if(NOT CMAKE_BUILD_TYPE AND NOT CMAKE_CONFIGURATION_TYPES)
     set(CMAKE_BUILD_TYPE Release CACHE STRING "" FORCE)
 endif()
 
+# --------------------------------------------------
+# miniaudio (single header, lives in src/miniaudio/)
+# --------------------------------------------------
+
+set(MINIAUDIO_VERSION 0.11.21)
+set(MINIAUDIO_DIR "${CMAKE_CURRENT_SOURCE_DIR}/src/miniaudio")
+
+if(NOT EXISTS "${MINIAUDIO_DIR}/miniaudio.h")
+    message(STATUS "Downloading miniaudio ${MINIAUDIO_VERSION} into src/miniaudio/ ...")
+    file(MAKE_DIRECTORY "${MINIAUDIO_DIR}")
+    file(DOWNLOAD
+        "https://raw.githubusercontent.com/mackron/miniaudio/${MINIAUDIO_VERSION}/miniaudio.h"
+        "${MINIAUDIO_DIR}/miniaudio.h"
+        STATUS _ma_status
+        TLS_VERIFY ON
+    )
+    list(GET _ma_status 0 _ma_code)
+    if(NOT _ma_code EQUAL 0)
+        file(REMOVE "${MINIAUDIO_DIR}/miniaudio.h")
+        message(FATAL_ERROR
+            "Could not download miniaudio.h (${_ma_status}). "
+            "Download it manually to ${MINIAUDIO_DIR}/miniaudio.h")
+    endif()
+endif()
+
+# --------------------------------------------------
 # FetchContent configuration
+# --------------------------------------------------
 
 include(FetchContent)
 
@@ -25,11 +54,12 @@ set(FETCHCONTENT_BASE_DIR
     CACHE PATH "" FORCE
 )
 
+# --------------------------------------------------
 # Boost (Asio only)
+# --------------------------------------------------
 
 set(BOOST_VERSION_TAG 1.86.0)
 
-# Only build/configure asio and its transitive dependencies
 set(BOOST_INCLUDE_LIBRARIES asio CACHE STRING "" FORCE)
 set(BOOST_ENABLE_MPI OFF CACHE BOOL "" FORCE)
 set(BOOST_ENABLE_PYTHON OFF CACHE BOOL "" FORCE)
@@ -40,7 +70,9 @@ FetchContent_Declare(
     DOWNLOAD_EXTRACT_TIMESTAMP TRUE
 )
 
+# --------------------------------------------------
 # wxWidgets configuration
+# --------------------------------------------------
 
 set(wxBUILD_SHARED OFF CACHE BOOL "" FORCE)
 set(wxBUILD_MONOLITHIC ON CACHE BOOL "" FORCE)
@@ -55,10 +87,11 @@ FetchContent_Declare(
     GIT_SHALLOW TRUE
 )
 
-# Fetch both dependencies
 FetchContent_MakeAvailable(Boost wxWidgets)
 
+# --------------------------------------------------
 # Resolve targets
+# --------------------------------------------------
 
 if(NOT TARGET Boost::asio)
     message(FATAL_ERROR "Boost::asio target was not created.")
@@ -80,7 +113,9 @@ message(STATUS "Using wxWidgets target(s): ${WX_TARGET}")
 
 find_package(Threads REQUIRED)
 
+# --------------------------------------------------
 # Source discovery
+# --------------------------------------------------
 
 file(GLOB_RECURSE PROJECT_SOURCES
     CONFIGURE_DEPENDS
@@ -96,12 +131,17 @@ file(GLOB_RECURSE PROJECT_HEADERS
 )
 
 if(NOT PROJECT_SOURCES)
-    message(FATAL_ERROR
-        "No source files found in src/"
-    )
+    message(FATAL_ERROR "No source files found in src/")
 endif()
 
+# miniaudio's implementation is third-party code: no warnings for that file
+set_source_files_properties("${MINIAUDIO_DIR}/miniaudio_impl.cpp" PROPERTIES
+    COMPILE_OPTIONS "$<IF:$<CXX_COMPILER_ID:MSVC>,/W0,-w>"
+)
+
+# --------------------------------------------------
 # Application target
+# --------------------------------------------------
 
 add_executable(${PROJECT_NAME}
     ${PROJECT_SOURCES}
@@ -113,7 +153,11 @@ target_include_directories(${PROJECT_NAME}
         "${CMAKE_CURRENT_SOURCE_DIR}/src"
 )
 
-# Linking
+# SYSTEM: keeps miniaudio.h's own warnings out of our build output
+target_include_directories(${PROJECT_NAME} SYSTEM
+    PRIVATE
+        "${MINIAUDIO_DIR}"
+)
 
 target_link_libraries(${PROJECT_NAME}
     PRIVATE
@@ -122,39 +166,48 @@ target_link_libraries(${PROJECT_NAME}
         Threads::Threads
 )
 
+# miniaudio loads audio backends at runtime (dlopen) on Linux/BSD
+if(UNIX AND NOT APPLE)
+    target_link_libraries(${PROJECT_NAME} PRIVATE ${CMAKE_DL_LIBS} m)
+endif()
+
+# --------------------------------------------------
 # Windows configuration
+# --------------------------------------------------
 
 if(WIN32)
     set_target_properties(${PROJECT_NAME} PROPERTIES
         WIN32_EXECUTABLE TRUE
     )
-    # Target Windows 10+ for Asio
     target_compile_definitions(${PROJECT_NAME} PRIVATE _WIN32_WINNT=0x0A00)
+    target_link_libraries(${PROJECT_NAME} PRIVATE ws2_32 mswsock iphlpapi)
 endif()
 
+# DPI awareness: without it Windows reports scaled (virtualized) monitor sizes
+if(MSVC)
+    target_sources(${PROJECT_NAME} PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/app.manifest")
+endif()
+
+# --------------------------------------------------
 # Compiler warnings
+# --------------------------------------------------
 
 if(MSVC)
-    target_compile_options(${PROJECT_NAME} PRIVATE
-        /W4
-    )
+    target_compile_options(${PROJECT_NAME} PRIVATE /W4)
 else()
-    target_compile_options(${PROJECT_NAME} PRIVATE
-        -Wall
-        -Wextra
-        -Wpedantic
-    )
+    target_compile_options(${PROJECT_NAME} PRIVATE -Wall -Wextra -Wpedantic)
 endif()
 
+# --------------------------------------------------
 # Status information
+# --------------------------------------------------
 
 message(STATUS "====================================")
 message(STATUS "Project:       ${PROJECT_NAME}")
 message(STATUS "Version:       ${PROJECT_VERSION}")
 message(STATUS "C++ Standard:  ${CMAKE_CXX_STANDARD}")
 message(STATUS "Build Type:    ${CMAKE_BUILD_TYPE}")
-message(STATUS "Build Dir:     ${CMAKE_BINARY_DIR}")
 message(STATUS "wxWidgets:     3.2.8 (${WX_TARGET})")
 message(STATUS "Boost:         ${BOOST_VERSION_TAG} (asio)")
-message(STATUS "Sources:       ${PROJECT_SOURCES}")
+message(STATUS "miniaudio:     ${MINIAUDIO_VERSION}")
 message(STATUS "====================================")
