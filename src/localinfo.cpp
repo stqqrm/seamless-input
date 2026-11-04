@@ -7,6 +7,10 @@
   #include <winsock2.h>
   #include <ws2tcpip.h>
   #include <iphlpapi.h>
+  #ifdef _MSC_VER
+    #pragma comment(lib, "iphlpapi.lib")
+    #pragma comment(lib, "ws2_32.lib")
+  #endif
 #else
   #include <arpa/inet.h>
   #include <ifaddrs.h>
