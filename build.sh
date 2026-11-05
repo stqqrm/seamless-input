@@ -48,6 +48,7 @@ install_debian() {
         libxcursor-dev \
         libxi-dev \
         libxfixes-dev \
+        libxtst-dev \
         libgl1-mesa-dev \
         libglu1-mesa-dev \
         libpng-dev \
@@ -75,6 +76,7 @@ install_arch() {
         libxcursor \
         libxi \
         libxfixes \
+        libxtst \
         mesa \
         glu \
         libpng \
@@ -102,6 +104,7 @@ install_fedora() {
         libXcursor-devel \
         libXi-devel \
         libXfixes-devel \
+        libXtst-devel \
         mesa-libGL-devel \
         mesa-libGLU-devel \
         libpng-devel \
@@ -129,6 +132,7 @@ install_opensuse() {
         libXcursor-devel \
         libXi-devel \
         libXfixes-devel \
+        libXtst-devel \
         Mesa-libGL-devel \
         Mesa-libGLU-devel \
         libpng16-devel \
@@ -234,3 +238,8 @@ echo "Project:       ${PROJECT_DIR}"
 echo "Build:         ${BUILD_DIR}"
 echo "Configuration: ${BUILD_TYPE}"
 echo "Jobs:          ${JOBS}"
+
+if [[ "${OS}" == "Linux" ]]; then
+    echo
+    echo "Wayland sessions: run ./linux-input-setup.sh once so the app may read /dev/input and use /dev/uinput."
+fi

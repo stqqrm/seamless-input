@@ -172,6 +172,25 @@ if(UNIX AND NOT APPLE)
 endif()
 
 # --------------------------------------------------
+# Keyboard / mouse sharing backends
+#   Windows : SetWindowsHookEx + SendInput   (user32, nothing to install)
+#   X11     : XInput2 + XGrab + XTest        (libX11, libXi, libXtst - optional)
+#   Wayland : evdev + uinput                 (kernel headers only)
+# --------------------------------------------------
+
+if(UNIX AND NOT APPLE)
+    find_package(X11)
+    if(TARGET X11::X11 AND TARGET X11::Xi AND TARGET X11::Xtst)
+        target_link_libraries(${PROJECT_NAME} PRIVATE X11::X11 X11::Xi X11::Xtst)
+        target_compile_definitions(${PROJECT_NAME} PRIVATE SI_HAVE_X11=1)
+        set(INPUT_X11_STATUS "yes")
+    else()
+        message(WARNING "libX11/libXi/libXtst development files not found: building WITHOUT the X11 input backend (install libxtst-dev and libxi-dev)")
+        set(INPUT_X11_STATUS "no")
+    endif()
+endif()
+
+# --------------------------------------------------
 # Windows configuration
 # --------------------------------------------------
 
@@ -210,4 +229,7 @@ message(STATUS "Build Type:    ${CMAKE_BUILD_TYPE}")
 message(STATUS "wxWidgets:     3.2.8 (${WX_TARGET})")
 message(STATUS "Boost:         ${BOOST_VERSION_TAG} (asio)")
 message(STATUS "miniaudio:     ${MINIAUDIO_VERSION}")
+if(UNIX AND NOT APPLE)
+    message(STATUS "Input:         evdev/uinput (Wayland), X11 backend: ${INPUT_X11_STATUS}")
+endif()
 message(STATUS "====================================")

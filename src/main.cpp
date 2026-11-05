@@ -14,11 +14,13 @@
 #include <functional>
 #include <map>
 #include <memory>
+#include <set>
 #include <sstream>
 #include <utility>
 #include <vector>
 
 #include "audio.hpp"
+#include "input/input.hpp"
 #include "localinfo.hpp"
 #include "network.hpp"
 
@@ -414,8 +416,14 @@ public:
                 OnPeerReady(id, inst, wxString::FromUTF8(name), addr, incoming);
             });
         };
-        cb.onPeerLost = [this](int id) { CallAfter([this, id] { OnPeerLost(id); }); };
+        cb.onPeerLost = [this](int id) {
+            if (input_) input_->RemovePeer(id);     // hand input back immediately
+            CallAfter([this, id] { OnPeerLost(id); });
+        };
         cb.onMessage = [this](int id, const std::string& line) {
+            // Keyboard/mouse traffic is injected right here on the network thread:
+            // going through the GUI event loop would add visible lag.
+            if (input_ && input_->HandleMessage(id, line)) return;
             CallAfter([this, id, line] { OnMessage(id, line); });
         };
         cb.onBeacon = [this](const std::string& ip, const std::string& host, bool server) {
@@ -435,6 +443,25 @@ public:
             std::string err;
             if (audio_->Start(&err)) Log("Audio ready (UDP " + wxString::Format("%d", (int)kAudioPort) + ")");
             else                     Log("Audio problem: " + wxString::FromUTF8(err));
+        }
+
+        input_ = std::make_unique<InputEngine>(
+            [this](int id, const std::string& line) { net_->Send(id, line); },
+            [this](const std::string& msg) { CallAfter([this, msg] { Log("Input: " + wxString::FromUTF8(msg)); }); });
+        {
+            std::vector<InputRect> rects;
+            for (const auto& m : localMons_) rects.push_back({m.x, m.y, m.width, m.height});
+            input_->SetLocalMonitors(rects);
+        }
+        input_->onModeChange = [this](InputEngine::Mode m, int id) {
+            CallAfter([this, m, id] { inputMode_ = m; inputPeer_ = id; RebuildDevices(); });
+        };
+        input_->onControlRequest = [this](int id) { CallAfter([this, id] { OnControlRequest(id); }); };
+        {
+            std::string msg;
+            if (input_->Start(&msg)) Log("Keyboard/mouse sharing ready: " + wxString::FromUTF8(input_->BackendName()));
+            else                     Log("Keyboard/mouse sharing unavailable: " + wxString::FromUTF8(msg));
+            if (!msg.empty() && input_->BackendName() != "none") Log("Input: " + wxString::FromUTF8(msg));
         }
 
         RebuildList();
@@ -516,6 +543,7 @@ private:
         devList_->InsertColumn(1, "IP address", wxLIST_FORMAT_LEFT, 130);
         devList_->InsertColumn(2, "Screens", wxLIST_FORMAT_LEFT, 260);
         devList_->InsertColumn(3, "Audio from device", wxLIST_FORMAT_LEFT, 240);
+        devList_->InsertColumn(4, "Keyboard / mouse", wxLIST_FORMAT_LEFT, 230);
         v->Add(devList_, 1, wxEXPAND | wxALL, 6);
 
         auto* row = new wxBoxSizer(wxHORIZONTAL);
@@ -535,6 +563,17 @@ private:
         row->Add(new wxStaticText(p, wxID_ANY, "Volume"), 0, wxALIGN_CENTER_VERTICAL | wxRIGHT, 6);
         row->Add(volSlider_, 0, wxALIGN_CENTER_VERTICAL);
         v->Add(row, 0, wxLEFT | wxRIGHT | wxBOTTOM, 6);
+
+        auto* irow = new wxBoxSizer(wxHORIZONTAL);
+        inputChk_ = new wxCheckBox(p, wxID_ANY, "Share keyboard && mouse");
+        inputChk_->SetValue(true);
+        inputBtn_ = new wxButton(p, wxID_ANY, "Allow / block control of this PC by selected device");
+        irow->Add(inputChk_, 0, wxALIGN_CENTER_VERTICAL | wxRIGHT, 16);
+        irow->Add(inputBtn_, 0, wxALIGN_CENTER_VERTICAL | wxRIGHT, 16);
+        irow->Add(new wxStaticText(p, wxID_ANY, "Scroll Lock returns control to this PC"), 0, wxALIGN_CENTER_VERTICAL);
+        v->Add(irow, 0, wxLEFT | wxRIGHT | wxBOTTOM, 6);
+        inputChk_->Bind(wxEVT_CHECKBOX, [this](wxCommandEvent&) { input_->SetEnabled(inputChk_->GetValue()); });
+        inputBtn_->Bind(wxEVT_BUTTON, [this](wxCommandEvent&) { ToggleSelectedAllowed(); });
 
         p->SetSizer(v);
         return p;
@@ -564,6 +603,7 @@ private:
 
     void SendPos(int id, double x, double y)
     {
+        input_->SetPeerOffset(id, x, y);
         net_->Send(id, "POS " + std::to_string(std::lround(x)) + " " + std::to_string(std::lround(y)));
     }
 
@@ -694,6 +734,12 @@ private:
             // The side that accepted the connection decides the initial layout and sends it;
             // the connecting side only places a provisional window until that POS arrives.
             auto pos = canvas_->AddPeer(id, p.name, wxString::FromUTF8(p.addr), mons, p.incoming);
+            {
+                std::vector<InputRect> rects;
+                for (const auto& m : mons) rects.push_back({m.x, m.y, m.width, m.height});
+                input_->SetPeer(id, rects, pos.first, pos.second);
+                input_->SetPeerAllowed(id, allowed_.count(p.inst) > 0);
+            }
             if (p.incoming) SendPos(id, pos.first, pos.second);
             RebuildDevices();
             return;
@@ -701,7 +747,10 @@ private:
 
         int x, y;
         if (p.placed && std::sscanf(line.c_str(), "POS %d %d", &x, &y) == 2)
+        {
             canvas_->SetPeerPos(id, -x, -y);   // mirrored: their view of us is the opposite offset
+            input_->SetPeerOffset(id, -x, -y);
+        }
     }
 
     void OnBeacon(const std::string& ip, const std::string& host, bool server)
@@ -785,8 +834,47 @@ private:
             devList_->SetItem(row, 1, wxString::FromUTF8(p.addr));
             devList_->SetItem(row, 2, ScreensText(p.mons));
             devList_->SetItem(row, 3, "no audio");
+            wxString in = allowed_.count(p.inst) ? "may control this PC" : "blocked (asks first)";
+            if (inputMode_ == InputEngine::Mode::Forwarding && inputPeer_ == kv.first) in = "YOU are controlling it";
+            if (inputMode_ == InputEngine::Mode::Controlled && inputPeer_ == kv.first) in = "controlling this PC now";
+            devList_->SetItem(row, 4, in);
         }
         devList_->Thaw();
+    }
+
+    // A peer reached its screen edge towards us: nothing happens until the user agrees.
+    void OnControlRequest(int id)
+    {
+        auto it = peers_.find(id);
+        if (it == peers_.end() || denied_.count(it->second.inst)) return;
+        const PeerInfo& p = it->second;
+        wxMessageDialog dlg(this,
+            p.name + " (" + wxString::FromUTF8(p.addr) + ") wants to control the keyboard and mouse of THIS PC.\n\n"
+            "Anything it types or clicks will happen here. Only allow PCs you own.\n\nAllow it?",
+            "Input control request", wxYES_NO | wxNO_DEFAULT | wxICON_QUESTION);
+        if (dlg.ShowModal() == wxID_YES) {
+            allowed_.insert(p.inst);
+            denied_.erase(p.inst);
+            input_->SetPeerAllowed(id, true);
+            Log("Allowed " + p.name + " to control this PC - move the cursor to its edge again");
+        } else {
+            denied_.insert(p.inst);
+            Log("Blocked input control from " + p.name);
+        }
+        RebuildDevices();
+    }
+
+    void ToggleSelectedAllowed()
+    {
+        long row = devList_->GetNextItem(-1, wxLIST_NEXT_ALL, wxLIST_STATE_SELECTED);
+        if (row < 0) return;
+        const int id = (int)devList_->GetItemData(row);
+        auto it = peers_.find(id);
+        if (it == peers_.end()) return;
+        const std::uint32_t inst = it->second.inst;
+        if (allowed_.count(inst)) { allowed_.erase(inst); denied_.insert(inst); input_->SetPeerAllowed(id, false); }
+        else                      { allowed_.insert(inst); denied_.erase(inst); input_->SetPeerAllowed(id, true); }
+        RebuildDevices();
     }
 
     void UpdateAudioStats()
@@ -819,6 +907,7 @@ private:
         timer_.Stop();
         animTimer_.Stop();
         statTimer_.Stop();
+        input_->Stop();   // return the keyboard/mouse before anything else shuts down
         audio_->Stop();
         net_->Stop();   // joins the asio thread: no more callbacks after this
         Destroy();
@@ -851,11 +940,17 @@ private:
     wxChoice* srcChoice_ = nullptr;
     wxGauge* inGauge_ = nullptr;
     wxSlider* volSlider_ = nullptr;
+    wxCheckBox* inputChk_ = nullptr;
+    wxButton* inputBtn_ = nullptr;
     wxTimer timer_;
     wxTimer animTimer_;
     wxTimer statTimer_;
     std::unique_ptr<Network> net_;
     std::unique_ptr<AudioEngine> audio_;
+    std::unique_ptr<InputEngine> input_;
+    std::set<std::uint32_t> allowed_, denied_;    // peers (by instance id) that may / may not control this PC
+    InputEngine::Mode inputMode_ = InputEngine::Mode::Local;
+    int inputPeer_ = -1;
 };
 
 class App : public wxApp {
