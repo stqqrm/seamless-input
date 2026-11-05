@@ -139,6 +139,11 @@ set_source_files_properties("${MINIAUDIO_DIR}/miniaudio_impl.cpp" PROPERTIES
     COMPILE_OPTIONS "$<IF:$<CXX_COMPILER_ID:MSVC>,/W0,-w>"
 )
 
+# Monocypher (Ed25519 machine identity, vendored in src/monocypher/) is third-party C code: no warnings either
+set_source_files_properties("${CMAKE_CURRENT_SOURCE_DIR}/src/monocypher/monocypher.c" PROPERTIES
+    COMPILE_OPTIONS "$<IF:$<C_COMPILER_ID:MSVC>,/W0,-w>"
+)
+
 # --------------------------------------------------
 # Application target
 # --------------------------------------------------

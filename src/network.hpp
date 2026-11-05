@@ -6,15 +6,19 @@
 #include <utility>
 #include <vector>
 
+#include "identity.hpp"
+
 inline constexpr unsigned short kTcpPort       = 45454;
 inline constexpr unsigned short kDiscoveryPort = 45455;
 
 // All callbacks are invoked on a non-GUI thread.
 struct NetCallbacks {
     std::function<void(const std::string& msg)> onStatus;
-    // 'instance' is the peer's unique id (also used to identify its audio stream).
-    std::function<void(int id, std::uint32_t instance, const std::string& name,
-                       const std::string& addr, bool incoming)> onPeerReady;
+    // 'instance' is the peer's per-run id (also used to identify its audio stream).
+    // 'key' is the peer's PUBLIC KEY (64 hex chars); the handshake has already proven
+    // that the peer owns the matching private key, so it is safe to use as identity.
+    std::function<void(int id, std::uint32_t instance, const std::string& key,
+                       const std::string& name, const std::string& addr, bool incoming)> onPeerReady;
     std::function<void(int id)> onPeerLost;
     std::function<void(int id, const std::string& line)> onMessage;
     // UDP discovery beacon from another instance on the LAN.
@@ -27,7 +31,7 @@ struct NetCallbacks {
 
 class Network {
 public:
-    Network(std::string hostName, NetCallbacks cb);
+    Network(std::string hostName, Identity identity, NetCallbacks cb);
     ~Network();
     Network(const Network&) = delete;
     Network& operator=(const Network&) = delete;

@@ -12,6 +12,10 @@ struct BackendSink {
     std::function<void(int x, int y, bool buttonsDown)> onLocalMotion;
     // Forwarding mode: a physical event that was swallowed locally.
     std::function<void(const InputEvent&)> onForwarded;
+    // Not forwarding: a REAL (not injected by us) mouse moved or clicked. 'weight' is
+    // the motion in device units (|dx|+|dy|), or 100 for a button press. The engine uses
+    // it to give control back to the user of a PC that is currently being controlled.
+    std::function<void(int weight)> onPhysicalInput;
 };
 
 // One implementation per platform:

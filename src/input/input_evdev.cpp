@@ -514,6 +514,7 @@ private:
             if (b < 0 || value == 2) return;
             if (value) mask_ |= (1 << b); else mask_ &= ~(1 << b);
             if (fwd_) Emit(InputKind::Button, b, value ? 1 : 0);
+            else if (value && sink_.onPhysicalInput) sink_.onPhysicalInput(100);
             return;
         }
         if (d.touchpad) {                                           // finger count
@@ -559,6 +560,7 @@ private:
                 estX_ = x;
                 estY_ = y;
                 if (sink_.onLocalMotion) sink_.onLocalMotion(x, y, mask_ != 0);
+                if (sink_.onPhysicalInput) sink_.onPhysicalInput(std::abs(ix) + std::abs(iy));
             }
         }
         if (d.wheelV || d.wheelH) {

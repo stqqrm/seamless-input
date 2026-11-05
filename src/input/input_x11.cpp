@@ -15,9 +15,13 @@
 
 #include <atomic>
 #include <bitset>
+#include <algorithm>
+#include <cmath>
 #include <cstdint>
 #include <cstdlib>
+#include <cstring>
 #include <mutex>
+#include <set>
 #include <thread>
 
 namespace {
@@ -48,11 +52,23 @@ public:
         // Raw motion = "the pointer moved", delivered without any grab.
         unsigned char mask[XIMaskLen(XI_LASTEVENT)] = {};
         XISetMask(mask, XI_RawMotion);
+        XISetMask(mask, XI_RawButtonPress);
         XIEventMask em;
         em.deviceid = XIAllMasterDevices;
         em.mask_len = (int)sizeof mask;
         em.mask = mask;
         XISelectEvents(dpy_, root_, &em, 1);
+
+        // The XTEST pointer is what OUR injection (and xdotool & co.) comes from: motion from
+        // it must not count as "the user moved the mouse".
+        {
+            int n = 0;
+            XIDeviceInfo* info = XIQueryDevice(dpy_, XIAllDevices, &n);
+            for (int i = 0; info && i < n; ++i)
+                if (info[i].use == XISlavePointer && info[i].name && std::strstr(info[i].name, "XTEST"))
+                    xtestIds_.insert(info[i].deviceid);
+            if (info) XIFreeDeviceInfo(info);
+        }
 
         Bool supported = False;
         XkbSetDetectableAutoRepeat(dpy_, True, &supported);   // repeats arrive as presses only
@@ -230,7 +246,16 @@ private:
         switch (ev.type) {
         case GenericEvent:
             if (ev.xcookie.extension == xiOp_ && XGetEventData(dpy_, &ev.xcookie)) {
-                if (ev.xcookie.evtype == XI_RawMotion && !fwd_) LocalMotion();
+                if (!fwd_) {
+                    const auto* re = static_cast<const XIRawEvent*>(ev.xcookie.data);
+                    const bool injected = re && xtestIds_.count(re->sourceid) != 0;
+                    if (ev.xcookie.evtype == XI_RawMotion) {
+                        LocalMotion();
+                        if (!injected && sink_.onPhysicalInput) sink_.onPhysicalInput(RawWeight(re));
+                    } else if (ev.xcookie.evtype == XI_RawButtonPress) {
+                        if (!injected && sink_.onPhysicalInput) sink_.onPhysicalInput(100);
+                    }
+                }
                 XFreeEventData(dpy_, &ev.xcookie);
             }
             break;
@@ -253,6 +278,20 @@ private:
             break;
         default: break;
         }
+    }
+
+    // |dx| + |dy| of a raw motion event (valuator 0 = x, 1 = y), at least 1.
+    static int RawWeight(const XIRawEvent* re)
+    {
+        if (!re) return 1;
+        double dx = 0, dy = 0;
+        const double* v = re->raw_values;
+        for (int i = 0; i < re->valuators.mask_len * 8; ++i) {
+            if (!XIMaskIsSet(re->valuators.mask, i)) continue;
+            const double val = *v++;
+            if (i == 0) dx = val; else if (i == 1) dy = val;
+        }
+        return std::max(1, (int)std::lround(std::fabs(dx) + std::fabs(dy)));
     }
 
     void LocalMotion()
@@ -320,6 +359,7 @@ private:
     std::mutex cmdMu_;
     std::vector<std::function<void()>> cmds_;
 
+    std::set<int> xtestIds_;                  // slave pointer ids of the XTEST device
     bool fwd_ = false, warping_ = false;      // X thread only
     int parkX_ = 0, parkY_ = 0, lastX_ = 0, lastY_ = 0;
 

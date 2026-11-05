@@ -4,6 +4,7 @@
 
 #include <array>
 #include <atomic>
+#include <cctype>
 #include <chrono>
 #include <cstdint>
 #include <deque>
@@ -15,6 +16,7 @@
 #include <utility>
 #include <vector>
 
+#include "identity.hpp"
 #include "localinfo.hpp"
 
 namespace asio = boost::asio;
@@ -26,20 +28,26 @@ namespace {
 
 struct SessionEvents {
     // returns false to reject the session (duplicate peer)
-    std::function<bool(int, std::uint32_t, const std::string&, const std::string&, bool)> ready;
+    // (session id, peer instance, peer public key, peer name, peer address, incoming)
+    std::function<bool(int, std::uint32_t, const std::string&, const std::string&,
+                       const std::string&, bool)> ready;
     std::function<void(int, const std::string&)> line;
     std::function<void(int, bool)> closed;
 };
 
 // One TCP connection, line based protocol:
-//   HELLO <instance> <name>
-//   POS <x*1000> <y*1000>
+//   HELLO <instance> <public key hex> <nonce hex> <name>
+//   AUTH <signature hex>      proves ownership of the key announced in HELLO:
+//                             sign("si-auth-v1|<my key>|<your key>|<your nonce>")
+//   (only after both AUTH lines verified:)
+//   SCREENS ..., POS ..., and the input protocol (see input.hpp)
 class Session : public std::enable_shared_from_this<Session> {
 public:
     Session(tcp::socket sock, int id, bool incoming, std::uint32_t myInstance,
-            std::string myName, SessionEvents ev)
+            std::string myName, const Identity& ident, SessionEvents ev)
         : sock_(std::move(sock)), id_(id), incoming_(incoming), myInstance_(myInstance),
-          myName_(std::move(myName)), ev_(std::move(ev)), buf_(4096) {}
+          myName_(std::move(myName)), ident_(ident), ev_(std::move(ev)), buf_(4096),
+          myNonce_(Identity::RandomHex(16)) {}
 
     void Start()
     {
@@ -47,7 +55,7 @@ public:
         sock_.set_option(tcp::no_delay(true), ec);
         auto ep = sock_.remote_endpoint(ec);
         if (!ec) addr_ = ep.address().to_string();
-        Send("HELLO " + std::to_string(myInstance_) + " " + myName_);
+        Send("HELLO " + std::to_string(myInstance_) + " " + ident_.PublicHex() + " " + myNonce_ + " " + myName_);
         DoRead();
     }
 
@@ -97,19 +105,48 @@ private:
         });
     }
 
+    static std::string AuthMsg(const std::string& signerKey, const std::string& verifierKey,
+                               const std::string& verifierNonce)
+    {
+        return "si-auth-v1|" + signerKey + "|" + verifierKey + "|" + verifierNonce;
+    }
+
+    static bool IsNonce(const std::string& s)
+    {
+        if (s.size() != 32) return false;
+        for (char c : s) if (!std::isxdigit(static_cast<unsigned char>(c))) return false;
+        return true;
+    }
+
     void Handle(const std::string& l)
     {
         if (ready_) { ev_.line(id_, l); return; }
 
-        if (l.rfind("HELLO ", 0) != 0) return;   // ignore anything before the handshake
-        std::istringstream is(l.substr(6));
-        std::uint32_t inst = 0;
-        if (!(is >> inst) || inst == 0) return;
-        std::string name;
-        std::getline(is >> std::ws, name);
-        if (name.empty()) name = addr_;
+        if (!gotHello_) {
+            if (l.rfind("HELLO ", 0) != 0) return;   // ignore anything before the handshake
+            std::istringstream is(l.substr(6));
+            std::uint32_t inst = 0;
+            std::string key, nonce;
+            if (!(is >> inst >> key >> nonce) || inst == 0 ||
+                !Identity::IsValidPublicHex(key) || !IsNonce(nonce)) { Close(); return; }
+            if (key == ident_.PublicHex()) { Close(); return; }   // that is us
+            std::string name;
+            std::getline(is >> std::ws, name);
+            if (name.empty()) name = addr_;
 
-        if (!ev_.ready(id_, inst, name, addr_, incoming_)) { Close(); return; }
+            peerInst_ = inst; peerKey_ = key; peerNonce_ = nonce; peerName_ = name;
+            gotHello_ = true;
+            // Prove that we own our key: sign the challenge the peer just gave us.
+            Send("AUTH " + ident_.Sign(AuthMsg(ident_.PublicHex(), peerKey_, peerNonce_)));
+            return;
+        }
+
+        if (l.rfind("AUTH ", 0) != 0) return;
+        if (!Identity::Verify(peerKey_, AuthMsg(peerKey_, ident_.PublicHex(), myNonce_), l.substr(5))) {
+            Close();                                // peer does not own the key it claims
+            return;
+        }
+        if (!ev_.ready(id_, peerInst_, peerKey_, peerName_, addr_, incoming_)) { Close(); return; }
         ready_ = true;
     }
 
@@ -118,8 +155,13 @@ private:
     bool incoming_;
     std::uint32_t myInstance_;
     std::string myName_;
+    const Identity& ident_;
     SessionEvents ev_;
     asio::streambuf buf_;
+    std::string myNonce_;
+    std::string peerKey_, peerNonce_, peerName_;
+    std::uint32_t peerInst_ = 0;
+    bool gotHello_ = false;
     std::deque<std::string> out_;
     std::string addr_;
     bool ready_  = false;
@@ -129,9 +171,10 @@ private:
 } // namespace
 
 struct Network::Impl {
-    Impl(std::string h, NetCallbacks c) : host(std::move(h)), cb(std::move(c)) {}
+    Impl(std::string h, Identity i, NetCallbacks c) : host(std::move(h)), ident(std::move(i)), cb(std::move(c)) {}
 
     std::string host;
+    Identity ident;
     NetCallbacks cb;
 
     asio::io_context io;
@@ -250,7 +293,7 @@ struct Network::Impl {
     {
         const int id = nextId++;
         SessionEvents ev;
-        ev.ready = [this](int i, std::uint32_t inst, const std::string& name,
+        ev.ready = [this](int i, std::uint32_t inst, const std::string& key, const std::string& name,
                           const std::string& addr, bool inc) -> bool {
             if (stopping) return false;
             if (byInstance.count(inst)) {            // already linked to this peer
@@ -258,7 +301,7 @@ struct Network::Impl {
                 return false;
             }
             byInstance[inst] = i;
-            if (cb.onPeerReady) cb.onPeerReady(i, inst, name, addr, inc);
+            if (cb.onPeerReady) cb.onPeerReady(i, inst, key, name, addr, inc);
             return true;
         };
         ev.line = [this](int i, const std::string& l) {
@@ -271,7 +314,7 @@ struct Network::Impl {
             }
             if (!stopping && wasReady && cb.onPeerLost) cb.onPeerLost(i);
         };
-        auto session = std::make_shared<Session>(std::move(s), id, incoming, instance, host, std::move(ev));
+        auto session = std::make_shared<Session>(std::move(s), id, incoming, instance, host, ident, std::move(ev));
         sessions[id] = session;
         session->Start();
     }
@@ -506,8 +549,8 @@ struct Network::Impl {
     }
 };
 
-Network::Network(std::string hostName, NetCallbacks cb)
-    : d_(new Impl(std::move(hostName), std::move(cb))) {}
+Network::Network(std::string hostName, Identity identity, NetCallbacks cb)
+    : d_(new Impl(std::move(hostName), std::move(identity), std::move(cb))) {}
 
 Network::~Network() { Stop(); }
 

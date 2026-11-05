@@ -68,6 +68,11 @@ struct Peer {
     std::string ip;
     udp::endpoint ep;
 
+    // per-device settings (guarded by Impl::mtx like everything else here)
+    bool  send  = false;     // send OUR audio to this peer
+    bool  muted = false;     // silence what this peer sends us
+    float vol   = 1.0f;      // 0..1.5, applied to what this peer sends us
+
     std::vector<std::int16_t> ring = std::vector<std::int16_t>(kRingSamples, 0);
     std::size_t head = 0, count = 0;
     bool primed = false;
@@ -218,6 +223,27 @@ struct AudioEngine::Impl {
         peers.erase(inst);
     }
 
+    void SetPeerSend(std::uint32_t inst, bool on)
+    {
+        std::lock_guard<std::mutex> lk(mtx);
+        auto it = peers.find(inst);
+        if (it != peers.end()) it->second.send = on;
+    }
+
+    void SetPeerMuted(std::uint32_t inst, bool m)
+    {
+        std::lock_guard<std::mutex> lk(mtx);
+        auto it = peers.find(inst);
+        if (it != peers.end()) it->second.muted = m;
+    }
+
+    void SetPeerVolume(std::uint32_t inst, float v)
+    {
+        std::lock_guard<std::mutex> lk(mtx);
+        auto it = peers.find(inst);
+        if (it != peers.end()) it->second.vol = std::clamp(v, 0.0f, 1.5f);
+    }
+
     // ------------------------------------------------------------------ capture / send
     bool SetSending(bool on, AudioSource src, std::string* err)
     {
@@ -359,7 +385,8 @@ struct AudioEngine::Impl {
         dests.clear();
         {
             std::lock_guard<std::mutex> lk(mtx);
-            for (auto& kv : peers) dests.push_back(kv.second.ep);
+            for (auto& kv : peers)
+                if (kv.second.send) dests.push_back(kv.second.ep);   // only devices we share with
         }
         for (auto& ep : dests) {
             error_code ec;
@@ -436,7 +463,7 @@ struct AudioEngine::Impl {
         const std::size_t n = (std::size_t)frames * kChannels;
         std::memset(o, 0, n * sizeof(float));
         if (muted.load()) return;
-        const float vol = volume.load() * (1.0f / 32768.0f);
+        const float master = volume.load() * (1.0f / 32768.0f);
 
         {
             std::lock_guard<std::mutex> lk(mtx);
@@ -447,6 +474,7 @@ struct AudioEngine::Impl {
                     else continue;
                 }
                 const std::size_t take = std::min(n, p.count);
+                const float vol = p.muted ? 0.0f : master * p.vol;   // a muted device is still drained: no stale audio on unmute
                 std::size_t idx = p.head;
                 for (std::size_t i = 0; i < take; ++i) {
                     o[i] += vol * (float)p.ring[idx];
@@ -491,6 +519,9 @@ void AudioEngine::Stop()                                  { d_->Stop(); }
 void AudioEngine::AddPeer(std::uint32_t i, const std::string& ip) { d_->AddPeer(i, ip); }
 void AudioEngine::RemovePeer(std::uint32_t i)             { d_->RemovePeer(i); }
 bool AudioEngine::SetSending(bool on, AudioSource s, std::string* e) { return d_->SetSending(on, s, e); }
+void AudioEngine::SetPeerSend(std::uint32_t i, bool on)   { d_->SetPeerSend(i, on); }
+void AudioEngine::SetPeerMuted(std::uint32_t i, bool m)   { d_->SetPeerMuted(i, m); }
+void AudioEngine::SetPeerVolume(std::uint32_t i, float v) { d_->SetPeerVolume(i, v); }
 void AudioEngine::SetMuted(bool m)                        { d_->muted = m; }
 void AudioEngine::SetVolume(float v)                      { d_->volume = std::clamp(v, 0.0f, 1.5f); }
 std::vector<AudioPeerStat> AudioEngine::Stats()           { return d_->Stats(); }
