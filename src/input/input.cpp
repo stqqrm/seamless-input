@@ -89,6 +89,9 @@ struct InputEngine::Impl {
     std::map<int, Peer> peers;
 
     int cx = 0, cy = 0;                 // Controlled: where our cursor is
+    int vx = 0, vy = 0;                 // Forwarding: where the cursor is on the controlled peer (its desktop coords)
+    int physAcc = 0;                    // Controlled: motion of the local (real) mouse in the current window
+    Clock::time_point physStart{};
     int exitX = 0, exitY = 0;           // Forwarding: where our cursor goes on a forced stop
     std::set<int> keysDown, btnsDown;   // Controlled: what we injected and must release
     Clock::time_point lastSwitch{};
@@ -157,6 +160,56 @@ struct InputEngine::Impl {
     }
 
     // ----------------------------------------------------------------- layout
+    // Core of the edge search, in world coordinates (our top-left = 0,0): the pixel (wx, wy)
+    // wants to leave in direction (dx, dy). Finds the monitor beyond that edge among all peers
+    // (onlyPeer >= 0 restricts to one, excludePeer skips one) and optionally this PC's own
+    // monitors (reported as peer -1). out.x/out.y are in the TARGET's desktop coordinates.
+    bool FindCrossingWorld(int wx, int wy, int dx, int dy, int onlyPeer, int excludePeer,
+                           bool includeLocal, Crossing& out) const
+    {
+        int bestGap = INT_MAX;
+        auto consider = [&](int pid, int rx, int ry, int rw, int rh, int toX, int toY) {
+            int gap, ex, ey;
+            if (dx > 0) {
+                if (wy < ry || wy >= ry + rh || rx + rw <= wx + 1) return;
+                gap = std::max(0, rx - (wx + 1));
+                ex  = std::min(rx + rw - 1, std::max(wx + 1, rx) + kInset);
+                ey  = wy;
+            } else if (dx < 0) {
+                if (wy < ry || wy >= ry + rh || rx > wx - 1) return;
+                gap = std::max(0, (wx - 1) - (rx + rw - 1));
+                ex  = std::max(rx, std::min(wx - 1, rx + rw - 1) - kInset);
+                ey  = wy;
+            } else if (dy > 0) {
+                if (wx < rx || wx >= rx + rw || ry + rh <= wy + 1) return;
+                gap = std::max(0, ry - (wy + 1));
+                ey  = std::min(ry + rh - 1, std::max(wy + 1, ry) + kInset);
+                ex  = wx;
+            } else {
+                if (wx < rx || wx >= rx + rw || ry > wy - 1) return;
+                gap = std::max(0, (wy - 1) - (ry + rh - 1));
+                ey  = std::max(ry, std::min(wy - 1, ry + rh - 1) - kInset);
+                ex  = wx;
+            }
+            if (gap > kMaxGap || gap >= bestGap) return;
+            bestGap = gap;
+            out.peer = pid;
+            out.x = ex + toX;
+            out.y = ey + toY;
+        };
+
+        for (const auto& kv : peers) {
+            const Peer& P = kv.second;
+            if (!P.placed || (onlyPeer >= 0 && kv.first != onlyPeer) || kv.first == excludePeer) continue;
+            const int pox = (int)std::lround(P.ox), poy = (int)std::lround(P.oy);
+            for (const auto& m : P.mons)
+                consider(kv.first, pox + m.x - P.bx, poy + m.y - P.by, m.w, m.h, P.bx - pox, P.by - poy);
+        }
+        if (includeLocal)
+            for (const auto& m : mons) consider(-1, m.x - lbx, m.y - lby, m.w, m.h, lbx, lby);
+        return bestGap != INT_MAX;
+    }
+
     // The cursor of this PC is at (px, py) and wants to leave in direction (dx, dy).
     // Finds the peer monitor that lies beyond that edge. onlyPeer >= 0 restricts
     // the search to one peer (used for "give control back").
@@ -164,45 +217,7 @@ struct InputEngine::Impl {
     {
         if (!inputgeom::InsideAny(mons, px, py)) return false;
         if (inputgeom::InsideAny(mons, px + dx, py + dy)) return false;   // not an outer edge
-
-        const int wx = px - lbx, wy = py - lby;     // world coordinates
-        int bestGap = INT_MAX;
-        for (const auto& kv : peers) {
-            const Peer& P = kv.second;
-            if (!P.placed || (onlyPeer >= 0 && kv.first != onlyPeer)) continue;
-            const int pox = (int)std::lround(P.ox), poy = (int)std::lround(P.oy);
-            for (const auto& m : P.mons) {
-                const int rx = pox + m.x - P.bx, ry = poy + m.y - P.by;   // monitor in our world
-                int gap, ex, ey;
-                if (dx > 0) {
-                    if (wy < ry || wy >= ry + m.h || rx + m.w <= wx + 1) continue;
-                    gap = std::max(0, rx - (wx + 1));
-                    ex  = std::min(rx + m.w - 1, std::max(wx + 1, rx) + kInset);
-                    ey  = wy;
-                } else if (dx < 0) {
-                    if (wy < ry || wy >= ry + m.h || rx > wx - 1) continue;
-                    gap = std::max(0, (wx - 1) - (rx + m.w - 1));
-                    ex  = std::max(rx, std::min(wx - 1, rx + m.w - 1) - kInset);
-                    ey  = wy;
-                } else if (dy > 0) {
-                    if (wx < rx || wx >= rx + m.w || ry + m.h <= wy + 1) continue;
-                    gap = std::max(0, ry - (wy + 1));
-                    ey  = std::min(ry + m.h - 1, std::max(wy + 1, ry) + kInset);
-                    ex  = wx;
-                } else {
-                    if (wx < rx || wx >= rx + m.w || ry > wy - 1) continue;
-                    gap = std::max(0, (wy - 1) - (ry + m.h - 1));
-                    ey  = std::max(ry, std::min(wy - 1, ry + m.h - 1) - kInset);
-                    ex  = wx;
-                }
-                if (gap > kMaxGap || gap >= bestGap) continue;
-                bestGap = gap;
-                out.peer = kv.first;
-                out.x = ex - pox + P.bx;            // back to the peer's desktop coordinates
-                out.y = ey - poy + P.by;
-            }
-        }
-        return bestGap != INT_MAX;
+        return FindCrossingWorld(px - lbx, py - lby, dx, dy, onlyPeer, -1, false, out);
     }
 
     void Notify() { if (self->onModeChange) self->onModeChange(mode, peerId); }
@@ -236,6 +251,8 @@ struct InputEngine::Impl {
             mode = Mode::Forwarding;
             peerId = c.peer;
             lastSwitch = now;
+            vx = c.x;
+            vy = c.y;
             PushRaw(c.peer, "ENTER " + std::to_string(c.x) + " " + std::to_string(c.y));
             Notify();
             return;
@@ -252,6 +269,43 @@ struct InputEngine::Impl {
             return;
         }
         Push(peerId, ev);
+        if (ev.kind == InputKind::Move) TrackVirtualLocked(ev.a, ev.b);
+    }
+
+    // We know the layout of every PC (all in OUR frame), so while we control one PC we follow
+    // its cursor ourselves. When it runs off the edge towards a THIRD PC, control hops there
+    // directly: PC1 -> PC2 -> PC3 works without PC2 having to know about PC3.
+    // (Going back to this PC is still decided by the controlled PC: RETURN.)
+    void TrackVirtualLocked(int dx, int dy)
+    {
+        auto it = peers.find(peerId);
+        if (it == peers.end() || !it->second.placed) return;
+        const Peer& P = it->second;
+        const int nx = vx + dx, ny = vy + dy;
+        if (inputgeom::InsideAny(P.mons, nx, ny)) { vx = nx; vy = ny; return; }
+
+        int px = nx, py = ny;
+        inputgeom::ClampToAny(P.mons, px, py);
+        vx = px;
+        vy = py;
+        const int sx = nx < px ? -1 : (nx > px ? 1 : 0);
+        const int sy = ny < py ? -1 : (ny > py ? 1 : 0);
+
+        const int wx = (int)std::lround(P.ox) + px - P.bx;      // the last pixel inside, in our world
+        const int wy = (int)std::lround(P.oy) + py - P.by;
+        Crossing c;
+        const bool found = (sx && FindCrossingWorld(wx, wy, sx, 0, -1, peerId, false, c)) ||
+                           (sy && FindCrossingWorld(wx, wy, 0, sy, -1, peerId, false, c));
+        if (!found || c.peer < 0 || c.peer == peerId) return;
+
+        const int from = peerId;
+        PushRaw(from, "RELEASE");
+        PushRaw(c.peer, "ENTER " + std::to_string(c.x) + " " + std::to_string(c.y));
+        peerId = c.peer;
+        vx = c.x;
+        vy = c.y;
+        lastSwitch = Clock::now();
+        Notify();
     }
 
     // x,y < 0 means "use the position we left from".
@@ -286,6 +340,27 @@ struct InputEngine::Impl {
         if (tellPeer) PushRaw(peerId, "DENY");
         mode = Mode::Local;
         lastSwitch = Clock::now();
+        peerId = -1;
+        Notify();
+    }
+
+    // The user of THIS PC touched its own mouse while a peer controls it: they win.
+    void OnPhysicalInput(int weight)
+    {
+        std::lock_guard<std::mutex> lk(mu);
+        if (!started || mode != Mode::Controlled) { physAcc = 0; return; }
+        const auto now = Clock::now();
+        if (now - lastSwitch < std::chrono::milliseconds(350)) return;     // let the hand-over settle
+        if (physAcc == 0 || now - physStart > std::chrono::milliseconds(400)) { physStart = now; physAcc = 0; }
+        physAcc += weight;
+        if (physAcc < 40) return;                                          // ignore bumps and jitter
+        physAcc = 0;
+
+        ReleaseInjectedLocked();
+        PushRaw(peerId, "TAKE");
+        log("Local mouse moved - took control back from the other PC");
+        mode = Mode::Local;
+        lastSwitch = now;
         peerId = -1;
         Notify();
     }
@@ -377,6 +452,7 @@ bool InputEngine::Start(std::string* msg)
     BackendSink sink;
     sink.onLocalMotion = [this](int x, int y, bool b) { d_->OnLocalMotion(x, y, b); };
     sink.onForwarded   = [this](const InputEvent& e) { d_->OnForwarded(e); };
+    sink.onPhysicalInput = [this](int w) { d_->OnPhysicalInput(w); };
 
     std::string err;
     if (!d_->be->Start(std::move(sink), &err)) {
@@ -517,6 +593,15 @@ bool InputEngine::HandleMessage(int id, const std::string& line)
         if (std::sscanf(s + 7, "%d %d", &a, &b) != 2) return true;
         std::lock_guard<std::mutex> lk(d_->mu);
         if (d_->mode == Mode::Forwarding && d_->peerId == id) d_->StopForwardingLocked(false, a, b);
+        return true;
+    }
+
+    if (line == "TAKE") {      // the controlled PC's user grabbed their mouse: back to this PC
+        std::lock_guard<std::mutex> lk(d_->mu);
+        if (d_->mode == Mode::Forwarding && d_->peerId == id) {
+            d_->log("The other PC's user took control back");
+            d_->StopForwardingLocked(false, -1, -1);
+        }
         return true;
     }
 

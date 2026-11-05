@@ -13,7 +13,11 @@
 //                switches to Forwarding.
 //   Forwarding   local input is swallowed and sent to one peer (ENTER/M/B/W/K).
 //   Controlled   a peer drives this PC. When its cursor leaves through the edge
-//                that borders the controller, control goes back (RETURN).
+//                that borders the controller, control goes back (RETURN); when this
+//                PC's own mouse is moved, control goes back too (TAKE).
+//
+// With several PCs the controller follows the controlled cursor in its own layout and
+// hops straight to a third PC when the cursor runs off towards it (RELEASE + ENTER).
 //
 // Wire protocol (added to the existing line protocol, handled by HandleMessage):
 //   ENTER x y      controller -> peer   take over, cursor at x,y (peer desktop coords)
@@ -22,7 +26,8 @@
 //   W dx dy        controller -> peer   wheel, 120 = one notch
 //   K code down    controller -> peer   key (Linux evdev code)
 //   RETURN x y     peer -> controller   cursor left the peer, put yours at x,y
-//   RELEASE        controller -> peer   stop controlling
+//   RELEASE        controller -> peer   stop controlling (also sent when control hops to a third PC)
+//   TAKE           peer -> controller   the peer's user moved their own mouse: control is theirs again
 //   DENY           peer -> controller   refused / revoked
 //
 // SECURITY: injecting input is remote control of the PC. A peer may only control

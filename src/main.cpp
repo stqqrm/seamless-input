@@ -801,7 +801,7 @@ public:
         Bind(wxEVT_TIMER, [this](wxTimerEvent&) { UpdateAudioStats(); }, kStatTimerId);
         statTimer_.Start(250);
 
-        canvas_->onPeerMoved = [this](int id, double x, double y) { SendPos(id, x, y); };
+        canvas_->onPeerMoved = [this](int id, double x, double y) { SendPos(id, x, y); BroadcastRelative(id); };
 
         // ---- network (callbacks arrive on the asio thread -> marshal to GUI)
         NetCallbacks cb;
@@ -1181,6 +1181,25 @@ private:
         Activate(entries_[i].ip);
     }
 
+    // With 3+ PCs every PC keeps the whole layout in its own frame. When the user drags PC X
+    // here, the other PCs must learn where X now is relative to THEM (and X where they are),
+    // otherwise PC2 and PC3 would disagree about their own neighbourhood.
+    void BroadcastRelative(int movedId)
+    {
+        auto mit = peers_.find(movedId);
+        double mx = 0, my = 0;
+        if (mit == peers_.end() || mit->second.key.empty() || !canvas_->PeerPos(movedId, mx, my)) return;
+        for (const auto& kv : peers_) {
+            if (kv.first == movedId || !kv.second.placed || kv.second.key.empty()) continue;
+            double qx = 0, qy = 0;
+            if (!canvas_->PeerPos(kv.first, qx, qy)) continue;
+            net_->Send(kv.first, "PEERPOS " + mit->second.key + " " +
+                       std::to_string(std::llround(mx - qx)) + " " + std::to_string(std::llround(my - qy)));
+            net_->Send(movedId, "PEERPOS " + kv.second.key + " " +
+                       std::to_string(std::llround(qx - mx)) + " " + std::to_string(std::llround(qy - my)));
+        }
+    }
+
     void SendPos(int id, double x, double y)
     {
         input_->SetPeerOffset(id, x, y);
@@ -1498,6 +1517,20 @@ private:
             ApplyStoredLayout(id);              // saved position for this set of PCs (or the default one)
             RebuildDevices();
             return;
+        }
+
+        {   // PEERPOS <key> <x> <y>: where the PC with that key is, relative to THIS PC
+            char key[80] = {};
+            int rx = 0, ry = 0;
+            if (p.placed && std::sscanf(line.c_str(), "PEERPOS %64s %d %d", key, &rx, &ry) == 3) {
+                for (auto& kv : peers_) {
+                    if (kv.first == id || !kv.second.placed || kv.second.key != key) continue;
+                    canvas_->SetPeerPos(kv.first, rx, ry);
+                    input_->SetPeerOffset(kv.first, rx, ry);
+                    RecordPeerPos(kv.first, rx, ry);
+                }
+                return;
+            }
         }
 
         int x, y;

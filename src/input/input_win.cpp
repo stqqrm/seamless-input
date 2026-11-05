@@ -11,6 +11,7 @@
 #include <atomic>
 #include <bitset>
 #include <cmath>
+#include <cstdlib>
 #include <condition_variable>
 #include <mutex>
 #include <thread>
@@ -239,7 +240,21 @@ private:
     {
         if (code != HC_ACTION) return CallNextHookEx(nullptr, code, wp, lp);
         const auto* ms = reinterpret_cast<const MSLLHOOKSTRUCT*>(lp);
+
+        // distance since the previous mouse event (also for our own injections, so a jump
+        // we caused is not mistaken for the user moving the mouse afterwards)
+        int moved = 0;
+        if (wp == WM_MOUSEMOVE) {
+            moved = std::abs(ms->pt.x - lastPtX_) + std::abs(ms->pt.y - lastPtY_);
+            lastPtX_ = ms->pt.x;
+            lastPtY_ = ms->pt.y;
+        }
         if (ms->dwExtraInfo == kTag) return CallNextHookEx(nullptr, code, wp, lp);   // our own injection
+
+        if (!fwd_ && sink_.onPhysicalInput) {
+            if (wp == WM_MOUSEMOVE && !(ms->flags & LLMHF_INJECTED) && moved > 0) sink_.onPhysicalInput(moved);
+            else if (wp == WM_LBUTTONDOWN || wp == WM_RBUTTONDOWN || wp == WM_MBUTTONDOWN) sink_.onPhysicalInput(100);
+        }
 
         // wire button number + held-button bookkeeping
         int btn = -1, bit = 0;
@@ -313,6 +328,7 @@ private:
 
     std::atomic<bool> fwd_{false};
     std::atomic<int> mask_{0};
+    int lastPtX_ = 0, lastPtY_ = 0;      // hook thread only
     int anchorX_ = 0, anchorY_ = 0;
     std::bitset<256> held_;
 };
