@@ -3,6 +3,7 @@
 #include <wx/display.h>
 #include <wx/listctrl.h>
 #include <wx/notebook.h>
+#include <wx/stdpaths.h>
 #include <wx/timer.h>
 
 #include <algorithm>
@@ -11,15 +12,19 @@
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
+#include <filesystem>
 #include <functional>
 #include <map>
 #include <memory>
 #include <set>
 #include <sstream>
+#include <tuple>
 #include <utility>
 #include <vector>
 
 #include "audio.hpp"
+#include "config.hpp"
+#include "identity.hpp"
 #include "input/input.hpp"
 #include "localinfo.hpp"
 #include "network.hpp"
@@ -88,6 +93,29 @@ public:
     void SetPeerPos(int id, double ox, double oy)
     {
         if (Group* g = Find(id)) { g->ox = ox; g->oy = oy; Refresh(); }
+    }
+
+    // Local update (e.g. a saved config): moves the peer there, but if that would put one
+    // of its monitors on top of another monitor it is pushed out to the nearest free edge.
+    // Returns the position it really got. Does not fire onPeerMoved.
+    std::pair<double, double> PlacePeer(int id, double ox, double oy)
+    {
+        Group* g = Find(id);
+        if (!g) return {ox, oy};
+        ox = std::round(ox);
+        oy = std::round(oy);
+        if (Collides(*g, ox, oy)) std::tie(ox, oy) = PushOut(*g, ox, oy);
+        g->ox = ox;
+        g->oy = oy;
+        Refresh();
+        return {ox, oy};
+    }
+
+    bool PeerPos(int id, double& ox, double& oy) const
+    {
+        for (const auto& g : peers_)
+            if (g.id == id) { ox = g.ox; oy = g.oy; return true; }
+        return false;
     }
 
 private:
@@ -190,6 +218,101 @@ private:
 
         if (bestX <= thr) ox += adjX;
         if (bestY <= thr) oy += adjY;
+    }
+
+    // ---- no overlap: monitors of different PCs may touch (share an edge) but never intersect
+    static bool Overlap(double l1, double t1, double r1, double b1,
+                        double l2, double t2, double r2, double b2)
+    {
+        return l1 < r2 && r1 > l2 && t1 < b2 && b1 > t2;   // strict: flush edges are fine
+    }
+
+    bool Collides(const Group& g, double ox, double oy) const
+    {
+        auto test = [&](const Group& o) {
+            if (o.id == g.id) return false;
+            for (const auto& m : g.mons)
+                for (const auto& n : o.mons)
+                    if (Overlap(ox + m.x, oy + m.y, ox + m.x + m.width, oy + m.y + m.height,
+                                o.ox + n.x, o.oy + n.y, o.ox + n.x + n.width, o.oy + n.y + n.height))
+                        return true;
+            return false;
+        };
+        if (test(local_)) return true;
+        for (const auto& o : peers_) if (test(o)) return true;
+        return false;
+    }
+
+    // How far (<= |d|, same sign) can g move along one axis from (ox, oy) before one of its
+    // monitors would run into another monitor? It stops exactly at the touching edge.
+    double Sweep(const Group& g, double ox, double oy, double d, bool horizontal) const
+    {
+        if (d == 0) return 0;
+        auto one = [&](const Group& o) {
+            if (o.id == g.id) return;
+            for (const auto& m : g.mons) {
+                const double l = ox + m.x, t = oy + m.y, r = l + m.width, b = t + m.height;
+                for (const auto& n : o.mons) {
+                    const double nl = o.ox + n.x, nt = o.oy + n.y, nr = nl + n.width, nb = nt + n.height;
+                    // only monitors that share rows (moving in x) / columns (moving in y) can block
+                    const double lo = horizontal ? t : l,  hi = horizontal ? b : r;
+                    const double nlo = horizontal ? nt : nl, nhi = horizontal ? nb : nr;
+                    if (!(lo < nhi && hi > nlo)) continue;
+                    const double front = horizontal ? r : b,  back = horizontal ? l : t;
+                    const double nfront = horizontal ? nl : nt, nback = horizontal ? nr : nb;
+                    if (d > 0 && front <= nfront) d = std::min(d, nfront - front);
+                    if (d < 0 && back >= nback)   d = std::max(d, nback - back);
+                }
+            }
+        };
+        one(local_);
+        for (const auto& o : peers_) one(o);
+        return d;
+    }
+
+    // Moves g from its current (valid) position towards (tx, ty) and stops/slides along
+    // whatever is in the way, so a monitor can never jump over another one.
+    std::pair<double, double> SlideTo(const Group& g, double tx, double ty) const
+    {
+        double x = g.ox, y = g.oy;
+        x += Sweep(g, x, y, tx - x, true);
+        y += Sweep(g, x, y, ty - y, false);
+        return {x, y};
+    }
+
+    // Shifts (ox, oy) by the smallest amounts until nothing overlaps (ends flush at an edge).
+    std::pair<double, double> PushOut(const Group& g, double ox, double oy) const
+    {
+        for (int guard = 0; guard < 64 && Collides(g, ox, oy); ++guard) {
+            double bestAbs = 1e18, bdx = 0, bdy = 0;
+            auto consider = [&](const Group& o) {
+                if (o.id == g.id) return;
+                for (const auto& m : g.mons) {
+                    const double l = ox + m.x, t = oy + m.y, r = l + m.width, b = t + m.height;
+                    for (const auto& n : o.mons) {
+                        const double nl = o.ox + n.x, nt = o.oy + n.y, nr = nl + n.width, nb = nt + n.height;
+                        if (!Overlap(l, t, r, b, nl, nt, nr, nb)) continue;
+                        const double cand[4][2] = {{nr - l, 0}, {nl - r, 0}, {0, nb - t}, {0, nt - b}};
+                        for (const auto& c : cand) {
+                            const double a = std::fabs(c[0]) + std::fabs(c[1]);
+                            if (a < bestAbs) { bestAbs = a; bdx = c[0]; bdy = c[1]; }
+                        }
+                    }
+                }
+            };
+            consider(local_);
+            for (const auto& o : peers_) consider(o);
+            if (bestAbs >= 1e18) break;
+            ox += bdx;
+            oy += bdy;
+        }
+        if (Collides(g, ox, oy)) {          // could not resolve: park it right of everything else
+            double r = local_.ox + local_.size.x;
+            for (const auto& o : peers_) if (o.id != g.id) r = std::max(r, o.ox + o.size.x);
+            ox = r;
+            oy = local_.oy;
+        }
+        return {ox, oy};
     }
 
     // ---- painting
@@ -296,6 +419,9 @@ private:
                 Snap(*g, ox, oy, 14.0 / v.s);
                 ox = std::round(ox);
                 oy = std::round(oy);
+                // never through another monitor: slide along it and stop flush at its edge
+                std::tie(ox, oy) = SlideTo(*g, ox, oy);
+                if (Collides(*g, ox, oy)) std::tie(ox, oy) = PushOut(*g, ox, oy);
                 if (ox != g->ox || oy != g->oy) {
                     g->ox = ox;
                     g->oy = oy;
@@ -356,6 +482,25 @@ public:
         local_ = GetLocalAddresses();
         localMons_ = GetLocalMonitors();
 
+        // ---- this PC's identity (key pair) and the saved configs live in the user data dir
+        {
+#if defined(__WXMSW__)
+            // %APPDATA%\seamless-input
+            const wxString base = wxStandardPaths::Get().GetUserDataDir();
+#else
+            // $XDG_DATA_HOME/seamless-input, normally ~/.local/share/seamless-input
+            wxString xdg;
+            if (!wxGetEnv("XDG_DATA_HOME", &xdg) || xdg.empty()) xdg = wxGetHomeDir() + "/.local/share";
+            const wxString base = xdg + "/seamless-input";
+#endif
+            const std::filesystem::path dir = std::filesystem::u8path(std::string(base.utf8_str()));
+            ident_ = std::make_unique<Identity>(Identity::LoadOrCreate(dir, &identNote_));
+            store_ = std::make_unique<ConfigStore>(dir / "configs");
+            trust_ = std::make_unique<TrustStore>(dir / "trust.txt");
+            trust_->Load();
+            dataDir_ = wxString::FromUTF8(dir.u8string());
+        }
+
         auto* root = new wxBoxSizer(wxVERTICAL);
 
         // ---- upper part: monitor layout
@@ -367,9 +512,10 @@ public:
         wxString ips;
         for (const auto& a : local_) ips += (ips.empty() ? "" : ", ") + wxString::FromUTF8(a.ip);
         auto* header = new wxStaticText(this, wxID_ANY,
-            wxString::Format("Host: %s     IP: %s     TCP %d / UDP %d (discovery) / UDP %d (audio)",
+            wxString::Format("Host: %s     IP: %s     TCP %d / UDP %d (discovery) / UDP %d (audio)     Key: %s",
                              host_, ips.empty() ? wxString("-") : ips,
-                             (int)kTcpPort, (int)kDiscoveryPort, (int)kAudioPort));
+                             (int)kTcpPort, (int)kDiscoveryPort, (int)kAudioPort,
+                             wxString::FromUTF8(ident_->Fingerprint())));
         root->Add(header, 0, wxALL, 8);
 
         // ---- lower part: tabs
@@ -385,10 +531,10 @@ public:
         target_->Bind(wxEVT_TEXT_ENTER, [this](wxCommandEvent&) { Activate(target_->GetValue().ToStdString()); });
         scanBtn_->Bind(wxEVT_BUTTON, [this](wxCommandEvent&) { StartScan(); });
 
-        sendChk_->Bind(wxEVT_CHECKBOX, [this](wxCommandEvent&) { ApplySending(); });
-        srcChoice_->Bind(wxEVT_CHOICE, [this](wxCommandEvent&) { if (sendChk_->GetValue()) ApplySending(); });
-        muteChk_->Bind(wxEVT_CHECKBOX, [this](wxCommandEvent&) { audio_->SetMuted(muteChk_->GetValue()); });
-        volSlider_->Bind(wxEVT_SLIDER, [this](wxCommandEvent&) { audio_->SetVolume(volSlider_->GetValue() / 100.0f); });
+        sendChk_->Bind(wxEVT_CHECKBOX, [this](wxCommandEvent&) { ApplySending(); MarkCfgDirty(); });
+        srcChoice_->Bind(wxEVT_CHOICE, [this](wxCommandEvent&) { if (sendChk_->GetValue()) ApplySending(); MarkCfgDirty(); });
+        muteChk_->Bind(wxEVT_CHECKBOX, [this](wxCommandEvent&) { audio_->SetMuted(muteChk_->GetValue()); MarkCfgDirty(); });
+        volSlider_->Bind(wxEVT_SLIDER, [this](wxCommandEvent&) { audio_->SetVolume(volSlider_->GetValue() / 100.0f); MarkCfgDirty(); });
 
         Bind(wxEVT_CLOSE_WINDOW, &MainFrame::OnClose, this);
 
@@ -410,10 +556,10 @@ public:
         cb.onStatus = [this](const std::string& s) {
             CallAfter([this, s] { Log(wxString::FromUTF8(s)); });
         };
-        cb.onPeerReady = [this](int id, std::uint32_t inst, const std::string& name,
-                                const std::string& addr, bool incoming) {
-            CallAfter([this, id, inst, name, addr, incoming] {
-                OnPeerReady(id, inst, wxString::FromUTF8(name), addr, incoming);
+        cb.onPeerReady = [this](int id, std::uint32_t inst, const std::string& key,
+                                const std::string& name, const std::string& addr, bool incoming) {
+            CallAfter([this, id, inst, key, name, addr, incoming] {
+                OnPeerReady(id, inst, key, wxString::FromUTF8(name), addr, incoming);
             });
         };
         cb.onPeerLost = [this](int id) {
@@ -436,7 +582,7 @@ public:
             CallAfter([this, ip, name] { OnHostName(ip, wxString::FromUTF8(name)); });
         };
         cb.onScanDone = [this]() { CallAfter([this] { OnScanDone(); }); };
-        net_ = std::make_unique<Network>(host_.ToStdString(), std::move(cb));
+        net_ = std::make_unique<Network>(host_.ToStdString(), *ident_, std::move(cb));
 
         audio_ = std::make_unique<AudioEngine>(net_->Instance());
         {
@@ -465,6 +611,8 @@ public:
         }
 
         RebuildList();
+        Log("This PC's key: " + wxString::FromUTF8(ident_->Fingerprint()) + "   (data: " + dataDir_ + ")");
+        if (!identNote_.empty()) Log("Identity: " + wxString::FromUTF8(identNote_));
         Log("Ready. Other seamless-input PCs connect automatically.");
         net_->Start();
         StartScan();
@@ -489,6 +637,7 @@ private:
     };
     struct PeerInfo {
         std::uint32_t inst = 0;
+        std::string key;            // public key (hex), proven by the handshake
         wxString name;
         std::string addr;
         std::vector<wxRect> mons;
@@ -544,6 +693,7 @@ private:
         devList_->InsertColumn(2, "Screens", wxLIST_FORMAT_LEFT, 260);
         devList_->InsertColumn(3, "Audio from device", wxLIST_FORMAT_LEFT, 240);
         devList_->InsertColumn(4, "Keyboard / mouse", wxLIST_FORMAT_LEFT, 230);
+        devList_->InsertColumn(5, "Key", wxLIST_FORMAT_LEFT, 150);
         v->Add(devList_, 1, wxEXPAND | wxALL, 6);
 
         auto* row = new wxBoxSizer(wxHORIZONTAL);
@@ -572,7 +722,7 @@ private:
         irow->Add(inputBtn_, 0, wxALIGN_CENTER_VERTICAL | wxRIGHT, 16);
         irow->Add(new wxStaticText(p, wxID_ANY, "Scroll Lock returns control to this PC"), 0, wxALIGN_CENTER_VERTICAL);
         v->Add(irow, 0, wxLEFT | wxRIGHT | wxBOTTOM, 6);
-        inputChk_->Bind(wxEVT_CHECKBOX, [this](wxCommandEvent&) { input_->SetEnabled(inputChk_->GetValue()); });
+        inputChk_->Bind(wxEVT_CHECKBOX, [this](wxCommandEvent&) { input_->SetEnabled(inputChk_->GetValue()); MarkCfgDirty(); });
         inputBtn_->Bind(wxEVT_BUTTON, [this](wxCommandEvent&) { ToggleSelectedAllowed(); });
 
         p->SetSizer(v);
@@ -605,6 +755,138 @@ private:
     {
         input_->SetPeerOffset(id, x, y);
         net_->Send(id, "POS " + std::to_string(std::lround(x)) + " " + std::to_string(std::lround(y)));
+        RecordPeerPos(id, x, y);
+    }
+
+    // ------------------------------------------------------------ saved configs
+    // The config that belongs to the exact set of connected PCs (by public key) is
+    // kept in cfg_. Every change goes into cfg_ right away and is written to disk
+    // shortly afterwards; when the set changes the matching config is loaded.
+    void UpdateCfgFromUi()
+    {
+        cfg_.audio.send   = sendChk_->GetValue();
+        cfg_.audio.source = srcChoice_->GetSelection() == 1 ? 1 : 0;
+        cfg_.audio.mute   = muteChk_->GetValue();
+        cfg_.audio.volume = volSlider_->GetValue();
+        cfg_.inputEnabled = inputChk_->GetValue();
+    }
+
+    void TouchCfg()
+    {
+        cfgDirty_ = true;
+        dirtyAt_ = std::chrono::steady_clock::now();
+    }
+
+    void MarkCfgDirty()
+    {
+        if (!haveCfg_ || loading_) return;
+        UpdateCfgFromUi();
+        TouchCfg();
+    }
+
+    void RecordPeerPos(int id, double x, double y)
+    {
+        if (!haveCfg_) return;
+        auto it = peers_.find(id);
+        if (it == peers_.end() || it->second.key.empty()) return;
+        SavedPeer& sp = cfg_.PeerRef(it->second.key);
+        const std::string name = std::string(it->second.name.utf8_str());
+        const bool changed = std::llround(sp.ox) != std::llround(x) || std::llround(sp.oy) != std::llround(y) ||
+                             sp.name != name;
+        sp.ox = x;
+        sp.oy = y;
+        sp.name = name;
+        if (changed && !loading_) TouchCfg();
+    }
+
+    void FlushConfig()
+    {
+        if (!haveCfg_ || !cfgDirty_) return;
+        cfgDirty_ = false;
+        cfg_.rev = NowMs();
+        std::string err;
+        if (!store_->Save(cfg_, &err)) Log("Could not save config: " + wxString::FromUTF8(err));
+    }
+
+    // Puts the saved position of peer 'id' on the canvas (pushed off any overlap) and, when this
+    // side accepted the connection, tells the peer. Without a saved position the current one is kept.
+    void ApplyStoredLayout(int id)
+    {
+        auto it = peers_.find(id);
+        if (it == peers_.end() || !it->second.placed) return;
+        PeerInfo& p = it->second;
+        double x = 0, y = 0;
+        if (const SavedPeer* sp = haveCfg_ ? cfg_.FindPeer(p.key) : nullptr) {
+            const auto pos = canvas_->PlacePeer(id, sp->ox, sp->oy);
+            x = pos.first;
+            y = pos.second;
+        } else if (!canvas_->PeerPos(id, x, y)) {
+            return;
+        }
+        if (p.incoming) SendPos(id, x, y);            // the accepting side is authoritative
+        else { input_->SetPeerOffset(id, x, y); RecordPeerPos(id, x, y); }
+    }
+
+    // Audio / input settings of the config go into the widgets and the engines.
+    void ApplyConfigSettings()
+    {
+        const SavedAudio& a = cfg_.audio;
+
+        muteChk_->SetValue(a.mute);
+        audio_->SetMuted(a.mute);
+        volSlider_->SetValue(a.volume);
+        audio_->SetVolume(a.volume / 100.0f);
+
+        const int src = (a.source == 1 && srcChoice_->GetCount() > 1) ? 1 : 0;
+        srcChoice_->SetSelection(src);
+        sendChk_->SetValue(a.send);
+        if (a.send != sendingNow_ || (a.send && src != sendingSrc_)) {   // capture is only restarted when needed
+            ApplySending();
+            if (a.send && sendingNow_) Log("Audio sharing switched on by the saved config");
+        }
+
+        const bool inputWas = inputChk_->GetValue();
+        inputChk_->SetValue(cfg_.inputEnabled);
+        if (inputWas != cfg_.inputEnabled) input_->SetEnabled(cfg_.inputEnabled);
+    }
+
+    // Called whenever a PC joins or leaves: save the old config, load (or start) the one
+    // for the new set of PCs.
+    void OnSetChanged()
+    {
+        FlushConfig();
+
+        std::vector<std::string> members{ident_->PublicHex()};
+        wxString names = host_;
+        for (const auto& kv : peers_) {
+            members.push_back(kv.second.key);
+            names += " + " + kv.second.name;
+        }
+        members = ConfigStore::Normalize(members);
+
+        if (members.size() < 2) { haveCfg_ = false; return; }          // alone: nothing to save
+        if (haveCfg_ && cfg_.members == members) return;
+
+        loading_ = true;
+        SavedConfig loaded;
+        const wxString id = wxString::FromUTF8(ConfigStore::SetId(members));
+        if (store_->Load(members, loaded)) {
+            cfg_ = std::move(loaded);
+            haveCfg_ = true;
+            Log("Loaded saved config " + id + " for " + names);
+            ApplyConfigSettings();
+        } else {
+            cfg_ = SavedConfig{};                    // new combination: start from the current settings
+            cfg_.members = members;
+            haveCfg_ = true;
+            UpdateCfgFromUi();
+            TouchCfg();
+            Log("New combination of PCs (" + names + ") - created config " + id);
+        }
+        cfg_.label = std::string(names.utf8_str());
+
+        for (const auto& kv : peers_) ApplyStoredLayout(kv.first);   // peers that already sent SCREENS
+        loading_ = false;
     }
 
     std::string ScreensLine() const
@@ -624,8 +906,11 @@ private:
         if (!audio_->SetSending(on, src, &err)) {
             Log("Audio capture failed: " + wxString::FromUTF8(err));
             sendChk_->SetValue(false);
+            sendingNow_ = false;
             return;
         }
+        sendingNow_ = on;
+        sendingSrc_ = src == AudioSource::System ? 1 : 0;
         if (!on)                           Log("Stopped sharing audio");
         else if (src == AudioSource::System) Log("Sharing system audio with all connected PCs");
         else                               Log("Sharing microphone with all connected PCs");
@@ -680,20 +965,24 @@ private:
     }
 
     // ------------------------------------------------------- network results
-    void OnPeerReady(int id, std::uint32_t inst, const wxString& name, const std::string& addr, bool incoming)
+    void OnPeerReady(int id, std::uint32_t inst, const std::string& key, const wxString& name,
+                     const std::string& addr, bool incoming)
     {
         PeerInfo& p = peers_[id];
         p.inst = inst;
+        p.key = key;
         p.name = name;
         p.addr = addr;
         p.incoming = incoming;
         p.placed = false;
 
-        Log("Connection established with " + name + " (" + wxString::FromUTF8(addr) + ")");
+        Log("Connection established with " + name + " (" + wxString::FromUTF8(addr) + "), key " +
+            wxString::FromUTF8(Identity::Fingerprint(key)) + " verified");
         audio_->AddPeer(inst, addr);
         net_->Send(id, ScreensLine());      // tell the peer about our monitors
         RebuildList();
         RebuildDevices();
+        OnSetChanged();                     // a new set of PCs: switch to its config
         // The virtual window appears once the peer's SCREENS line arrives.
     }
 
@@ -708,6 +997,7 @@ private:
         canvas_->RemovePeer(id);            // virtual window disappears with the connection
         RebuildList();
         RebuildDevices();
+        OnSetChanged();
     }
 
     void OnMessage(int id, const std::string& line)
@@ -738,9 +1028,9 @@ private:
                 std::vector<InputRect> rects;
                 for (const auto& m : mons) rects.push_back({m.x, m.y, m.width, m.height});
                 input_->SetPeer(id, rects, pos.first, pos.second);
-                input_->SetPeerAllowed(id, allowed_.count(p.inst) > 0);
+                input_->SetPeerAllowed(id, trust_->Get(p.key) == TrustStore::State::Allowed);
             }
-            if (p.incoming) SendPos(id, pos.first, pos.second);
+            ApplyStoredLayout(id);              // saved position for this set of PCs (or the default one)
             RebuildDevices();
             return;
         }
@@ -750,6 +1040,7 @@ private:
         {
             canvas_->SetPeerPos(id, -x, -y);   // mirrored: their view of us is the opposite offset
             input_->SetPeerOffset(id, -x, -y);
+            RecordPeerPos(id, -x, -y);
         }
     }
 
@@ -774,6 +1065,7 @@ private:
             else ++it;
         }
         if (removed) RebuildList();
+        if (cfgDirty_ && now - dirtyAt_ > std::chrono::milliseconds(600)) FlushConfig();
         if (++tick_ % 120 == 0) StartScan();   // periodic rescan
     }
 
@@ -834,31 +1126,40 @@ private:
             devList_->SetItem(row, 1, wxString::FromUTF8(p.addr));
             devList_->SetItem(row, 2, ScreensText(p.mons));
             devList_->SetItem(row, 3, "no audio");
-            wxString in = allowed_.count(p.inst) ? "may control this PC" : "blocked (asks first)";
+            const auto ts = trust_->Get(p.key);
+            wxString in = ts == TrustStore::State::Allowed ? "may control this PC"
+                        : ts == TrustStore::State::Denied  ? "blocked" : "asks first";
             if (inputMode_ == InputEngine::Mode::Forwarding && inputPeer_ == kv.first) in = "YOU are controlling it";
             if (inputMode_ == InputEngine::Mode::Controlled && inputPeer_ == kv.first) in = "controlling this PC now";
             devList_->SetItem(row, 4, in);
+            devList_->SetItem(row, 5, wxString::FromUTF8(Identity::Fingerprint(p.key)));
         }
         devList_->Thaw();
+    }
+
+    void SetTrust(const PeerInfo& p, TrustStore::State st)
+    {
+        std::string err;
+        if (!trust_->Set(p.key, st, std::string(p.name.utf8_str()), &err))
+            Log("Could not save permissions: " + wxString::FromUTF8(err));
     }
 
     // A peer reached its screen edge towards us: nothing happens until the user agrees.
     void OnControlRequest(int id)
     {
         auto it = peers_.find(id);
-        if (it == peers_.end() || denied_.count(it->second.inst)) return;
+        if (it == peers_.end() || trust_->Get(it->second.key) == TrustStore::State::Denied) return;
         const PeerInfo& p = it->second;
         wxMessageDialog dlg(this,
             p.name + " (" + wxString::FromUTF8(p.addr) + ") wants to control the keyboard and mouse of THIS PC.\n\n"
             "Anything it types or clicks will happen here. Only allow PCs you own.\n\nAllow it?",
             "Input control request", wxYES_NO | wxNO_DEFAULT | wxICON_QUESTION);
         if (dlg.ShowModal() == wxID_YES) {
-            allowed_.insert(p.inst);
-            denied_.erase(p.inst);
+            SetTrust(p, TrustStore::State::Allowed);
             input_->SetPeerAllowed(id, true);
             Log("Allowed " + p.name + " to control this PC - move the cursor to its edge again");
         } else {
-            denied_.insert(p.inst);
+            SetTrust(p, TrustStore::State::Denied);
             Log("Blocked input control from " + p.name);
         }
         RebuildDevices();
@@ -871,9 +1172,9 @@ private:
         const int id = (int)devList_->GetItemData(row);
         auto it = peers_.find(id);
         if (it == peers_.end()) return;
-        const std::uint32_t inst = it->second.inst;
-        if (allowed_.count(inst)) { allowed_.erase(inst); denied_.insert(inst); input_->SetPeerAllowed(id, false); }
-        else                      { allowed_.insert(inst); denied_.erase(inst); input_->SetPeerAllowed(id, true); }
+        const bool wasAllowed = trust_->Get(it->second.key) == TrustStore::State::Allowed;
+        SetTrust(it->second, wasAllowed ? TrustStore::State::Denied : TrustStore::State::Allowed);
+        input_->SetPeerAllowed(id, !wasAllowed);
         RebuildDevices();
     }
 
@@ -904,6 +1205,7 @@ private:
 
     void OnClose(wxCloseEvent&)
     {
+        FlushConfig();
         timer_.Stop();
         animTimer_.Stop();
         statTimer_.Stop();
@@ -948,7 +1250,18 @@ private:
     std::unique_ptr<Network> net_;
     std::unique_ptr<AudioEngine> audio_;
     std::unique_ptr<InputEngine> input_;
-    std::set<std::uint32_t> allowed_, denied_;    // peers (by instance id) that may / may not control this PC
+    std::unique_ptr<TrustStore> trust_;           // peers (by public key) that may / may not control this PC; persisted
+    std::unique_ptr<Identity> ident_;             // this PC's key pair
+    std::unique_ptr<ConfigStore> store_;
+    std::string identNote_;
+    wxString dataDir_;
+    SavedConfig cfg_;                             // config of the currently connected set of PCs
+    bool haveCfg_ = false;                        // false while no other PC is connected
+    bool cfgDirty_ = false;
+    bool loading_ = false;
+    std::chrono::steady_clock::time_point dirtyAt_;
+    bool sendingNow_ = false;
+    int sendingSrc_ = 0;
     InputEngine::Mode inputMode_ = InputEngine::Mode::Local;
     int inputPeer_ = -1;
 };
@@ -957,6 +1270,7 @@ class App : public wxApp {
 public:
     bool OnInit() override
     {
+        SetAppName("seamless-input");
         (new MainFrame)->Show();
         return true;
     }
