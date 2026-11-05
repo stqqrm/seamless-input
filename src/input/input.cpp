@@ -1,0 +1,539 @@
+#include "input/input.hpp"
+
+#include <chrono>
+#include <climits>
+#include <cmath>
+#include <condition_variable>
+#include <cstdio>
+#include <cstdlib>
+#include <cstring>
+#include <deque>
+#include <map>
+#include <mutex>
+#include <set>
+#include <thread>
+
+#include "input/input_backend.hpp"
+
+#if defined(_WIN32)
+std::unique_ptr<InputBackend> MakeWindowsBackend();
+#elif defined(__linux__)
+std::unique_ptr<InputBackend> MakeX11Backend(std::string* why);
+std::unique_ptr<InputBackend> MakeEvdevBackend();
+#endif
+
+namespace {
+
+using Clock = std::chrono::steady_clock;
+
+constexpr int kKeyScrollLock = 70;      // emergency exit while forwarding
+constexpr int kInset         = 4;       // px inside the target monitor where the cursor lands
+constexpr int kExitBack      = 24;      // px inside our own monitor after control comes back
+constexpr int kMaxGap        = 256;     // largest gap between monitors that is still bridged
+constexpr auto kCooldown     = std::chrono::milliseconds(250);
+constexpr auto kRetry        = std::chrono::milliseconds(750);
+
+std::unique_ptr<InputBackend> CreateBackend(std::string* why)
+{
+#if defined(_WIN32)
+    (void)why;
+    return MakeWindowsBackend();
+#elif defined(__linux__)
+    const char* force = std::getenv("SEAMLESS_INPUT_BACKEND");
+    const char* sess  = std::getenv("XDG_SESSION_TYPE");
+    std::string pick;
+    if (force && *force)                         pick = force;
+    else if (sess && !std::strcmp(sess, "wayland")) pick = "evdev";
+    else if (sess && !std::strcmp(sess, "x11"))     pick = "x11";
+    else if (std::getenv("WAYLAND_DISPLAY"))        pick = "evdev";
+    else if (std::getenv("DISPLAY"))                pick = "x11";
+    else                                            pick = "evdev";
+
+    if (pick == "x11") return MakeX11Backend(why);
+    return MakeEvdevBackend();
+#else
+    if (why) *why = "keyboard/mouse sharing is not implemented for this platform";
+    return nullptr;
+#endif
+}
+
+} // namespace
+
+struct InputEngine::Impl {
+    struct Peer {
+        std::vector<InputRect> mons;   // peer desktop coordinates
+        int bx = 0, by = 0;            // top-left of the peer's bounding box
+        double ox = 0, oy = 0;
+        bool placed = false;
+        bool allowed = false;
+        bool requested = false;
+    };
+    struct Crossing { int peer = -1; int x = 0, y = 0; };
+    struct Out { int peer = 0; InputEvent ev; std::string raw; bool isRaw = false; };
+
+    Impl(InputEngine* s, SendFn sf, LogFn lf) : self(s), send(std::move(sf)), log(std::move(lf)) {}
+
+    InputEngine* self;
+    SendFn send;
+    LogFn log;
+    std::unique_ptr<InputBackend> be;
+
+    std::mutex mu;
+    bool enabled = true;
+    bool started = false;
+    Mode mode = Mode::Local;
+    int peerId = -1;
+
+    std::vector<InputRect> mons;
+    int lbx = 0, lby = 0;
+    std::map<int, Peer> peers;
+
+    int cx = 0, cy = 0;                 // Controlled: where our cursor is
+    int exitX = 0, exitY = 0;           // Forwarding: where our cursor goes on a forced stop
+    std::set<int> keysDown, btnsDown;   // Controlled: what we injected and must release
+    Clock::time_point lastSwitch{};
+    std::string lastErr;
+
+    // ---- outgoing queue (keeps hook callbacks fast and coalesces mouse motion)
+    std::mutex qmu;
+    std::condition_variable qcv;
+    std::deque<Out> q;
+    bool qstop = false;
+    std::thread sender;
+
+    // ----------------------------------------------------------------- sender
+    void Push(int peer, const InputEvent& ev)
+    {
+        std::lock_guard<std::mutex> lk(qmu);
+        if (!q.empty()) {
+            Out& t = q.back();
+            if (!t.isRaw && t.peer == peer && t.ev.kind == ev.kind &&
+                (ev.kind == InputKind::Move || ev.kind == InputKind::Wheel)) {
+                t.ev.a += ev.a;
+                t.ev.b += ev.b;
+                return;
+            }
+        }
+        Out o; o.peer = peer; o.ev = ev;
+        q.push_back(std::move(o));
+        qcv.notify_one();
+    }
+
+    void PushRaw(int peer, std::string line)
+    {
+        std::lock_guard<std::mutex> lk(qmu);
+        Out o; o.peer = peer; o.raw = std::move(line); o.isRaw = true;
+        q.push_back(std::move(o));
+        qcv.notify_one();
+    }
+
+    static std::string Format(const Out& o)
+    {
+        if (o.isRaw) return o.raw;
+        char b[64];
+        switch (o.ev.kind) {
+        case InputKind::Move:   std::snprintf(b, sizeof b, "M %d %d", o.ev.a, o.ev.b); break;
+        case InputKind::Button: std::snprintf(b, sizeof b, "B %d %d", o.ev.a, o.ev.b); break;
+        case InputKind::Wheel:  std::snprintf(b, sizeof b, "W %d %d", o.ev.a, o.ev.b); break;
+        case InputKind::Key:    std::snprintf(b, sizeof b, "K %d %d", o.ev.a, o.ev.b); break;
+        }
+        return b;
+    }
+
+    void SenderLoop()
+    {
+        std::unique_lock<std::mutex> lk(qmu);
+        for (;;) {
+            qcv.wait(lk, [this] { return qstop || !q.empty(); });
+            if (qstop) break;
+            std::deque<Out> batch;
+            batch.swap(q);
+            lk.unlock();
+            for (const auto& o : batch) send(o.peer, Format(o));
+            // ~500 Hz cap: motion that arrives meanwhile is merged in Push()
+            std::this_thread::sleep_for(std::chrono::milliseconds(2));
+            lk.lock();
+        }
+    }
+
+    // ----------------------------------------------------------------- layout
+    // The cursor of this PC is at (px, py) and wants to leave in direction (dx, dy).
+    // Finds the peer monitor that lies beyond that edge. onlyPeer >= 0 restricts
+    // the search to one peer (used for "give control back").
+    bool FindCrossing(int px, int py, int dx, int dy, int onlyPeer, Crossing& out) const
+    {
+        if (!inputgeom::InsideAny(mons, px, py)) return false;
+        if (inputgeom::InsideAny(mons, px + dx, py + dy)) return false;   // not an outer edge
+
+        const int wx = px - lbx, wy = py - lby;     // world coordinates
+        int bestGap = INT_MAX;
+        for (const auto& kv : peers) {
+            const Peer& P = kv.second;
+            if (!P.placed || (onlyPeer >= 0 && kv.first != onlyPeer)) continue;
+            const int pox = (int)std::lround(P.ox), poy = (int)std::lround(P.oy);
+            for (const auto& m : P.mons) {
+                const int rx = pox + m.x - P.bx, ry = poy + m.y - P.by;   // monitor in our world
+                int gap, ex, ey;
+                if (dx > 0) {
+                    if (wy < ry || wy >= ry + m.h || rx + m.w <= wx + 1) continue;
+                    gap = std::max(0, rx - (wx + 1));
+                    ex  = std::min(rx + m.w - 1, std::max(wx + 1, rx) + kInset);
+                    ey  = wy;
+                } else if (dx < 0) {
+                    if (wy < ry || wy >= ry + m.h || rx > wx - 1) continue;
+                    gap = std::max(0, (wx - 1) - (rx + m.w - 1));
+                    ex  = std::max(rx, std::min(wx - 1, rx + m.w - 1) - kInset);
+                    ey  = wy;
+                } else if (dy > 0) {
+                    if (wx < rx || wx >= rx + m.w || ry + m.h <= wy + 1) continue;
+                    gap = std::max(0, ry - (wy + 1));
+                    ey  = std::min(ry + m.h - 1, std::max(wy + 1, ry) + kInset);
+                    ex  = wx;
+                } else {
+                    if (wx < rx || wx >= rx + m.w || ry > wy - 1) continue;
+                    gap = std::max(0, (wy - 1) - (ry + m.h - 1));
+                    ey  = std::max(ry, std::min(wy - 1, ry + m.h - 1) - kInset);
+                    ex  = wx;
+                }
+                if (gap > kMaxGap || gap >= bestGap) continue;
+                bestGap = gap;
+                out.peer = kv.first;
+                out.x = ex - pox + P.bx;            // back to the peer's desktop coordinates
+                out.y = ey - poy + P.by;
+            }
+        }
+        return bestGap != INT_MAX;
+    }
+
+    void Notify() { if (self->onModeChange) self->onModeChange(mode, peerId); }
+
+    // -------------------------------------------------- local -> peer (we control)
+    void OnLocalMotion(int x, int y, bool buttonsDown)
+    {
+        std::lock_guard<std::mutex> lk(mu);
+        if (!enabled || !started || mode != Mode::Local || buttonsDown || peers.empty()) return;
+        const auto now = Clock::now();
+        if (now - lastSwitch < kCooldown) return;
+
+        static const int dirs[4][2] = {{1, 0}, {-1, 0}, {0, 1}, {0, -1}};
+        for (const auto& d : dirs) {
+            Crossing c;
+            if (!FindCrossing(x, y, d[0], d[1], -1, c)) continue;
+
+            int parkX = x, parkY = y;
+            inputgeom::MonitorCenter(mons, x, y, parkX, parkY);
+            std::string err;
+            if (!be->BeginForwarding(parkX, parkY, &err)) {
+                lastSwitch = now - kCooldown + kRetry;      // retry in ~750 ms
+                if (err != lastErr) { lastErr = err; log("Cannot take over input: " + err); }
+                return;
+            }
+            lastErr.clear();
+            exitX = x - d[0] * kExitBack;
+            exitY = y - d[1] * kExitBack;
+            inputgeom::ClampToAny(mons, exitX, exitY);
+
+            mode = Mode::Forwarding;
+            peerId = c.peer;
+            lastSwitch = now;
+            PushRaw(c.peer, "ENTER " + std::to_string(c.x) + " " + std::to_string(c.y));
+            Notify();
+            return;
+        }
+    }
+
+    void OnForwarded(const InputEvent& ev)
+    {
+        std::lock_guard<std::mutex> lk(mu);
+        if (mode != Mode::Forwarding) return;
+        if (ev.kind == InputKind::Key && ev.a == kKeyScrollLock && ev.b == 1) {
+            log("Scroll Lock pressed - input returned to this PC");
+            StopForwardingLocked(true, -1, -1);
+            return;
+        }
+        Push(peerId, ev);
+    }
+
+    // x,y < 0 means "use the position we left from".
+    void StopForwardingLocked(bool tellPeer, int x, int y)
+    {
+        if (mode != Mode::Forwarding) return;
+        if (x < 0 || y < 0) { x = exitX; y = exitY; }
+        else {
+            inputgeom::ClampToAny(mons, x, y);
+        }
+        be->EndForwarding(x, y);
+        if (tellPeer) PushRaw(peerId, "RELEASE");
+        mode = Mode::Local;
+        lastSwitch = Clock::now();
+        peerId = -1;
+        Notify();
+    }
+
+    // ------------------------------------------------- peer -> local (we are controlled)
+    void ReleaseInjectedLocked()
+    {
+        for (int k : keysDown) be->InjectKey(k, false);
+        for (int b : btnsDown) be->InjectButton(b, false);
+        keysDown.clear();
+        btnsDown.clear();
+    }
+
+    void StopControlledLocked(bool tellPeer)
+    {
+        if (mode != Mode::Controlled) return;
+        ReleaseInjectedLocked();
+        if (tellPeer) PushRaw(peerId, "DENY");
+        mode = Mode::Local;
+        lastSwitch = Clock::now();
+        peerId = -1;
+        Notify();
+    }
+
+    void RemoteMoveLocked(int id, int dx, int dy)
+    {
+        if (mode != Mode::Controlled || id != peerId) return;
+        const int nx = cx + dx, ny = cy + dy;
+        if (inputgeom::InsideAny(mons, nx, ny)) {
+            cx = nx; cy = ny;
+            be->InjectMoveTo(cx, cy);
+            return;
+        }
+
+        int px = nx, py = ny;
+        inputgeom::ClampToAny(mons, px, py);
+        const int sx = nx < px ? -1 : (nx > px ? 1 : 0);    // direction of the overshoot
+        const int sy = ny < py ? -1 : (ny > py ? 1 : 0);
+
+        Crossing c;
+        const bool back = (sx && FindCrossing(px, py, sx, 0, peerId, c)) ||
+                          (sy && FindCrossing(px, py, 0, sy, peerId, c));
+        if (!back) {
+            cx = px; cy = py;
+            be->InjectMoveTo(cx, cy);
+            return;
+        }
+
+        PushRaw(peerId, "RETURN " + std::to_string(c.x) + " " + std::to_string(c.y));
+        ReleaseInjectedLocked();
+        int ix = px - (sx ? sx * kExitBack : 0);
+        int iy = py - (sy && !sx ? sy * kExitBack : 0);
+        inputgeom::ClampToAny(mons, ix, iy);
+        be->InjectMoveTo(ix, iy);
+        mode = Mode::Local;
+        lastSwitch = Clock::now();
+        peerId = -1;
+        Notify();
+    }
+
+    void DispatchLocked(int id, char type, int a, int b)
+    {
+        if (mode != Mode::Controlled || id != peerId) return;
+        switch (type) {
+        case 'M': RemoteMoveLocked(id, a, b); break;
+        case 'B':
+            if (b) btnsDown.insert(a); else btnsDown.erase(a);
+            be->InjectButton(a, b != 0);
+            break;
+        case 'W': be->InjectWheel(a, b); break;
+        case 'K':
+            if (b) keysDown.insert(a); else keysDown.erase(a);
+            be->InjectKey(a, b != 0);
+            break;
+        }
+    }
+};
+
+// ---------------------------------------------------------------------------
+InputEngine::InputEngine(SendFn send, LogFn log)
+    : d_(new Impl(this, std::move(send), std::move(log))) {}
+
+InputEngine::~InputEngine() { Stop(); }
+
+void InputEngine::SetLocalMonitors(const std::vector<InputRect>& mons)
+{
+    std::lock_guard<std::mutex> lk(d_->mu);
+    d_->mons = mons;
+    const InputRect b = inputgeom::Bounds(mons);
+    d_->lbx = b.x;
+    d_->lby = b.y;
+}
+
+bool InputEngine::Start(std::string* msg)
+{
+    if (d_->started) return true;
+    std::string why;
+    d_->be = CreateBackend(&why);
+    if (!d_->be) {
+        if (msg) *msg = why.empty() ? "no input backend available" : why;
+        return false;
+    }
+
+    {
+        std::lock_guard<std::mutex> lk(d_->mu);
+        d_->be->SetGeometry(d_->mons);
+    }
+
+    BackendSink sink;
+    sink.onLocalMotion = [this](int x, int y, bool b) { d_->OnLocalMotion(x, y, b); };
+    sink.onForwarded   = [this](const InputEvent& e) { d_->OnForwarded(e); };
+
+    std::string err;
+    if (!d_->be->Start(std::move(sink), &err)) {
+        if (msg) *msg = err.empty() ? "input backend failed to start" : err;
+        d_->be.reset();
+        return false;
+    }
+    if (msg) *msg = err;     // warning, if any
+
+    d_->qstop = false;
+    d_->sender = std::thread([this] { d_->SenderLoop(); });
+    std::lock_guard<std::mutex> lk(d_->mu);
+    d_->started = true;
+    return true;
+}
+
+void InputEngine::Stop()
+{
+    if (!d_->be) return;
+    {
+        std::lock_guard<std::mutex> lk(d_->mu);
+        d_->started = false;
+        d_->StopForwardingLocked(true, -1, -1);
+        d_->StopControlledLocked(true);
+    }
+    d_->be->Stop();                 // joins the backend thread: no more callbacks after this
+    {
+        std::lock_guard<std::mutex> lk(d_->qmu);
+        d_->qstop = true;
+    }
+    d_->qcv.notify_all();
+    if (d_->sender.joinable()) d_->sender.join();
+    d_->be.reset();
+}
+
+std::string InputEngine::BackendName() const
+{
+    return d_->be ? d_->be->Name() : std::string("none");
+}
+
+void InputEngine::SetEnabled(bool on)
+{
+    std::lock_guard<std::mutex> lk(d_->mu);
+    d_->enabled = on;
+    if (!on && d_->be) {
+        d_->StopForwardingLocked(true, -1, -1);
+        d_->StopControlledLocked(true);
+    }
+}
+
+void InputEngine::SetPeer(int id, const std::vector<InputRect>& mons, double ox, double oy)
+{
+    std::lock_guard<std::mutex> lk(d_->mu);
+    auto& p = d_->peers[id];
+    p.mons = mons;
+    const InputRect b = inputgeom::Bounds(mons);
+    p.bx = b.x;
+    p.by = b.y;
+    p.ox = ox;
+    p.oy = oy;
+    p.placed = !mons.empty();
+}
+
+void InputEngine::SetPeerOffset(int id, double ox, double oy)
+{
+    std::lock_guard<std::mutex> lk(d_->mu);
+    auto it = d_->peers.find(id);
+    if (it == d_->peers.end()) return;
+    it->second.ox = ox;
+    it->second.oy = oy;
+}
+
+void InputEngine::SetPeerAllowed(int id, bool allowed)
+{
+    std::lock_guard<std::mutex> lk(d_->mu);
+    auto it = d_->peers.find(id);
+    if (it == d_->peers.end()) return;
+    it->second.allowed = allowed;
+    it->second.requested = false;
+    if (!allowed && d_->be && d_->mode == Mode::Controlled && d_->peerId == id)
+        d_->StopControlledLocked(true);
+}
+
+void InputEngine::RemovePeer(int id)
+{
+    std::lock_guard<std::mutex> lk(d_->mu);
+    d_->peers.erase(id);
+    if (!d_->be || d_->peerId != id) return;
+    if (d_->mode == Mode::Forwarding)      d_->StopForwardingLocked(false, -1, -1);
+    else if (d_->mode == Mode::Controlled) d_->StopControlledLocked(false);
+}
+
+bool InputEngine::HandleMessage(int id, const std::string& line)
+{
+    if (line.empty()) return false;
+    const char* s = line.c_str();
+    int a = 0, b = 0;
+
+    // ---- hot path: events from the controller
+    if ((s[0] == 'M' || s[0] == 'B' || s[0] == 'W' || s[0] == 'K') && s[1] == ' ') {
+        if (std::sscanf(s + 2, "%d %d", &a, &b) != 2) return true;
+        std::lock_guard<std::mutex> lk(d_->mu);
+        if (d_->started) d_->DispatchLocked(id, s[0], a, b);
+        return true;
+    }
+
+    if (line.rfind("ENTER ", 0) == 0) {
+        if (std::sscanf(s + 6, "%d %d", &a, &b) != 2) return true;
+        bool ask = false;
+        {
+            std::lock_guard<std::mutex> lk(d_->mu);
+            auto it = d_->peers.find(id);
+            const bool known = it != d_->peers.end() && it->second.placed;
+            const bool ok = d_->started && d_->enabled && known && it->second.allowed &&
+                            d_->mode == Mode::Local;
+            if (!ok) {
+                if (d_->started && d_->enabled && known && !it->second.allowed && !it->second.requested) {
+                    it->second.requested = true;
+                    ask = true;
+                }
+                d_->PushRaw(id, "DENY");
+            } else {
+                d_->cx = a;
+                d_->cy = b;
+                inputgeom::ClampToAny(d_->mons, d_->cx, d_->cy);
+                d_->mode = Mode::Controlled;
+                d_->peerId = id;
+                d_->lastSwitch = Clock::now();
+                d_->be->InjectMoveTo(d_->cx, d_->cy);
+                d_->Notify();
+            }
+        }
+        if (ask && onControlRequest) onControlRequest(id);
+        return true;
+    }
+
+    if (line.rfind("RETURN ", 0) == 0) {
+        if (std::sscanf(s + 7, "%d %d", &a, &b) != 2) return true;
+        std::lock_guard<std::mutex> lk(d_->mu);
+        if (d_->mode == Mode::Forwarding && d_->peerId == id) d_->StopForwardingLocked(false, a, b);
+        return true;
+    }
+
+    if (line == "RELEASE") {
+        std::lock_guard<std::mutex> lk(d_->mu);
+        if (d_->mode == Mode::Controlled && d_->peerId == id) d_->StopControlledLocked(false);
+        return true;
+    }
+
+    if (line == "DENY") {
+        std::lock_guard<std::mutex> lk(d_->mu);
+        if (d_->mode == Mode::Forwarding && d_->peerId == id) {
+            d_->log("The other PC refused input control (it has to allow this PC first)");
+            d_->StopForwardingLocked(false, -1, -1);
+        }
+        return true;
+    }
+
+    return false;
+}

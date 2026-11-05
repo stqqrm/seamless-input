@@ -121,6 +121,13 @@ struct AudioEngine::Impl {
     ma_device capture;
     bool playbackOn = false;
     bool captureOn  = false;
+#if defined(__linux__)
+    // System audio on Linux = the PulseAudio/PipeWire "monitor" of the default output.
+    // miniaudio's loopback device type only exists for WASAPI, so we open that monitor
+    // source as an ordinary capture device. The context must outlive the device.
+    ma_context sysCtx;
+    bool sysCtxOn = false;
+#endif
     bool stopped    = false;
 
     std::atomic<bool>  sending{false};
@@ -182,6 +189,7 @@ struct AudioEngine::Impl {
         stopped = true;
         sending = false;
         if (captureOn)  { ma_device_uninit(&capture);  captureOn = false; }
+        CloseSysCtx();
         if (playbackOn) { ma_device_uninit(&playback); playbackOn = false; }
         if (th.joinable()) {
             asio::post(io, [this] { error_code ec; sock.close(ec); });
@@ -214,12 +222,21 @@ struct AudioEngine::Impl {
     bool SetSending(bool on, AudioSource src, std::string* err)
     {
         if (captureOn) { ma_device_uninit(&capture); captureOn = false; }
+        CloseSysCtx();
         sending = false;
         inLevel = 0.0f;
         if (!on) return true;
 
+#if defined(__linux__)
+        const bool system = src == AudioSource::System;
+        ma_device_id monitorId;
+        if (system && !OpenMonitor(&monitorId, err)) return false;
+        ma_device_config cfg = ma_device_config_init(ma_device_type_capture);
+        if (system) cfg.capture.pDeviceID = &monitorId;
+#else
         ma_device_config cfg = ma_device_config_init(
             src == AudioSource::System ? ma_device_type_loopback : ma_device_type_capture);
+#endif
         cfg.capture.format    = ma_format_s16;
         cfg.capture.channels  = kChannels;
         cfg.sampleRate        = kRate;
@@ -228,13 +245,19 @@ struct AudioEngine::Impl {
         cfg.dataCallback      = &Impl::CaptureCb;
         cfg.pUserData         = this;
 
-        ma_result r = ma_device_init(nullptr, &cfg, &capture);
-        if (r != MA_SUCCESS) { if (err) *err = ma_result_description(r); return false; }
+#if defined(__linux__)
+        ma_context* ctx = (system && sysCtxOn) ? &sysCtx : nullptr;
+#else
+        ma_context* ctx = nullptr;
+#endif
+        ma_result r = ma_device_init(ctx, &cfg, &capture);
+        if (r != MA_SUCCESS) { CloseSysCtx(); if (err) *err = ma_result_description(r); return false; }
 
         stageCount = 0;
         r = ma_device_start(&capture);
         if (r != MA_SUCCESS) {
             ma_device_uninit(&capture);
+            CloseSysCtx();
             if (err) *err = ma_result_description(r);
             return false;
         }
@@ -242,6 +265,55 @@ struct AudioEngine::Impl {
         sending = true;
         return true;
     }
+
+    void CloseSysCtx()
+    {
+#if defined(__linux__)
+        if (sysCtxOn) { ma_context_uninit(&sysCtx); sysCtxOn = false; }
+#endif
+    }
+
+#if defined(__linux__)
+    // Finds the ".monitor" source of the default output (falls back to the first monitor).
+    bool OpenMonitor(ma_device_id* out, std::string* err)
+    {
+        const ma_backend backends[] = {ma_backend_pulseaudio};   // PipeWire answers through pipewire-pulse
+        if (ma_context_init(backends, 1, nullptr, &sysCtx) != MA_SUCCESS) {
+            if (err) *err = "system audio needs PulseAudio or PipeWire (pipewire-pulse); neither is reachable";
+            return false;
+        }
+        sysCtxOn = true;
+
+        ma_device_info *pb = nullptr, *cap = nullptr;
+        ma_uint32 nPb = 0, nCap = 0;
+        if (ma_context_get_devices(&sysCtx, &pb, &nPb, &cap, &nCap) != MA_SUCCESS) {
+            CloseSysCtx();
+            if (err) *err = "could not list audio devices";
+            return false;
+        }
+
+        std::string defaultSink;
+        for (ma_uint32 i = 0; i < nPb; ++i)
+            if (pb[i].isDefault) { defaultSink = pb[i].id.pulse; break; }
+
+        const ma_device_info* best = nullptr;
+        for (ma_uint32 i = 0; i < nCap; ++i) {
+            const std::string name = cap[i].id.pulse;
+            const std::string suffix = ".monitor";
+            if (name.size() < suffix.size() || name.compare(name.size() - suffix.size(), suffix.size(), suffix) != 0)
+                continue;
+            if (!best) best = &cap[i];
+            if (!defaultSink.empty() && name == defaultSink + suffix) { best = &cap[i]; break; }
+        }
+        if (!best) {
+            CloseSysCtx();
+            if (err) *err = "no monitor source found (is an audio output active?)";
+            return false;
+        }
+        *out = best->id;
+        return true;
+    }
+#endif
 
     static void CaptureCb(ma_device* dev, void*, const void* in, ma_uint32 frames)
     {
@@ -426,8 +498,8 @@ float AudioEngine::InputLevel() const                     { return d_->inLevel.l
 
 bool AudioEngine::SystemAudioSupported()
 {
-#ifdef _WIN32
-    return true;
+#if defined(_WIN32) || defined(__linux__)
+    return true;      // WASAPI loopback / PulseAudio-PipeWire monitor source
 #else
     return false;
 #endif
