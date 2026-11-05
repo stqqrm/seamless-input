@@ -3,8 +3,14 @@
 #include <wx/dcgraph.h>
 #include <wx/graphics.h>
 #include <wx/scrolwin.h>
+#include <wx/simplebook.h>
 #include <wx/settings.h>
 #include <wx/statline.h>
+
+#ifdef __WXMSW__
+#include <dwmapi.h>
+#include <uxtheme.h>
+#endif
 #include <wx/display.h>
 #include <wx/listctrl.h>
 #include <wx/notebook.h>
@@ -706,6 +712,132 @@ private:
     bool muted_ = false, hover_ = false, down_ = false;
 };
 
+
+// Dark-mode helpers for native Windows controls (wxWidgets 3.2 draws them light otherwise).
+static void DarkenNative(wxWindow* w, const wchar_t* theme = L"DarkMode_Explorer")
+{
+#ifdef __WXMSW__
+    if (w && w->GetHWND()) SetWindowTheme((HWND)w->GetHWND(), theme, nullptr);
+#else
+    (void)w; (void)theme;
+#endif
+}
+
+static void DarkenTree(wxWindow* w)
+{
+#ifdef __WXMSW__
+    if (!w) return;
+    if (dynamic_cast<wxChoice*>(w))        DarkenNative(w, L"DarkMode_CFD");
+    else if (auto* lc = dynamic_cast<wxListCtrl*>(w)) {
+        DarkenNative(w, L"DarkMode_Explorer");
+        if (HWND hdr = ListView_GetHeader((HWND)lc->GetHWND())) SetWindowTheme(hdr, L"DarkMode_ItemsView", nullptr);
+    }
+    else if (dynamic_cast<wxButton*>(w) || dynamic_cast<wxTextCtrl*>(w) || dynamic_cast<wxScrolledWindow*>(w))
+        DarkenNative(w, L"DarkMode_Explorer");
+    for (wxWindow* c : w->GetChildren()) DarkenTree(c);
+#else
+    (void)w;
+#endif
+}
+
+static void DarkTitleBar(wxWindow* w)
+{
+#ifdef __WXMSW__
+    if (!w || !w->GetHWND()) return;
+    BOOL on = TRUE;
+    DwmSetWindowAttribute((HWND)w->GetHWND(), 20 /*DWMWA_USE_IMMERSIVE_DARK_MODE*/, &on, sizeof on);
+    DwmSetWindowAttribute((HWND)w->GetHWND(), 19 /*same, Windows 10 before 20H1*/, &on, sizeof on);
+#else
+    (void)w;
+#endif
+}
+
+// Flat tab strip (replaces wxNotebook, whose white frame cannot be themed).
+class TabBar : public wxControl {
+public:
+    std::function<void(int)> onSelect;
+
+    TabBar(wxWindow* parent, const Theme& t, std::vector<wxString> labels)
+        : wxControl(parent, wxID_ANY, wxDefaultPosition, wxSize(-1, 38), wxBORDER_NONE),
+          t_(t), labels_(std::move(labels))
+    {
+        SetBackgroundStyle(wxBG_STYLE_PAINT);
+        SetMinSize(wxSize(-1, 38));
+        Bind(wxEVT_PAINT, &TabBar::OnPaint, this);
+        Bind(wxEVT_MOTION, [this](wxMouseEvent& e) {
+            const int h = HitTest(e.GetPosition());
+            if (h != hover_) { hover_ = h; SetCursor(h >= 0 ? wxCursor(wxCURSOR_HAND) : wxNullCursor); Refresh(); }
+        });
+        Bind(wxEVT_LEAVE_WINDOW, [this](wxMouseEvent&) { hover_ = -1; Refresh(); });
+        Bind(wxEVT_LEFT_UP, [this](wxMouseEvent& e) {
+            const int h = HitTest(e.GetPosition());
+            if (h < 0 || h == sel_) return;
+            sel_ = h;
+            Refresh();
+            if (onSelect) onSelect(h);
+        });
+    }
+
+    void SetSelection(int i) { sel_ = i; Refresh(); }
+
+private:
+    static constexpr int kPad = 20;
+
+    int TabWidth(wxDC& dc, size_t i) const { return dc.GetTextExtent(labels_[i]).x + 2 * kPad; }
+
+    wxFont BoldFont() const
+    {
+        wxFont f = GetFont();
+        f.SetWeight(wxFONTWEIGHT_BOLD);
+        return f;
+    }
+
+    int HitTest(const wxPoint& p) const
+    {
+        wxClientDC dc(const_cast<TabBar*>(this));
+        dc.SetFont(BoldFont());
+        int x = 4;
+        for (size_t i = 0; i < labels_.size(); ++i) {
+            const int w = TabWidth(dc, i);
+            if (p.x >= x && p.x < x + w) return (int)i;
+            x += w;
+        }
+        return -1;
+    }
+
+    void OnPaint(wxPaintEvent&)
+    {
+        wxAutoBufferedPaintDC pdc(this);
+        pdc.SetBackground(wxBrush(t_.page));
+        pdc.Clear();
+        wxGCDC dc(pdc);
+        dc.SetFont(BoldFont());
+        const wxSize s = GetClientSize();
+
+        dc.SetPen(wxPen(t_.border, 1));
+        dc.DrawLine(0, s.y - 1, s.x, s.y - 1);
+
+        int x = 4;
+        for (size_t i = 0; i < labels_.size(); ++i) {
+            const int w = TabWidth(dc, i);
+            const bool sel = (int)i == sel_;
+            dc.SetTextForeground(sel ? t_.text : ((int)i == hover_ ? t_.text : t_.sub));
+            const wxSize ext = dc.GetTextExtent(labels_[i]);
+            dc.DrawText(labels_[i], x + kPad, (s.y - ext.y) / 2 - 1);
+            if (sel) {
+                dc.SetPen(*wxTRANSPARENT_PEN);
+                dc.SetBrush(wxBrush(t_.accent));
+                dc.DrawRoundedRectangle(x + 8, s.y - 3, w - 16, 3, 1.5);
+            }
+            x += w;
+        }
+    }
+
+    Theme t_;
+    std::vector<wxString> labels_;
+    int sel_ = 0, hover_ = -1;
+};
+
 // ============================================================================
 // Main window
 // ============================================================================
@@ -768,10 +900,14 @@ public:
         root->Add(canvas_, 2, wxEXPAND | wxALL, 10);
 
         // ---- lower part: tabs
-        notebook_ = new wxNotebook(this, wxID_ANY);
-        notebook_->AddPage(BuildDevicesPage(notebook_), "Devices", true);
-        notebook_->AddPage(BuildNetworkPage(notebook_), "Network");
-        root->Add(notebook_, 3, wxEXPAND | wxLEFT | wxRIGHT | wxBOTTOM, 10);
+        tabs_ = new TabBar(this, theme_, {"Devices", "Network"});
+        root->Add(tabs_, 0, wxEXPAND | wxLEFT | wxRIGHT, 10);
+        pages_ = new wxSimplebook(this, wxID_ANY);
+        pages_->SetBackgroundColour(theme_.page);
+        pages_->AddPage(BuildDevicesPage(pages_), "Devices", true);
+        pages_->AddPage(BuildNetworkPage(pages_), "Network");
+        tabs_->onSelect = [this](int i) { pages_->ChangeSelection((size_t)i); };
+        root->Add(pages_, 3, wxEXPAND | wxLEFT | wxRIGHT | wxBOTTOM, 10);
         SetSizer(root);
 
         // ---- events
@@ -869,6 +1005,7 @@ public:
         net_->Start();
         StartScan();
         Centre();
+        if (theme_.dark) { DarkTitleBar(this); DarkenTree(this); }
     }
 
 private:
@@ -904,6 +1041,7 @@ private:
     wxWindow* BuildNetworkPage(wxWindow* parent)
     {
         auto* p = new wxPanel(parent);
+        p->SetBackgroundColour(theme_.page);
         auto* bottom = new wxBoxSizer(wxHORIZONTAL);
 
         auto* left = new wxBoxSizer(wxVERTICAL);
@@ -931,8 +1069,14 @@ private:
                               wxTE_MULTILINE | wxTE_READONLY);
         log_->SetFont(wxFont(wxFontInfo(wxSystemSettings::GetFont(wxSYS_DEFAULT_GUI_FONT).GetPointSize()).Family(wxFONTFAMILY_TELETYPE)));
 
-        bottom->Add(left, 1, wxEXPAND | wxALL, 6);
-        bottom->Add(log_, 1, wxEXPAND | wxTOP | wxRIGHT | wxBOTTOM, 6);
+        searchLbl_->SetForegroundColour(theme_.sub);
+        for (wxWindow* w : std::initializer_list<wxWindow*>{list_, target_, log_}) {
+            w->SetBackgroundColour(theme_.card);
+            w->SetForegroundColour(theme_.text);
+        }
+
+        bottom->Add(left, 1, wxEXPAND | wxALL, 10);
+        bottom->Add(log_, 1, wxEXPAND | wxTOP | wxRIGHT | wxBOTTOM, 10);
         p->SetSizer(bottom);
         return p;
     }
@@ -1713,7 +1857,8 @@ private:
     int animStep_ = 0;
 
     Canvas* canvas_ = nullptr;
-    wxNotebook* notebook_ = nullptr;
+    TabBar* tabs_ = nullptr;
+    wxSimplebook* pages_ = nullptr;
     wxListCtrl* list_ = nullptr;
     wxScrolledWindow* devScroll_ = nullptr;
     wxBoxSizer* devSizer_ = nullptr;
