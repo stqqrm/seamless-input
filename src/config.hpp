@@ -16,13 +16,20 @@ struct SavedPeer {
     std::string key;       // public key, 64 hex chars
     std::string name;      // host name when last seen (display only)
     double ox = 0, oy = 0; // top-left of the peer's desktop relative to this PC's top-left
+    bool hasPos = false;   // false: only the audio settings are known, no layout position yet
+
+    // per-device audio (saved with the set, like the position)
+    bool hasAudio = false; // false: the file had no "peeraudio" line for this peer
+    bool send = false;     // share my audio with this device
+    bool mute = false;     // mute what this device sends me
+    int  volume = 100;     // 0..100 slider units (what I hear from this device)
 };
 
 struct SavedAudio {
-    bool send = false;     // "Share my audio"
+    bool send = false;     // legacy (one switch for all devices); only used to migrate old files
     int  source = 0;       // 0 microphone, 1 system audio
-    bool mute = false;     // mute incoming
-    int  volume = 100;     // 0..100 (slider units)
+    bool mute = false;     // master mute of everything incoming
+    int  volume = 100;     // master volume, 0..100 (slider units)
 };
 
 struct SavedConfig {

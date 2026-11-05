@@ -54,12 +54,13 @@ fs::path ConfigStore::PathFor(const std::vector<std::string>& members) const
 //   label <text>
 //   rev <ms>
 //   member <public key>            (one per PC of the set, this PC included)
-//   audio.send 0|1
+//   audio.send 0|1                 (legacy, read only)
 //   audio.source 0|1
-//   audio.mute 0|1
-//   audio.volume 0..100
+//   audio.mute 0|1                 (master)
+//   audio.volume 0..100            (master)
 //   input.enabled 0|1
 //   peer <public key> <ox> <oy> <name...>
+//   peeraudio <public key> <send 0|1> <mute 0|1> <volume 0..100>
 bool ConfigStore::Save(const SavedConfig& in, std::string* err) const
 {
     SavedConfig cfg = in;
@@ -76,14 +77,16 @@ bool ConfigStore::Save(const SavedConfig& in, std::string* err) const
         out << "label " << cfg.label << "\n";
         out << "rev " << cfg.rev << "\n";
         for (const auto& m : cfg.members) out << "member " << m << "\n";
-        out << "audio.send " << (cfg.audio.send ? 1 : 0) << "\n";
         out << "audio.source " << cfg.audio.source << "\n";
         out << "audio.mute " << (cfg.audio.mute ? 1 : 0) << "\n";
         out << "audio.volume " << cfg.audio.volume << "\n";
         out << "input.enabled " << (cfg.inputEnabled ? 1 : 0) << "\n";
         for (const auto& p : cfg.peers)
-            out << "peer " << p.key << " " << std::llround(p.ox) << " " << std::llround(p.oy)
+            if (p.hasPos) out << "peer " << p.key << " " << std::llround(p.ox) << " " << std::llround(p.oy)
                 << " " << p.name << "\n";
+        for (const auto& p : cfg.peers)
+            out << "peeraudio " << p.key << " " << (p.send ? 1 : 0) << " " << (p.mute ? 1 : 0)
+                << " " << std::clamp(p.volume, 0, 100) << "\n";
         out.flush();
         if (!out) { if (err) *err = "write failed: " + tmp.string(); return false; }
     }
@@ -122,7 +125,21 @@ bool ConfigStore::Load(const std::vector<std::string>& wanted, SavedConfig& out)
             if (is >> p.key >> x >> y && Identity::IsValidPublicHex(p.key)) {
                 std::getline(is >> std::ws, p.name);
                 p.ox = x; p.oy = y;
-                cfg.peers.push_back(std::move(p));
+                p.hasPos = true;
+                SavedPeer& dst = cfg.PeerRef(p.key);
+                dst.name = std::move(p.name);
+                dst.ox = x; dst.oy = y; dst.hasPos = true;
+            }
+        }
+        else if (k == "peeraudio") {
+            std::string key;
+            int snd = 0, mut = 0, vol = 100;
+            if (is >> key >> snd >> mut >> vol && Identity::IsValidPublicHex(key)) {
+                SavedPeer& p = cfg.PeerRef(key);
+                p.hasAudio = true;
+                p.send = snd != 0;
+                p.mute = mut != 0;
+                p.volume = std::clamp(vol, 0, 100);
             }
         }
     }

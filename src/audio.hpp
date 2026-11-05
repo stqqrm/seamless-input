@@ -34,12 +34,19 @@ public:
     void AddPeer(std::uint32_t instance, const std::string& ip);
     void RemovePeer(std::uint32_t instance);
 
-    // Start/stop capturing and sending. Microphone works everywhere; System
-    // (WASAPI loopback) only on Windows.
+    // Start/stop capturing. The captured audio is sent to the peers that have
+    // SetPeerSend(true). Microphone works everywhere; System audio on Windows
+    // (WASAPI loopback) and on Linux (PulseAudio/PipeWire monitor).
     bool SetSending(bool on, AudioSource src, std::string* err);
 
-    void SetMuted(bool muted);       // mute everything received
-    void SetVolume(float volume);    // 0..1.5, applied to the mixed output
+    // Per device (peer). 'send' decides whether OUR audio goes to that device at all;
+    // mute / volume only affect what we hear FROM it.
+    void SetPeerSend(std::uint32_t instance, bool on);
+    void SetPeerMuted(std::uint32_t instance, bool muted);
+    void SetPeerVolume(std::uint32_t instance, float volume);   // 0..1.5
+
+    void SetMuted(bool muted);       // master: mute everything received
+    void SetVolume(float volume);    // master: 0..1.5, applied to the mixed output
 
     std::vector<AudioPeerStat> Stats();
     float InputLevel() const;        // 0..1 peak of what we are sending
