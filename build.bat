@@ -43,3 +43,4 @@ if errorlevel 1 (
 echo Build completed!
 
 endlocal
+pause
