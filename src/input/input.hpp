@@ -54,7 +54,9 @@ public:
     void Stop();
     std::string BackendName() const;
 
-    void SetEnabled(bool on);   // master switch; off = return to Local and refuse control
+    // Master switch for OUTGOING control: off = this PC's keyboard/mouse never leaves it
+    // (and a running forward stops). Incoming control is governed per peer by SetPeerAllowed.
+    void SetEnabled(bool on);
 
     // Layout: (ox, oy) is the peer's top-left corner relative to this PC's top-left
     // corner in canvas "world" pixels (exactly what Canvas keeps).

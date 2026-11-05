@@ -1125,7 +1125,7 @@ private:
         auto* r2 = new wxBoxSizer(wxHORIZONTAL);
         inputChk_ = new wxCheckBox(bar, wxID_ANY, "Share keyboard && mouse");
         inputChk_->SetValue(true);
-        inputChk_->SetToolTip("Master switch for moving the cursor onto other PCs");
+        inputChk_->SetToolTip("Lets this PC's keyboard and mouse move onto other PCs.\nWho may control THIS PC is set per device with \"Allow remote control\".");
         r2->Add(inputChk_, 0, wxALIGN_CENTER_VERTICAL | wxRIGHT, 14);
         r2->Add(MakeLabel(bar, "Scroll Lock returns control to this PC", true), 0, wxALIGN_CENTER_VERTICAL);
         bv->Add(r2, 0, wxEXPAND | wxALL, 14);
