@@ -24,6 +24,9 @@ public:
     static std::string Fingerprint(const std::string& pubHex);    // "1a2b-3c4d-5e6f-7a8b"
     static std::string RandomHex(std::size_t bytes);              // OS random, hex encoded
     static std::string HashHex(const std::string& data, std::size_t bytes = 16);   // BLAKE2b
+    // Group password -> shared secret (Argon2id, deliberately slow: call once, not per packet).
+    // Empty password -> empty string (= no group).
+    static std::string GroupSecret(const std::string& password);
 
 private:
     Identity() = default;

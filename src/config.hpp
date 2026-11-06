@@ -79,6 +79,8 @@ public:
 
     void Load();
     State Get(const std::string& key) const;
+    // (key, name) of every Allowed entry
+    std::vector<std::pair<std::string, std::string>> AllowedList() const;
     // Stores the decision and writes the file right away (decisions are rare).
     bool Set(const std::string& key, State s, const std::string& name, std::string* err = nullptr);
 

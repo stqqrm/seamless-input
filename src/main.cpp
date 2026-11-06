@@ -24,6 +24,7 @@
 #include <cstdint>
 #include <cstdio>
 #include <filesystem>
+#include <fstream>
 #include <functional>
 #include <map>
 #include <memory>
@@ -550,6 +551,9 @@ public:
         Refresh();
     }
 
+    // Different card colour (used as a background hint, e.g. for seamless-input clients)
+    void SetFill(const wxColour& c) { fill_ = c; hasFill_ = true; Refresh(); }
+
 private:
     void OnPaint(wxPaintEvent&)
     {
@@ -559,7 +563,7 @@ private:
         wxGCDC dc(pdc);
         const wxSize s = GetClientSize();
         dc.SetPen(wxPen(t_.border, 1));
-        dc.SetBrush(wxBrush(t_.card));
+        dc.SetBrush(wxBrush(hasFill_ ? fill_ : t_.card));
         dc.DrawRoundedRectangle(0, 0, s.x, s.y, 10);
         if (hasAccent_) {
             dc.SetPen(*wxTRANSPARENT_PEN);
@@ -571,6 +575,8 @@ private:
     Theme t_;
     bool hasAccent_;
     wxColour accent_;
+    wxColour fill_;
+    bool hasFill_ = false;
 };
 
 // Thin rounded level meter (0..1): green, amber above 70 %, red above 90 %.
@@ -867,6 +873,17 @@ public:
             store_ = std::make_unique<ConfigStore>(dir / "configs");
             trust_ = std::make_unique<TrustStore>(dir / "trust.txt");
             trust_->Load();
+            netTrust_ = std::make_unique<TrustStore>(dir / "network-trust.txt");
+            netTrust_->Load();
+            groupFile_ = dir / "group.txt";
+            {
+                std::ifstream gi(groupFile_);
+                std::string line;
+                if (gi && std::getline(gi, line)) {
+                    if (!line.empty() && line.back() == '\r') line.pop_back();
+                    groupPwd_ = line;
+                }
+            }
             dataDir_ = wxString::FromUTF8(dir.u8string());
         }
 
@@ -915,6 +932,8 @@ public:
         goBtn_->Bind(wxEVT_BUTTON, [this](wxCommandEvent&) { Activate(target_->GetValue().ToStdString()); });
         target_->Bind(wxEVT_TEXT_ENTER, [this](wxCommandEvent&) { Activate(target_->GetValue().ToStdString()); });
         scanBtn_->Bind(wxEVT_BUTTON, [this](wxCommandEvent&) { StartScan(); });
+        groupBtn_->Bind(wxEVT_BUTTON, [this](wxCommandEvent&) { ApplyGroupPassword(); });
+        groupCtl_->Bind(wxEVT_TEXT_ENTER, [this](wxCommandEvent&) { ApplyGroupPassword(); });
 
         masterMute_->onToggle = [this](bool m) { audio_->SetMuted(m); MarkCfgDirty(); };
         volSlider_->Bind(wxEVT_SLIDER, [this](wxCommandEvent&) {
@@ -944,10 +963,21 @@ public:
             CallAfter([this, s] { Log(wxString::FromUTF8(s)); });
         };
         cb.onPeerReady = [this](int id, std::uint32_t inst, const std::string& key,
-                                const std::string& name, const std::string& addr, bool incoming) {
-            CallAfter([this, id, inst, key, name, addr, incoming] {
-                OnPeerReady(id, inst, key, wxString::FromUTF8(name), addr, incoming);
+                                const std::string& name, const std::string& addr, bool incoming,
+                                bool viaGroup) {
+            CallAfter([this, id, inst, key, name, addr, incoming, viaGroup] {
+                OnPeerReady(id, inst, key, wxString::FromUTF8(name), addr, incoming, viaGroup);
             });
+        };
+        cb.onPeerPending = [this](int id, std::uint32_t inst, const std::string& key,
+                                  const std::string& name, const std::string& addr, bool incoming,
+                                  bool theyTrust) {
+            CallAfter([this, id, inst, key, name, addr, incoming, theyTrust] {
+                OnPeerPending(id, inst, key, wxString::FromUTF8(name), addr, incoming, theyTrust);
+            });
+        };
+        cb.onPeerPendingLost = [this](int id) {
+            CallAfter([this, id] { if (pend_.erase(id)) RebuildClients(); });
         };
         cb.onPeerLost = [this](int id) {
             if (input_) input_->RemovePeer(id);     // hand input back immediately
@@ -959,8 +989,8 @@ public:
             if (input_ && input_->HandleMessage(id, line)) return;
             CallAfter([this, id, line] { OnMessage(id, line); });
         };
-        cb.onBeacon = [this](const std::string& ip, const std::string& host, bool server) {
-            CallAfter([this, ip, host, server] { OnBeacon(ip, host, server); });
+        cb.onBeacon = [this](const BeaconInfo& b) {
+            CallAfter([this, b] { OnBeacon(b); });
         };
         cb.onScanHost = [this](const std::string& ip, bool server) {
             CallAfter([this, ip, server] { OnScanHost(ip, server); });
@@ -1000,7 +1030,12 @@ public:
         RebuildList();
         Log("This PC's key: " + wxString::FromUTF8(ident_->Fingerprint()) + "   (data: " + dataDir_ + ")");
         if (!identNote_.empty()) Log("Identity: " + wxString::FromUTF8(identNote_));
-        Log("Ready. Other seamless-input PCs connect automatically.");
+        Log(groupPwd_.empty()
+            ? "Ready. Set a group password, or tick Trust on both PCs (Network tab), to connect them."
+            : "Ready. PCs with the same group password connect automatically.");
+        net_->SetGroup(groupPwd_);
+        for (const auto& t : netTrust_->AllowedList()) net_->SetTrust(t.first, true, "");
+        UpdateGroupLabel();
         net_->Start();
         StartScan();
         Centre();
@@ -1017,6 +1052,17 @@ private:
         std::string host;
         bool server;
         std::chrono::steady_clock::time_point seen;
+        std::string key;            // announced public key (proven only by the handshake)
+        bool sameGroup = false;
+    };
+    // connected to us but neither in our group nor mutually trusted (yet)
+    struct PendInfo {
+        std::uint32_t inst = 0;
+        std::string key;
+        wxString name;
+        std::string addr;
+        bool incoming = false;
+        bool theyTrust = false;
     };
     struct Scanned {
         wxString name;
@@ -1030,6 +1076,7 @@ private:
         std::string addr;
         std::vector<wxRect> mons;
         bool incoming = false;
+        bool viaGroup = false;      // accepted because of the group password (else: mutual trust)
         bool placed = false;
         bool share = false;         // send my audio (system audio) to this device
         bool mic = false;           // send my microphone to this device
@@ -1045,15 +1092,47 @@ private:
         auto* bottom = new wxBoxSizer(wxHORIZONTAL);
 
         auto* left = new wxBoxSizer(wxVERTICAL);
-        searchLbl_ = new wxStaticText(p, wxID_ANY, "");
-        left->Add(searchLbl_, 0, wxBOTTOM, 4);
 
-        list_ = new wxListCtrl(p, wxID_ANY, wxDefaultPosition, wxDefaultSize,
+        // ---- group password
+        auto* grow = new wxBoxSizer(wxHORIZONTAL);
+        groupCtl_ = new wxTextCtrl(p, wxID_ANY, wxString::FromUTF8(groupPwd_), wxDefaultPosition, wxDefaultSize,
+                                   wxTE_PASSWORD | wxTE_PROCESS_ENTER);
+        groupCtl_->SetHint("same password on every PC of the group");
+        groupBtn_ = new wxButton(p, wxID_ANY, "Apply");
+        grow->Add(MakeLabel(p, "Group"), 0, wxALIGN_CENTER_VERTICAL | wxRIGHT, 8);
+        grow->Add(groupCtl_, 1, wxRIGHT, 6);
+        grow->Add(groupBtn_, 0);
+        left->Add(grow, 0, wxEXPAND);
+        groupLbl_ = MakeLabel(p, "", true);
+        left->Add(groupLbl_, 0, wxTOP | wxBOTTOM, 4);
+
+        // ---- clients: one card per PC that runs seamless-input
+        left->Add(MakeHeader(p, "Clients"), 0, wxBOTTOM, 4);
+        cliScroll_ = new wxScrolledWindow(p, wxID_ANY, wxDefaultPosition, wxSize(-1, 120),
+                                          wxVSCROLL | wxBORDER_NONE);
+        cliScroll_->SetBackgroundColour(theme_.page);
+        cliScroll_->SetScrollRate(0, 12);
+        cliSizer_ = new wxBoxSizer(wxVERTICAL);
+        cliEmpty_ = new wxStaticText(cliScroll_, wxID_ANY, "No seamless-input clients found yet.");
+        cliEmpty_->SetForegroundColour(theme_.sub);
+        cliSizer_->Add(cliEmpty_, 0, wxALIGN_CENTER_HORIZONTAL | wxTOP, 14);
+        cliScroll_->SetSizer(cliSizer_);
+        left->Add(cliScroll_, 3, wxEXPAND);
+
+        // ---- other hosts: plain IP addresses
+        searchLbl_ = new wxStaticText(p, wxID_ANY, "");
+        auto* orow = new wxBoxSizer(wxHORIZONTAL);
+        orow->Add(MakeHeader(p, "Other  (IP addresses)"), 0, wxALIGN_CENTER_VERTICAL);
+        orow->AddStretchSpacer();
+        orow->Add(searchLbl_, 0, wxALIGN_CENTER_VERTICAL);
+        left->Add(orow, 0, wxEXPAND | wxTOP | wxBOTTOM, 4);
+
+        list_ = new wxListCtrl(p, wxID_ANY, wxDefaultPosition, wxSize(-1, 70),
                                wxLC_REPORT | wxLC_SINGLE_SEL);
         list_->InsertColumn(0, "Name", wxLIST_FORMAT_LEFT, 200);
         list_->InsertColumn(1, "Address", wxLIST_FORMAT_LEFT, 130);
         list_->InsertColumn(2, "Status", wxLIST_FORMAT_LEFT, 140);
-        left->Add(list_, 1, wxEXPAND);
+        left->Add(list_, 2, wxEXPAND);
 
         auto* row = new wxBoxSizer(wxHORIZONTAL);
         target_ = new wxTextCtrl(p, wxID_ANY, "", wxDefaultPosition, wxDefaultSize, wxTE_PROCESS_ENTER);
@@ -1070,7 +1149,7 @@ private:
         log_->SetFont(wxFont(wxFontInfo(wxSystemSettings::GetFont(wxSYS_DEFAULT_GUI_FONT).GetPointSize()).Family(wxFONTFAMILY_TELETYPE)));
 
         searchLbl_->SetForegroundColour(theme_.sub);
-        for (wxWindow* w : std::initializer_list<wxWindow*>{list_, target_, log_}) {
+        for (wxWindow* w : std::initializer_list<wxWindow*>{list_, target_, groupCtl_, log_}) {
             w->SetBackgroundColour(theme_.card);
             w->SetForegroundColour(theme_.text);
         }
@@ -1079,6 +1158,15 @@ private:
         bottom->Add(log_, 1, wxEXPAND | wxTOP | wxRIGHT | wxBOTTOM, 10);
         p->SetSizer(bottom);
         return p;
+    }
+
+    wxStaticText* MakeHeader(wxWindow* parent, const wxString& text)
+    {
+        auto* l = new wxStaticText(parent, wxID_ANY, text);
+        wxFont f = l->GetFont();
+        f.SetWeight(wxFONTWEIGHT_BOLD);
+        l->SetFont(f);
+        return l;
     }
 
     wxStaticText* MakeLabel(wxWindow* parent, const wxString& text, bool subtle = false)
@@ -1123,7 +1211,7 @@ private:
         devScroll_->SetScrollRate(0, 12);
         devSizer_ = new wxBoxSizer(wxVERTICAL);
         emptyLbl_ = new wxStaticText(devScroll_, wxID_ANY,
-            "No devices connected yet.\nOther seamless-input PCs on your network connect automatically.",
+            "No devices connected yet.\nSet the same group password on your PCs, or tick Trust on both (Network tab).",
             wxDefaultPosition, wxDefaultSize, wxALIGN_CENTRE_HORIZONTAL);
         emptyLbl_->SetForegroundColour(theme_.sub);
         devSizer_->Add(emptyLbl_, 0, wxALIGN_CENTER_HORIZONTAL | wxTOP, 28);
@@ -1300,6 +1388,220 @@ private:
     void RefreshDeviceRows()
     {
         for (auto& kv : devRows_) RefreshDeviceRow(kv.second);
+    }
+
+    // ----------------------------------------------------------- group password
+    void UpdateGroupLabel()
+    {
+        groupLbl_->SetLabelText(groupPwd_.empty()
+            ? "No group: PCs only connect after you tick Trust (on both PCs)."
+            : "Group active: PCs with the same password connect to each other automatically.");
+    }
+
+    void ApplyGroupPassword()
+    {
+        groupPwd_ = std::string(groupCtl_->GetValue().utf8_str());
+        std::error_code ec;
+        if (groupPwd_.empty()) {
+            std::filesystem::remove(groupFile_, ec);
+        } else {
+            std::filesystem::create_directories(groupFile_.parent_path(), ec);
+            {
+                std::ofstream out(groupFile_, std::ios::trunc);
+                out << groupPwd_ << "\n";
+            }
+            // owner-only: the password lets other PCs join this group
+            std::filesystem::permissions(groupFile_, std::filesystem::perms::owner_read | std::filesystem::perms::owner_write,
+                                         std::filesystem::perm_options::replace, ec);
+        }
+        net_->SetGroup(groupPwd_);
+        UpdateGroupLabel();
+        Log(groupPwd_.empty() ? "Group password removed - reconnecting"
+                              : "Group password set - reconnecting");
+    }
+
+    // ------------------------------------------------------------ clients (Network tab)
+    struct CliView {
+        std::string key, ip;
+        wxString name;
+        bool connected = false, viaGroup = false;
+        bool pending = false, theyTrust = false;
+        bool sameGroup = false, seen = false;
+    };
+
+    // One entry per PC (by public key) that runs seamless-input: seen on the LAN, connected,
+    // waiting for trust, or trusted earlier.
+    std::vector<CliView> ClientViews() const
+    {
+        std::map<std::string, CliView> m;
+        auto at = [&m](const std::string& key) -> CliView& { CliView& v = m[key]; v.key = key; return v; };
+        for (const auto& kv : disc_) {
+            if (kv.second.key.empty()) continue;
+            CliView& v = at(kv.second.key);
+            v.ip = kv.first;
+            v.name = wxString::FromUTF8(kv.second.host);
+            v.sameGroup = kv.second.sameGroup;
+            v.seen = true;
+        }
+        for (const auto& kv : pend_) {
+            CliView& v = at(kv.second.key);
+            v.pending = true;
+            v.theyTrust = kv.second.theyTrust;
+            v.ip = kv.second.addr;
+            if (v.name.empty()) v.name = kv.second.name;
+        }
+        for (const auto& kv : peers_) {
+            if (kv.second.key.empty()) continue;
+            CliView& v = at(kv.second.key);
+            v.connected = true;
+            v.viaGroup = kv.second.viaGroup;
+            v.ip = kv.second.addr;
+            v.name = kv.second.name;
+        }
+        for (const auto& t : netTrust_->AllowedList()) {
+            CliView& v = at(t.first);
+            if (v.name.empty()) v.name = wxString::FromUTF8(t.second);
+        }
+        std::vector<CliView> out;
+        for (auto& kv : m) out.push_back(std::move(kv.second));
+        std::sort(out.begin(), out.end(), [](const CliView& a, const CliView& b) {
+            const int c = a.name.CmpNoCase(b.name);
+            return c != 0 ? c < 0 : a.key < b.key;
+        });
+        return out;
+    }
+
+    wxColour ClientTint() const
+    {
+        auto mix = [](int a, int b) { return (unsigned char)(a + (b - a) * 12 / 100); };   // 12 % accent
+        return wxColour(mix(theme_.card.Red(), theme_.accent.Red()),
+                        mix(theme_.card.Green(), theme_.accent.Green()),
+                        mix(theme_.card.Blue(), theme_.accent.Blue()));
+    }
+
+    struct CliRow {
+        CardPanel* card = nullptr;
+        wxStaticText *name = nullptr, *sub = nullptr, *status = nullptr, *tag = nullptr;
+        wxCheckBox* trust = nullptr;
+    };
+
+    void BuildClientRow(const CliView& v)
+    {
+        CliRow r;
+        const wxColour tint = ClientTint();
+        r.card = new CardPanel(cliScroll_, theme_, true);
+        r.card->SetFill(tint);                    // tinted background = "this is a seamless-input client"
+        wxWindow* c = r.card;
+
+        r.name = new wxStaticText(c, wxID_ANY, "");
+        wxFont nf = r.name->GetFont();
+        nf.SetWeight(wxFONTWEIGHT_BOLD);
+        nf.SetPointSize(nf.GetPointSize() + 1);
+        r.name->SetFont(nf);
+        r.sub = MakeLabel(c, "", true);
+        r.status = MakeLabel(c, "", true);
+        auto* info = new wxBoxSizer(wxVERTICAL);
+        info->Add(r.name, 0, wxBOTTOM, 2);
+        info->Add(r.sub, 0, wxBOTTOM, 2);
+        info->Add(r.status, 0);
+
+        r.tag = MakeLabel(c, "seamless-input client", true);
+        r.trust = new wxCheckBox(c, wxID_ANY, "Trust");
+        r.trust->SetToolTip("Pair with this PC using its key. Both PCs must tick Trust for each other\n"
+                            "(unless they share the group password). The handshake proves the key.");
+        auto* right = new wxBoxSizer(wxVERTICAL);
+        right->Add(r.tag, 0, wxALIGN_RIGHT | wxBOTTOM, 6);
+        right->Add(r.trust, 0, wxALIGN_RIGHT);
+
+        auto* h = new wxBoxSizer(wxHORIZONTAL);
+        h->Add(info, 1, wxALIGN_CENTER_VERTICAL | wxRIGHT, 16);
+        h->Add(right, 0, wxALIGN_CENTER_VERTICAL);
+        auto* outer = new wxBoxSizer(wxHORIZONTAL);
+        outer->AddSpacer(28);
+        outer->Add(h, 1, wxEXPAND | wxTOP | wxBOTTOM | wxRIGHT, 10);
+        r.card->SetSizer(outer);
+        ApplyBackground(r.card, tint);
+        r.sub->SetForegroundColour(theme_.sub);
+        r.status->SetForegroundColour(theme_.sub);
+        r.tag->SetForegroundColour(theme_.accent);
+
+        const std::string key = v.key;
+        r.trust->Bind(wxEVT_CHECKBOX, [this, key](wxCommandEvent& e) { SetNetTrust(key, e.IsChecked()); });
+
+        cliSizer_->Add(r.card, 0, wxEXPAND | wxBOTTOM, 8);
+        cliRows_[key] = r;
+    }
+
+    void RefreshClientRow(CliRow& r, const CliView& v)
+    {
+        const wxString dot = wxString::FromUTF8("  \xC2\xB7  ");
+        const bool trusted = netTrust_->Get(v.key) == TrustStore::State::Allowed;
+
+        SetText(r.name, v.name.empty() ? wxString("(unknown)") : v.name);
+        SetText(r.sub, (v.ip.empty() ? wxString("offline") : wxString::FromUTF8(v.ip)) + dot + "Key " +
+                       wxString::FromUTF8(Identity::Fingerprint(v.key)));
+
+        wxString st;
+        wxColour col = theme_.sub, accent = theme_.border;
+        if (v.connected) {
+            st = v.viaGroup ? wxString("Connected") + dot + "same group" : wxString("Connected") + dot + "mutual trust";
+            col = accent = theme_.ok;
+        } else if (v.pending && v.theyTrust && !trusted) {
+            st = "Wants to pair with you - tick Trust to accept";
+            col = accent = theme_.warn;
+        } else if (trusted && (v.pending || v.seen)) {
+            st = "Waiting for it to trust you back";
+            col = accent = theme_.warn;
+        } else if (trusted) {
+            st = "Trusted" + dot + "offline";
+        } else if (v.sameGroup) {
+            st = "Same group - connecting...";
+            accent = theme_.accent;
+        } else if (v.pending || v.seen) {
+            st = groupPwd_.empty() ? wxString("Not paired - tick Trust to pair")
+                                   : wxString("Different group - tick Trust to pair");
+        }
+        SetText(r.status, st);
+        if (r.status->GetForegroundColour() != col) { r.status->SetForegroundColour(col); r.status->Refresh(); }
+        r.card->SetAccent(accent);
+        if (r.trust->GetValue() != trusted) r.trust->SetValue(trusted);
+    }
+
+    void RebuildClients()
+    {
+        if (!cliScroll_) return;
+        const auto views = ClientViews();
+        bool same = cliRows_.size() == views.size();
+        for (const auto& v : views) same = same && cliRows_.count(v.key);
+        if (!same) {
+            cliScroll_->Freeze();
+            for (auto& kv : cliRows_) kv.second.card->Destroy();
+            cliRows_.clear();
+            for (const auto& v : views) BuildClientRow(v);
+            cliEmpty_->Show(views.empty());
+            cliSizer_->Layout();
+            cliScroll_->FitInside();
+            cliScroll_->Thaw();
+            cliScroll_->Refresh();
+        }
+        for (const auto& v : views) RefreshClientRow(cliRows_[v.key], v);
+    }
+
+    // Trust checkbox: remember the key; the network layer connects and runs the signed handshake.
+    void SetNetTrust(const std::string& key, bool on)
+    {
+        std::string ip;
+        wxString name;
+        for (const auto& v : ClientViews())
+            if (v.key == key) { ip = v.ip; name = v.name; break; }
+        std::string err;
+        if (!netTrust_->Set(key, on ? TrustStore::State::Allowed : TrustStore::State::Unknown,
+                            std::string(name.utf8_str()), &err))
+            Log("Could not save trust: " + wxString::FromUTF8(err));
+        net_->SetTrust(key, on, ip);
+        Log((on ? "Trusting " : "No longer trusting ") + (name.empty() ? wxString::FromUTF8(Identity::Fingerprint(key)) : name) +
+            (on ? " - starting key handshake" : ""));
+        RebuildClients();
     }
 
     // ---------------------------------------------------------------- actions
@@ -1598,10 +1900,26 @@ private:
     }
 
     // ------------------------------------------------------- network results
-    void OnPeerReady(int id, std::uint32_t inst, const std::string& key, const wxString& name,
-                     const std::string& addr, bool incoming)
+    void OnPeerPending(int id, std::uint32_t inst, const std::string& key, const wxString& name,
+                       const std::string& addr, bool incoming, bool theyTrust)
     {
+        PendInfo& pi = pend_[id];
+        const bool isNew = pi.key.empty();
+        const bool trustChanged = !isNew && pi.theyTrust != theyTrust;
+        pi.inst = inst; pi.key = key; pi.name = name; pi.addr = addr; pi.incoming = incoming; pi.theyTrust = theyTrust;
+        if (isNew)
+            Log(name + " (" + wxString::FromUTF8(addr) + "), key " + wxString::FromUTF8(Identity::Fingerprint(key)) +
+                " verified - not in your group; tick Trust (Network tab) to pair");
+        if (trustChanged) Log(name + (theyTrust ? " trusts this PC" : " no longer trusts this PC"));
+        RebuildClients();
+    }
+
+    void OnPeerReady(int id, std::uint32_t inst, const std::string& key, const wxString& name,
+                     const std::string& addr, bool incoming, bool viaGroup)
+    {
+        pend_.erase(id);
         PeerInfo& p = peers_[id];
+        p.viaGroup = viaGroup;
         p.inst = inst;
         p.key = key;
         p.name = name;
@@ -1621,6 +1939,7 @@ private:
 
     void OnPeerLost(int id)
     {
+        pend_.erase(id);
         auto it = peers_.find(id);
         if (it != peers_.end()) {
             Log("Disconnected from " + it->second.name);
@@ -1691,11 +2010,12 @@ private:
         }
     }
 
-    void OnBeacon(const std::string& ip, const std::string& host, bool server)
+    void OnBeacon(const BeaconInfo& b)
     {
-        auto it = disc_.find(ip);
-        bool changed = it == disc_.end() || it->second.host != host || it->second.server != server;
-        disc_[ip] = {host, server, std::chrono::steady_clock::now()};
+        auto it = disc_.find(b.ip);
+        bool changed = it == disc_.end() || it->second.host != b.host || it->second.server != b.server ||
+                       it->second.key != b.key || it->second.sameGroup != b.sameGroup;
+        disc_[b.ip] = {b.host, b.server, std::chrono::steady_clock::now(), b.key, b.sameGroup};
         if (changed) RebuildList();
     }
 
@@ -1719,8 +2039,11 @@ private:
     // -------------------------------------------------------------------- GUI
     void RebuildList()
     {
-        auto isConnected = [this](const std::string& ip) {
+        // PCs that run seamless-input are shown as client cards, not in this list
+        auto isClient = [this](const std::string& ip) {
+            if (disc_.count(ip)) return true;
             for (auto& kv : peers_) if (kv.second.addr == ip) return true;
+            for (auto& kv : pend_)  if (kv.second.addr == ip) return true;
             return false;
         };
 
@@ -1730,16 +2053,14 @@ private:
             return (std::uint32_t)((a << 24) | (b << 16) | (c << 8) | d);
         };
 
-        // remote hosts: scan results first, UDP beacons override (they know the real host name)
+        // other hosts found by the scan (everything that is not a seamless-input client)
         std::map<std::uint32_t, Entry> remote;
         for (const auto& kv : scan_) {
+            if (isClient(kv.first)) continue;
             const auto& s = kv.second;
             remote[key(kv.first)] = {s.name.empty() ? wxString("(unknown)") : s.name, kv.first,
                                      s.server ? "Server running" : "Online", false};
         }
-        for (const auto& kv : disc_)
-            remote[key(kv.first)] = {wxString::FromUTF8(kv.second.host), kv.first,
-                                     kv.second.server ? "Server running" : "No server", false};
 
         entries_.clear();
         for (const auto& a : local_)
@@ -1753,12 +2074,13 @@ private:
             const auto& e = entries_[i];
             long row = list_->InsertItem((long)i, e.name);
             list_->SetItem(row, 1, wxString::FromUTF8(e.ip));
-            list_->SetItem(row, 2, e.status + (isConnected(e.ip) ? "  [connected]" : ""));
+            list_->SetItem(row, 2, e.status);
             if (e.ip == selectedIp_)
                 list_->SetItemState(row, wxLIST_STATE_SELECTED, wxLIST_STATE_SELECTED);
         }
         list_->Thaw();
         rebuilding_ = false;
+        RebuildClients();
     }
 
     // Devices tab: one card per connected PC. Cards are only recreated when the set of
@@ -1854,6 +2176,8 @@ private:
     std::vector<wxRect> localMons_;
     std::vector<Entry> entries_;
     std::map<std::string, Discovered> disc_;
+    std::map<int, PendInfo> pend_;
+    std::map<std::string, CliRow> cliRows_;
     std::map<std::string, Scanned> scan_;
     std::map<int, PeerInfo> peers_;
     std::string selectedIp_;
@@ -1866,6 +2190,15 @@ private:
     TabBar* tabs_ = nullptr;
     wxSimplebook* pages_ = nullptr;
     wxListCtrl* list_ = nullptr;
+    wxTextCtrl* groupCtl_ = nullptr;
+    wxButton* groupBtn_ = nullptr;
+    wxStaticText* groupLbl_ = nullptr;
+    wxScrolledWindow* cliScroll_ = nullptr;
+    wxBoxSizer* cliSizer_ = nullptr;
+    wxStaticText* cliEmpty_ = nullptr;
+    std::filesystem::path groupFile_;
+    std::string groupPwd_;
+    std::unique_ptr<TrustStore> netTrust_;       // keys we trust for network pairing (network-trust.txt)
     wxScrolledWindow* devScroll_ = nullptr;
     wxBoxSizer* devSizer_ = nullptr;
     wxStaticText* emptyLbl_ = nullptr;
