@@ -66,6 +66,20 @@ std::string Identity::HashHex(const std::string& data, std::size_t bytes)
     return ToHex(h.data(), h.size());
 }
 
+std::string Identity::GroupSecret(const std::string& password)
+{
+    // An empty password is a valid group too ("no password"): all PCs without one connect.
+    constexpr std::uint32_t kBlocks = 8192;                 // 8 MiB
+    std::vector<std::uint8_t> work(std::size_t(kBlocks) * 1024);
+    static const std::uint8_t salt[16] = {'s','i','-','g','r','o','u','p','-','v','1',0,0,0,0,0};
+    crypto_argon2_config cfg{CRYPTO_ARGON2_ID, kBlocks, 3, 1};
+    crypto_argon2_inputs in{reinterpret_cast<const std::uint8_t*>(password.data()), salt,
+                            static_cast<std::uint32_t>(password.size()), 16};
+    std::uint8_t out[32];
+    crypto_argon2(out, sizeof out, work.data(), cfg, in, crypto_argon2_no_extras);
+    return ToHex(out, sizeof out);
+}
+
 bool Identity::IsValidPublicHex(const std::string& s)
 {
     std::uint8_t tmp[32];

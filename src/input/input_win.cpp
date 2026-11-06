@@ -208,6 +208,7 @@ private:
             32512 /*arrow*/, 32513 /*I-beam*/, 32514 /*wait*/, 32515 /*cross*/, 32516 /*up arrow*/,
             32642 /*size NW-SE*/, 32643 /*size NE-SW*/, 32644 /*size W-E*/, 32645 /*size N-S*/,
             32646 /*size all*/, 32648 /*no*/, 32649 /*hand*/, 32650 /*app starting*/, 32651 /*help*/,
+            32631 /*pen*/, 32671 /*location pin*/, 32672 /*person*/,
         };
         BYTE andMask[32 * 4];
         BYTE xorMask[32 * 4];
@@ -224,6 +225,69 @@ private:
     {
         if (!hidden_.exchange(false)) return;
         RestoreSystemCursors();
+    }
+
+    // ------------------------------------------------------------ cursor overlay
+    // Replacing the system cursors is not enough: many applications (browsers, editors,
+    // games, anything with a custom cursor) set their own cursor and keep showing it. So
+    // while input is forwarded, an invisible, topmost window covers the whole desktop and
+    // answers WM_SETCURSOR with "no cursor". It never takes focus, and the pointer is
+    // parked on it, so nothing underneath gets to choose the cursor shape. Hook thread only.
+    static LRESULT CALLBACK OverlayProc(HWND h, UINT m, WPARAM wp, LPARAM lp)
+    {
+        switch (m) {
+        case WM_SETCURSOR:    SetCursor(nullptr); return TRUE;
+        case WM_MOUSEACTIVATE: return MA_NOACTIVATE;
+        default:              return DefWindowProcW(h, m, wp, lp);
+        }
+    }
+
+    void ShowOverlay()
+    {
+        if (!overlay_) {
+            WNDCLASSW wc{};
+            wc.lpfnWndProc   = &OverlayProc;
+            wc.hInstance     = GetModuleHandleW(nullptr);
+            wc.lpszClassName = L"SeamlessInputCursorOverlay";
+            wc.hCursor       = nullptr;
+            RegisterClassW(&wc);            // fails harmlessly when already registered
+            overlay_ = CreateWindowExW(WS_EX_TOPMOST | WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE | WS_EX_LAYERED,
+                                       wc.lpszClassName, L"", WS_POPUP, 0, 0, 1, 1,
+                                       nullptr, nullptr, wc.hInstance, nullptr);
+            if (!overlay_) return;
+            // alpha 1/255: invisible, but (unlike a colour key) the window still receives the pointer
+            SetLayeredWindowAttributes(overlay_, 0, 1, LWA_ALPHA);
+        }
+        SetWindowPos(overlay_, HWND_TOPMOST,
+                     GetSystemMetrics(SM_XVIRTUALSCREEN), GetSystemMetrics(SM_YVIRTUALSCREEN),
+                     GetSystemMetrics(SM_CXVIRTUALSCREEN), GetSystemMetrics(SM_CYVIRTUALSCREEN),
+                     SWP_NOACTIVATE | SWP_SHOWWINDOW);
+        SetCursor(nullptr);
+        // ShowCursor() is per thread and applies over this thread's windows - and the overlay
+        // (ours) covers the whole desktop, so this hides the pointer everywhere as well.
+        if (!cursorCounted_) { ShowCursor(FALSE); cursorCounted_ = true; }
+        // Other topmost windows (taskbar, menus, full-screen apps) can climb above the overlay
+        // and bring the pointer back; re-assert it a few times a second while forwarding.
+        overlayTimer_ = SetTimer(nullptr, overlayTimer_, 150, nullptr);
+        SetCursorPos(anchorX_, anchorY_);   // makes Windows re-evaluate the cursor under the pointer
+    }
+
+    void Reassert()
+    {
+        if (!overlay_ || !fwd_) return;
+        SetWindowPos(overlay_, HWND_TOPMOST, 0, 0, 0, 0,
+                     SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_SHOWWINDOW);
+        SetCursor(nullptr);
+        POINT p{};
+        if (GetCursorPos(&p) && (p.x != anchorX_ || p.y != anchorY_))
+            SetCursorPos(anchorX_, anchorY_);   // also re-triggers WM_SETCURSOR
+    }
+
+    void HideOverlay()
+    {
+        if (overlayTimer_) { KillTimer(nullptr, overlayTimer_); overlayTimer_ = 0; }
+        if (cursorCounted_) { ShowCursor(TRUE); cursorCounted_ = false; }
+        if (overlay_) ShowWindow(overlay_, SW_HIDE);
     }
 
     // ------------------------------------------------------------ hook thread
@@ -246,8 +310,12 @@ private:
             if (msg.message == kMsgKbdOn) {
                 // The keyboard hook only exists while input is being forwarded.
                 if (!kbd_ && fwd_) kbd_ = SetWindowsHookExW(WH_KEYBOARD_LL, &KbdThunk, GetModuleHandleW(nullptr), 0);
+                if (fwd_) ShowOverlay();
             } else if (msg.message == kMsgKbdOff) {
                 if (kbd_) { UnhookWindowsHookEx(kbd_); kbd_ = nullptr; }
+                HideOverlay();
+            } else if (msg.message == WM_TIMER && msg.hwnd == nullptr) {
+                Reassert();
             } else {
                 TranslateMessage(&msg);
                 DispatchMessageW(&msg);
@@ -255,6 +323,7 @@ private:
         }
         if (kbd_)   { UnhookWindowsHookEx(kbd_);   kbd_ = nullptr; }
         if (mouse_) { UnhookWindowsHookEx(mouse_); mouse_ = nullptr; }
+        if (overlay_) { DestroyWindow(overlay_); overlay_ = nullptr; }
     }
 
     static LRESULT CALLBACK MouseThunk(int code, WPARAM wp, LPARAM lp)
@@ -359,6 +428,9 @@ private:
     std::thread th_;
     DWORD tid_ = 0;
     HHOOK mouse_ = nullptr, kbd_ = nullptr;
+    HWND overlay_ = nullptr;             // hook thread only
+    bool cursorCounted_ = false;         // hook thread only: ShowCursor(FALSE) is in effect
+    UINT_PTR overlayTimer_ = 0;          // hook thread only
     std::mutex initMu_;
     std::condition_variable initCv_;
     bool initDone_ = false, hookOk_ = false;

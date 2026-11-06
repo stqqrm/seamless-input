@@ -187,6 +187,14 @@ TrustStore::State TrustStore::Get(const std::string& key) const
     return it == entries_.end() ? State::Unknown : it->second.state;
 }
 
+std::vector<std::pair<std::string, std::string>> TrustStore::AllowedList() const
+{
+    std::vector<std::pair<std::string, std::string>> out;
+    for (const auto& kv : entries_)
+        if (kv.second.state == State::Allowed) out.emplace_back(kv.first, kv.second.name);
+    return out;
+}
+
 bool TrustStore::Set(const std::string& key, State s, const std::string& name, std::string* err)
 {
     if (s == State::Unknown) entries_.erase(key);

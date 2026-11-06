@@ -24,6 +24,7 @@
 #include <cstdint>
 #include <cstdio>
 #include <filesystem>
+#include <fstream>
 #include <functional>
 #include <map>
 #include <memory>
@@ -500,8 +501,9 @@ static Theme MakeTheme()
 {
     Theme t;
     t.dark = wxSystemSettings::GetAppearance().IsDark();
-    t.text = wxSystemSettings::GetColour(wxSYS_COLOUR_WINDOWTEXT);
+    // Explicit colours: on Windows the system text colour stays black even in dark mode.
     if (t.dark) {
+        t.text   = wxColour(232, 234, 240);
         t.page   = wxColour(30, 32, 37);
         t.card   = wxColour(41, 44, 52);
         t.border = wxColour(62, 66, 77);
@@ -512,6 +514,7 @@ static Theme MakeTheme()
         t.warn   = wxColour(245, 185, 66);
         t.bad    = wxColour(240, 96, 96);
     } else {
+        t.text   = wxColour(28, 31, 38);
         t.page   = wxColour(241, 243, 248);
         t.card   = wxColour(255, 255, 255);
         t.border = wxColour(220, 224, 233);
@@ -525,10 +528,326 @@ static Theme MakeTheme()
     return t;
 }
 
+
+// Blend two colours (pct = share of b, 0..100).
+static wxColour MixColour(const wxColour& a, const wxColour& b, int pct)
+{
+    auto m = [pct](int x, int y) { return (unsigned char)(x + (y - x) * pct / 100); };
+    return wxColour(m(a.Red(), b.Red()), m(a.Green(), b.Green()), m(a.Blue(), b.Blue()));
+}
+
+// Text field drawn by us (rounded, themed border, accent ring on focus). The real text control
+// sits inside it without any native border, so it looks the same on every OS.
+class InputBox : public wxPanel {
+public:
+    wxTextCtrl* ctl = nullptr;
+
+    InputBox(wxWindow* parent, const Theme& t, long style, const wxString& value, const wxString& hint)
+        : wxPanel(parent, wxID_ANY, wxDefaultPosition, wxDefaultSize, wxBORDER_NONE | wxTAB_TRAVERSAL), t_(t)
+    {
+        SetBackgroundStyle(wxBG_STYLE_PAINT);
+        ctl = new wxTextCtrl(this, wxID_ANY, value, wxDefaultPosition, wxDefaultSize, style | wxBORDER_NONE);
+        ctl->SetBackgroundColour(t.page);
+        ctl->SetForegroundColour(t.text);
+        if (!hint.empty()) ctl->SetHint(hint);
+        auto* sz = new wxBoxSizer(wxVERTICAL);
+        const bool multi = (style & wxTE_MULTILINE) != 0;
+        sz->Add(ctl, 1, wxEXPAND | wxLEFT | wxRIGHT | wxTOP | wxBOTTOM, multi ? 8 : 7);
+        SetSizer(sz);
+        Bind(wxEVT_PAINT, &InputBox::OnPaint, this);
+        Bind(wxEVT_SIZE, [this](wxSizeEvent& e) { Refresh(); e.Skip(); });
+        Bind(wxEVT_LEFT_DOWN, [this](wxMouseEvent&) { ctl->SetFocus(); });
+        ctl->Bind(wxEVT_SET_FOCUS,  [this](wxFocusEvent& e) { focus_ = true;  Refresh(); e.Skip(); });
+        ctl->Bind(wxEVT_KILL_FOCUS, [this](wxFocusEvent& e) { focus_ = false; Refresh(); e.Skip(); });
+    }
+
+private:
+    void OnPaint(wxPaintEvent&)
+    {
+        wxAutoBufferedPaintDC pdc(this);
+        pdc.SetBackground(wxBrush(GetBackgroundColour()));
+        pdc.Clear();
+        wxGCDC dc(pdc);
+        const wxSize s = GetClientSize();
+        dc.SetPen(wxPen(focus_ ? t_.accent : t_.border, 1));
+        dc.SetBrush(wxBrush(t_.page));
+        dc.DrawRoundedRectangle(0, 0, s.x, s.y, 8);
+    }
+
+    Theme t_;
+    bool focus_ = false;
+};
+
+// Rounded push button. Sends a normal wxEVT_BUTTON, so it is bound like a wxButton.
+class FlatButton : public wxControl {
+public:
+    FlatButton(wxWindow* parent, const Theme& t, const wxString& label, bool primary = false)
+        : wxControl(parent, wxID_ANY, wxDefaultPosition, wxDefaultSize, wxBORDER_NONE),
+          t_(t), label_(label), primary_(primary)
+    {
+        SetBackgroundStyle(wxBG_STYLE_PAINT);
+        SetCursor(wxCursor(wxCURSOR_HAND));
+        wxFont f = GetFont();
+        f.SetWeight(wxFONTWEIGHT_BOLD);
+        SetFont(f);
+        Bind(wxEVT_PAINT, &FlatButton::OnPaint, this);
+        Bind(wxEVT_ENTER_WINDOW, [this](wxMouseEvent&) { hover_ = true; Refresh(); });
+        Bind(wxEVT_LEAVE_WINDOW, [this](wxMouseEvent&) { hover_ = false; down_ = false; Refresh(); });
+        Bind(wxEVT_LEFT_DOWN, [this](wxMouseEvent&) { if (IsEnabled()) { down_ = true; Refresh(); } });
+        Bind(wxEVT_LEFT_UP, [this](wxMouseEvent&) {
+            const bool fire = down_ && hover_;
+            down_ = false;
+            Refresh();
+            if (fire) Fire();
+        });
+        Bind(wxEVT_SET_FOCUS,  [this](wxFocusEvent& e) { focus_ = true;  Refresh(); e.Skip(); });
+        Bind(wxEVT_KILL_FOCUS, [this](wxFocusEvent& e) { focus_ = false; Refresh(); e.Skip(); });
+        Bind(wxEVT_KEY_DOWN, [this](wxKeyEvent& e) {
+            if (e.GetKeyCode() == WXK_SPACE || e.GetKeyCode() == WXK_RETURN) Fire();
+            else e.Skip();
+        });
+    }
+
+    bool AcceptsFocus() const override { return IsEnabled(); }
+    bool Enable(bool on = true) override { const bool r = wxControl::Enable(on); Refresh(); return r; }
+
+    void SetLabel(const wxString& l) override { label_ = l; InvalidateBestSize(); Refresh(); }
+
+protected:
+    wxSize DoGetBestSize() const override
+    {
+        const wxSize te = GetTextExtent(label_);
+        return wxSize(te.x + 32, te.y + 16);
+    }
+
+private:
+    void Fire()
+    {
+        if (!IsEnabled()) return;
+        wxCommandEvent ev(wxEVT_BUTTON, GetId());
+        ev.SetEventObject(this);
+        ProcessWindowEvent(ev);
+    }
+
+    void OnPaint(wxPaintEvent&)
+    {
+        wxAutoBufferedPaintDC pdc(this);
+        pdc.SetBackground(wxBrush(GetBackgroundColour()));
+        pdc.Clear();
+        wxGCDC dc(pdc);
+        const wxSize s = GetClientSize();
+        wxColour fill = primary_ ? t_.accent : t_.track;
+        wxColour ink  = primary_ ? wxColour(255, 255, 255) : t_.text;
+        if (hover_) fill = MixColour(fill, primary_ ? wxColour(255, 255, 255) : t_.text, primary_ ? 12 : 8);
+        if (down_)  fill = MixColour(fill, wxColour(0, 0, 0), 18);
+        if (!IsEnabled()) { fill = MixColour(t_.card, t_.track, 60); ink = t_.sub; }
+        dc.SetPen(wxPen(focus_ ? t_.accent : (primary_ ? fill : t_.border), 1));
+        dc.SetBrush(wxBrush(fill));
+        dc.DrawRoundedRectangle(0, 0, s.x, s.y, 8);
+        dc.SetFont(GetFont());
+        dc.SetTextForeground(ink);
+        const wxSize te = dc.GetTextExtent(label_);
+        dc.DrawText(label_, (s.x - te.x) / 2, (s.y - te.y) / 2);
+    }
+
+    Theme t_;
+    wxString label_;
+    bool primary_;
+    bool hover_ = false, down_ = false, focus_ = false;
+};
+
+// Check box with a label. Sends wxEVT_CHECKBOX (IsChecked() works as usual).
+class FlatCheck : public wxControl {
+public:
+    FlatCheck(wxWindow* parent, const Theme& t, const wxString& label)
+        : wxControl(parent, wxID_ANY, wxDefaultPosition, wxDefaultSize, wxBORDER_NONE), t_(t), label_(label)
+    {
+        SetBackgroundStyle(wxBG_STYLE_PAINT);
+        SetCursor(wxCursor(wxCURSOR_HAND));
+        Bind(wxEVT_PAINT, &FlatCheck::OnPaint, this);
+        Bind(wxEVT_ENTER_WINDOW, [this](wxMouseEvent&) { hover_ = true; Refresh(); });
+        Bind(wxEVT_LEAVE_WINDOW, [this](wxMouseEvent&) { hover_ = false; Refresh(); });
+        Bind(wxEVT_LEFT_UP, [this](wxMouseEvent&) { Toggle(); });
+        Bind(wxEVT_SET_FOCUS,  [this](wxFocusEvent& e) { focus_ = true;  Refresh(); e.Skip(); });
+        Bind(wxEVT_KILL_FOCUS, [this](wxFocusEvent& e) { focus_ = false; Refresh(); e.Skip(); });
+        Bind(wxEVT_KEY_DOWN, [this](wxKeyEvent& e) {
+            if (e.GetKeyCode() == WXK_SPACE) Toggle(); else e.Skip();
+        });
+    }
+
+    bool AcceptsFocus() const override { return IsEnabled(); }
+    bool Enable(bool on = true) override { const bool r = wxControl::Enable(on); Refresh(); return r; }
+
+    void SetValue(bool v) { if (v != on_) { on_ = v; Refresh(); } }
+    bool GetValue() const { return on_; }
+
+protected:
+    wxSize DoGetBestSize() const override
+    {
+        const wxSize te = GetTextExtent(label_);
+        return wxSize(kBox + 9 + te.x + 2, std::max(kBox, te.y) + 4);
+    }
+
+private:
+    static constexpr int kBox = 18;
+
+    void Toggle()
+    {
+        if (!IsEnabled()) return;
+        on_ = !on_;
+        Refresh();
+        wxCommandEvent ev(wxEVT_CHECKBOX, GetId());
+        ev.SetEventObject(this);
+        ev.SetInt(on_ ? 1 : 0);
+        ProcessWindowEvent(ev);
+    }
+
+    void OnPaint(wxPaintEvent&)
+    {
+        wxAutoBufferedPaintDC pdc(this);
+        pdc.SetBackground(wxBrush(GetBackgroundColour()));
+        pdc.Clear();
+        wxGCDC dc(pdc);
+        const wxSize s = GetClientSize();
+        const bool en = IsEnabled();
+        const int by = (s.y - kBox) / 2;
+        wxColour fill = on_ ? t_.accent : t_.page;
+        wxColour edge = on_ ? t_.accent : (hover_ ? t_.sub : t_.border);
+        if (!en) { fill = on_ ? MixColour(t_.card, t_.sub, 40) : t_.card; edge = t_.border; }
+        dc.SetPen(wxPen(focus_ ? t_.accent : edge, focus_ ? 2 : 1));
+        dc.SetBrush(wxBrush(fill));
+        dc.DrawRoundedRectangle(1, by + 1, kBox - 2, kBox - 2, 5);
+        if (on_) {
+            dc.SetPen(wxPen(wxColour(255, 255, 255), 2, wxPENSTYLE_SOLID));
+            const wxPoint pts[3] = { wxPoint(5, by + 9), wxPoint(8, by + 12), wxPoint(13, by + 6) };
+            dc.DrawLines(3, pts);
+        }
+        dc.SetFont(GetFont());
+        dc.SetTextForeground(en ? t_.text : t_.sub);
+        const wxSize te = dc.GetTextExtent(label_);
+        dc.DrawText(label_, kBox + 9, (s.y - te.y) / 2);
+    }
+
+    Theme t_;
+    wxString label_;
+    bool on_ = false, hover_ = false, focus_ = false;
+};
+
+// Horizontal slider: thin track, accent fill, round thumb. Sends wxEVT_SLIDER (GetInt()).
+class FlatSlider : public wxControl {
+public:
+    FlatSlider(wxWindow* parent, const Theme& t, int minV, int maxV, int value, int width)
+        : wxControl(parent, wxID_ANY, wxDefaultPosition, wxSize(width, 26), wxBORDER_NONE),
+          t_(t), min_(minV), max_(maxV), val_(value), width_(width)
+    {
+        SetBackgroundStyle(wxBG_STYLE_PAINT);
+        SetCursor(wxCursor(wxCURSOR_HAND));
+        Bind(wxEVT_PAINT, &FlatSlider::OnPaint, this);
+        Bind(wxEVT_ENTER_WINDOW, [this](wxMouseEvent&) { hover_ = true; Refresh(); });
+        Bind(wxEVT_LEAVE_WINDOW, [this](wxMouseEvent&) { hover_ = false; Refresh(); });
+        Bind(wxEVT_LEFT_DOWN, [this](wxMouseEvent& e) {
+            if (!IsEnabled()) return;
+            drag_ = true;
+            if (!HasCapture()) CaptureMouse();
+            SetFromX(e.GetX());
+        });
+        Bind(wxEVT_MOTION, [this](wxMouseEvent& e) { if (drag_) SetFromX(e.GetX()); });
+        Bind(wxEVT_LEFT_UP, [this](wxMouseEvent&) {
+            drag_ = false;
+            if (HasCapture()) ReleaseMouse();
+            Refresh();
+        });
+        Bind(wxEVT_MOUSE_CAPTURE_LOST, [this](wxMouseCaptureLostEvent&) { drag_ = false; Refresh(); });
+        Bind(wxEVT_MOUSEWHEEL, [this](wxMouseEvent& e) {
+            if (!IsEnabled()) return;
+            Change(val_ + (e.GetWheelRotation() > 0 ? 5 : -5));
+        });
+        Bind(wxEVT_SET_FOCUS,  [this](wxFocusEvent& e) { focus_ = true;  Refresh(); e.Skip(); });
+        Bind(wxEVT_KILL_FOCUS, [this](wxFocusEvent& e) { focus_ = false; Refresh(); e.Skip(); });
+        Bind(wxEVT_KEY_DOWN, [this](wxKeyEvent& e) {
+            switch (e.GetKeyCode()) {
+                case WXK_LEFT:  case WXK_DOWN: Change(val_ - 1);  break;
+                case WXK_RIGHT: case WXK_UP:   Change(val_ + 1);  break;
+                case WXK_PAGEDOWN:             Change(val_ - 10); break;
+                case WXK_PAGEUP:               Change(val_ + 10); break;
+                default: e.Skip();
+            }
+        });
+    }
+
+    bool AcceptsFocus() const override { return IsEnabled(); }
+    bool Enable(bool on = true) override { const bool r = wxControl::Enable(on); Refresh(); return r; }
+
+    void SetValue(int v) { v = std::clamp(v, min_, max_); if (v != val_) { val_ = v; Refresh(); } }
+    int GetValue() const { return val_; }
+
+protected:
+    wxSize DoGetBestSize() const override { return wxSize(width_, 26); }
+
+private:
+    static constexpr int kPad = 10;
+
+    void SetFromX(int x)
+    {
+        const double w = std::max(1, GetClientSize().x - 2 * kPad);
+        const double f = std::clamp((x - kPad) / w, 0.0, 1.0);
+        Change(min_ + (int)std::lround(f * (max_ - min_)));
+    }
+
+    void Change(int v)
+    {
+        v = std::clamp(v, min_, max_);
+        if (v == val_) return;
+        val_ = v;
+        Refresh();
+        wxCommandEvent ev(wxEVT_SLIDER, GetId());
+        ev.SetEventObject(this);
+        ev.SetInt(val_);
+        ProcessWindowEvent(ev);
+    }
+
+    void OnPaint(wxPaintEvent&)
+    {
+        wxAutoBufferedPaintDC pdc(this);
+        pdc.SetBackground(wxBrush(GetBackgroundColour()));
+        pdc.Clear();
+        wxGCDC dc(pdc);
+        const wxSize s = GetClientSize();
+        const bool en = IsEnabled();
+        const double cy = s.y / 2.0, th = 6.0;
+        const double span = std::max(1, s.x - 2 * kPad);
+        const double frac = max_ > min_ ? double(val_ - min_) / (max_ - min_) : 0.0;
+        const double tx = kPad + span * frac;
+        const wxColour fillCol = en ? t_.accent : t_.sub;
+
+        dc.SetPen(*wxTRANSPARENT_PEN);
+        dc.SetBrush(wxBrush(t_.track));
+        dc.DrawRoundedRectangle(kPad, cy - th / 2, span, th, th / 2);
+        if (tx > kPad) {
+            dc.SetBrush(wxBrush(fillCol));
+            dc.DrawRoundedRectangle(kPad, cy - th / 2, tx - kPad, th, th / 2);
+        }
+        const double r = (drag_ || hover_) ? 8.5 : 7.5;
+        if (focus_) {
+            dc.SetPen(wxPen(wxColour(fillCol.Red(), fillCol.Green(), fillCol.Blue(), 90), 3));
+            dc.SetBrush(*wxTRANSPARENT_BRUSH);
+            dc.DrawCircle(wxPoint((int)tx, (int)cy), (int)(r + 3));
+        }
+        dc.SetPen(wxPen(fillCol, 2));
+        dc.SetBrush(wxBrush(wxColour(255, 255, 255)));
+        dc.DrawCircle(wxPoint((int)tx, (int)cy), (int)r);
+    }
+
+    Theme t_;
+    int min_, max_, val_, width_;
+    bool hover_ = false, drag_ = false, focus_ = false;
+};
+
 // Children of a card must paint with the card's colour.
 static void ApplyBackground(wxWindow* w, const wxColour& bg)
 {
     w->SetBackgroundColour(bg);
+    if (dynamic_cast<InputBox*>(w)) return;     // its text control keeps the field colour
     for (wxWindow* c : w->GetChildren()) ApplyBackground(c, bg);
 }
 
@@ -550,6 +869,9 @@ public:
         Refresh();
     }
 
+    // Different card colour (used as a background hint, e.g. for seamless-input clients)
+    void SetFill(const wxColour& c) { fill_ = c; hasFill_ = true; Refresh(); }
+
 private:
     void OnPaint(wxPaintEvent&)
     {
@@ -559,7 +881,7 @@ private:
         wxGCDC dc(pdc);
         const wxSize s = GetClientSize();
         dc.SetPen(wxPen(t_.border, 1));
-        dc.SetBrush(wxBrush(t_.card));
+        dc.SetBrush(wxBrush(hasFill_ ? fill_ : t_.card));
         dc.DrawRoundedRectangle(0, 0, s.x, s.y, 10);
         if (hasAccent_) {
             dc.SetPen(*wxTRANSPARENT_PEN);
@@ -571,6 +893,8 @@ private:
     Theme t_;
     bool hasAccent_;
     wxColour accent_;
+    wxColour fill_;
+    bool hasFill_ = false;
 };
 
 // Thin rounded level meter (0..1): green, amber above 70 %, red above 90 %.
@@ -616,6 +940,200 @@ private:
 };
 
 // Speaker icon that toggles between "sound on" and "muted" (drawn, no bitmaps needed).
+// Small on/off switch (green when on).
+class ToggleSwitch : public wxControl {
+public:
+    std::function<void(bool on)> onToggle;
+
+    ToggleSwitch(wxWindow* parent, const Theme& t)
+        : wxControl(parent, wxID_ANY, wxDefaultPosition, wxSize(42, 24), wxBORDER_NONE), t_(t)
+    {
+        SetBackgroundStyle(wxBG_STYLE_PAINT);
+        SetMinSize(wxSize(42, 24));
+        SetCursor(wxCursor(wxCURSOR_HAND));
+        Bind(wxEVT_PAINT, &ToggleSwitch::OnPaint, this);
+        Bind(wxEVT_ENTER_WINDOW, [this](wxMouseEvent&) { hover_ = true; Refresh(); });
+        Bind(wxEVT_LEAVE_WINDOW, [this](wxMouseEvent&) { hover_ = false; Refresh(); });
+        Bind(wxEVT_LEFT_UP, [this](wxMouseEvent&) {
+            on_ = !on_;
+            Refresh();
+            if (onToggle) onToggle(on_);
+        });
+    }
+
+    void SetValue(bool v) { if (v != on_) { on_ = v; Refresh(); } }
+    bool GetValue() const { return on_; }
+
+private:
+    void OnPaint(wxPaintEvent&)
+    {
+        wxAutoBufferedPaintDC pdc(this);
+        pdc.SetBackground(wxBrush(GetBackgroundColour()));
+        pdc.Clear();
+        wxGCDC dc(pdc);
+        wxGraphicsContext* gc = dc.GetGraphicsContext();
+        if (!gc) return;
+        const wxSize s = GetClientSize();
+        const double h = s.y - 4;
+        wxColour track = on_ ? t_.ok : t_.track;
+        if (hover_ && !on_) track = t_.border;
+        gc->SetPen(*wxTRANSPARENT_PEN);
+        gc->SetBrush(wxBrush(track));
+        gc->DrawRoundedRectangle(0, 2, s.x, h, h / 2);
+        const double d = h - 6;
+        gc->SetBrush(wxBrush(wxColour(255, 255, 255)));
+        gc->DrawEllipse(on_ ? s.x - 3 - d : 3, 2 + 3, d, d);
+    }
+
+    Theme t_;
+    bool on_ = false, hover_ = false;
+};
+
+// Rounded label with a tinted background ("Connected", "Waiting", ...).
+class StatusPill : public wxControl {
+public:
+    StatusPill(wxWindow* parent, const Theme& t)
+        : wxControl(parent, wxID_ANY, wxDefaultPosition, wxDefaultSize, wxBORDER_NONE), t_(t)
+    {
+        SetBackgroundStyle(wxBG_STYLE_PAINT);
+        wxFont f = GetFont();
+        f.SetWeight(wxFONTWEIGHT_BOLD);
+        SetFont(f);
+        Bind(wxEVT_PAINT, &StatusPill::OnPaint, this);
+        Set("-", t.sub);
+    }
+
+    void Set(const wxString& text, const wxColour& c)
+    {
+        if (text == text_ && c == col_) return;
+        const bool resize = text != text_;
+        text_ = text;
+        col_ = c;
+        if (resize) {
+            const wxSize te = GetTextExtent(text_);
+            SetMinSize(wxSize(te.x + 22, te.y + 8));
+            InvalidateBestSize();
+            if (GetParent()) GetParent()->Layout();
+        }
+        Refresh();
+    }
+
+private:
+    void OnPaint(wxPaintEvent&)
+    {
+        wxAutoBufferedPaintDC pdc(this);
+        pdc.SetBackground(wxBrush(GetBackgroundColour()));
+        pdc.Clear();
+        wxGCDC dc(pdc);
+        const wxSize s = GetClientSize();
+        dc.SetPen(*wxTRANSPARENT_PEN);
+        dc.SetBrush(wxBrush(wxColour(col_.Red(), col_.Green(), col_.Blue(), t_.dark ? 46 : 34)));
+        dc.DrawRoundedRectangle(0, 0, s.x, s.y, s.y / 2.0);
+        dc.SetFont(GetFont());
+        dc.SetTextForeground(col_);
+        const wxSize te = dc.GetTextExtent(text_);
+        dc.DrawText(text_, (s.x - te.x) / 2, (s.y - te.y) / 2);
+    }
+
+    Theme t_;
+    wxString text_;
+    wxColour col_;
+};
+
+// Horizontal divider with a caption in the middle: ---- Other hosts ----
+class SectionDivider : public wxControl {
+public:
+    SectionDivider(wxWindow* parent, const Theme& t)
+        : wxControl(parent, wxID_ANY, wxDefaultPosition, wxDefaultSize, wxBORDER_NONE), t_(t)
+    {
+        SetBackgroundStyle(wxBG_STYLE_PAINT);
+        wxFont f = GetFont();
+        f.SetWeight(wxFONTWEIGHT_BOLD);
+        SetFont(f);
+        Bind(wxEVT_PAINT, &SectionDivider::OnPaint, this);
+        Bind(wxEVT_SIZE, [this](wxSizeEvent& e) { Refresh(); e.Skip(); });
+        Set("");
+    }
+
+    void Set(const wxString& text)
+    {
+        if (text == text_ && GetMinSize().y > 0) return;
+        text_ = text;
+        SetMinSize(wxSize(-1, GetTextExtent("Ag").y + 14));
+        InvalidateBestSize();
+        Refresh();
+    }
+
+private:
+    void OnPaint(wxPaintEvent&)
+    {
+        wxAutoBufferedPaintDC pdc(this);
+        pdc.SetBackground(wxBrush(GetBackgroundColour()));
+        pdc.Clear();
+        wxGCDC dc(pdc);
+        const wxSize s = GetClientSize();
+        dc.SetFont(GetFont());
+        const wxSize te = dc.GetTextExtent(text_);
+        const int gap = 12, y = s.y / 2;
+        const int tx = std::max(0, (s.x - te.x) / 2);
+        dc.SetPen(wxPen(t_.border, 1));
+        if (tx > gap) {
+            dc.DrawLine(0, y, tx - gap, y);
+            dc.DrawLine(tx + te.x + gap, y, s.x, y);
+        }
+        dc.SetTextForeground(t_.sub);
+        dc.DrawText(text_, tx, (s.y - te.y) / 2);
+    }
+
+    Theme t_;
+    wxString text_;
+};
+
+// Round badge with the first letter of a name.
+class Avatar : public wxControl {
+public:
+    Avatar(wxWindow* parent, const Theme& t, int size = 40)
+        : wxControl(parent, wxID_ANY, wxDefaultPosition, wxSize(size, size), wxBORDER_NONE), t_(t), col_(t.accent)
+    {
+        SetBackgroundStyle(wxBG_STYLE_PAINT);
+        SetMinSize(wxSize(size, size));
+        Bind(wxEVT_PAINT, &Avatar::OnPaint, this);
+    }
+
+    void Set(const wxString& name, const wxColour& c)
+    {
+        wxString l = name.empty() ? wxString("?") : name.Left(1).Upper();
+        if (l == letter_ && c == col_) return;
+        letter_ = l;
+        col_ = c;
+        Refresh();
+    }
+
+private:
+    void OnPaint(wxPaintEvent&)
+    {
+        wxAutoBufferedPaintDC pdc(this);
+        pdc.SetBackground(wxBrush(GetBackgroundColour()));
+        pdc.Clear();
+        wxGCDC dc(pdc);
+        const wxSize s = GetClientSize();
+        dc.SetPen(*wxTRANSPARENT_PEN);
+        dc.SetBrush(wxBrush(wxColour(col_.Red(), col_.Green(), col_.Blue(), t_.dark ? 52 : 38)));
+        dc.DrawEllipse(0, 0, s.x, s.y);
+        wxFont f = GetFont();
+        f.SetWeight(wxFONTWEIGHT_BOLD);
+        f.SetPointSize(f.GetPointSize() + 4);
+        dc.SetFont(f);
+        dc.SetTextForeground(col_);
+        const wxSize te = dc.GetTextExtent(letter_);
+        dc.DrawText(letter_, (s.x - te.x) / 2, (s.y - te.y) / 2);
+    }
+
+    Theme t_;
+    wxString letter_;
+    wxColour col_;
+};
+
 class SpeakerButton : public wxControl {
 public:
     std::function<void(bool muted)> onToggle;
@@ -867,10 +1385,22 @@ public:
             store_ = std::make_unique<ConfigStore>(dir / "configs");
             trust_ = std::make_unique<TrustStore>(dir / "trust.txt");
             trust_->Load();
+            netTrust_ = std::make_unique<TrustStore>(dir / "network-trust.txt");
+            netTrust_->Load();
+            groupFile_ = dir / "group.txt";
+            {
+                std::ifstream gi(groupFile_);
+                std::string line;
+                if (gi && std::getline(gi, line)) {
+                    if (!line.empty() && line.back() == '\r') line.pop_back();
+                    groupPwd_ = line;
+                }
+            }
             dataDir_ = wxString::FromUTF8(dir.u8string());
         }
 
         SetBackgroundColour(theme_.page);
+        SetForegroundColour(theme_.text);
         auto* root = new wxBoxSizer(wxVERTICAL);
 
         // ---- header: host name, addresses, key
@@ -882,6 +1412,7 @@ public:
             tf.SetWeight(wxFONTWEIGHT_BOLD);
             tf.SetPointSize(tf.GetPointSize() + 5);
             title->SetFont(tf);
+            title->SetForegroundColour(theme_.text);
             auto* sub = new wxStaticText(this, wxID_ANY,
                 wxString::Format("IP %s   |   Key %s   |   TCP %d   UDP %d (discovery)   UDP %d (audio)",
                                  ips.empty() ? wxString("-") : ips,
@@ -906,15 +1437,19 @@ public:
         pages_->SetBackgroundColour(theme_.page);
         pages_->AddPage(BuildDevicesPage(pages_), "Devices", true);
         pages_->AddPage(BuildNetworkPage(pages_), "Network");
-        tabs_->onSelect = [this](int i) { pages_->ChangeSelection((size_t)i); };
+        tabs_->onSelect = [this](int i) {
+            pages_->ChangeSelection((size_t)i);
+            if (wxWindow* pg = pages_->GetCurrentPage()) pg->Layout();
+        };
         root->Add(pages_, 3, wxEXPAND | wxLEFT | wxRIGHT | wxBOTTOM, 10);
         SetSizer(root);
 
         // ---- events
-        list_->Bind(wxEVT_LIST_ITEM_SELECTED, &MainFrame::OnListSelected, this);
         goBtn_->Bind(wxEVT_BUTTON, [this](wxCommandEvent&) { Activate(target_->GetValue().ToStdString()); });
         target_->Bind(wxEVT_TEXT_ENTER, [this](wxCommandEvent&) { Activate(target_->GetValue().ToStdString()); });
         scanBtn_->Bind(wxEVT_BUTTON, [this](wxCommandEvent&) { StartScan(); });
+        groupBtn_->Bind(wxEVT_BUTTON, [this](wxCommandEvent&) { ApplyGroupPassword(); });
+        groupCtl_->Bind(wxEVT_TEXT_ENTER, [this](wxCommandEvent&) { ApplyGroupPassword(); });
 
         masterMute_->onToggle = [this](bool m) { audio_->SetMuted(m); MarkCfgDirty(); };
         volSlider_->Bind(wxEVT_SLIDER, [this](wxCommandEvent&) {
@@ -944,10 +1479,21 @@ public:
             CallAfter([this, s] { Log(wxString::FromUTF8(s)); });
         };
         cb.onPeerReady = [this](int id, std::uint32_t inst, const std::string& key,
-                                const std::string& name, const std::string& addr, bool incoming) {
-            CallAfter([this, id, inst, key, name, addr, incoming] {
-                OnPeerReady(id, inst, key, wxString::FromUTF8(name), addr, incoming);
+                                const std::string& name, const std::string& addr, bool incoming,
+                                bool viaGroup) {
+            CallAfter([this, id, inst, key, name, addr, incoming, viaGroup] {
+                OnPeerReady(id, inst, key, wxString::FromUTF8(name), addr, incoming, viaGroup);
             });
+        };
+        cb.onPeerPending = [this](int id, std::uint32_t inst, const std::string& key,
+                                  const std::string& name, const std::string& addr, bool incoming,
+                                  bool theyTrust) {
+            CallAfter([this, id, inst, key, name, addr, incoming, theyTrust] {
+                OnPeerPending(id, inst, key, wxString::FromUTF8(name), addr, incoming, theyTrust);
+            });
+        };
+        cb.onPeerPendingLost = [this](int id) {
+            CallAfter([this, id] { if (pend_.erase(id)) RebuildClients(); });
         };
         cb.onPeerLost = [this](int id) {
             if (input_) input_->RemovePeer(id);     // hand input back immediately
@@ -959,8 +1505,8 @@ public:
             if (input_ && input_->HandleMessage(id, line)) return;
             CallAfter([this, id, line] { OnMessage(id, line); });
         };
-        cb.onBeacon = [this](const std::string& ip, const std::string& host, bool server) {
-            CallAfter([this, ip, host, server] { OnBeacon(ip, host, server); });
+        cb.onBeacon = [this](const BeaconInfo& b) {
+            CallAfter([this, b] { OnBeacon(b); });
         };
         cb.onScanHost = [this](const std::string& ip, bool server) {
             CallAfter([this, ip, server] { OnScanHost(ip, server); });
@@ -1000,10 +1546,24 @@ public:
         RebuildList();
         Log("This PC's key: " + wxString::FromUTF8(ident_->Fingerprint()) + "   (data: " + dataDir_ + ")");
         if (!identNote_.empty()) Log("Identity: " + wxString::FromUTF8(identNote_));
-        Log("Ready. Other seamless-input PCs connect automatically.");
+        Log(groupPwd_.empty()
+            ? "Ready. No password set - PCs without a password connect automatically."
+            : "Ready. PCs with the same group password connect automatically.");
+        net_->SetGroup(groupPwd_);
+        UpdateGroupLabel();
         net_->Start();
         StartScan();
+        listDirty_ = true;      // force the first real layout of the client / other-host list
+        RebuildClients();
+        Layout();
         Centre();
+        // The first page is not laid out until it gets a size event; do it once the frame is up.
+        CallAfter([this] {
+            Layout();
+            if (wxWindow* pg = pages_->GetCurrentPage()) pg->Layout();
+            for (size_t i = 0; i < pages_->GetPageCount(); ++i) pages_->GetPage(i)->Layout();
+            if (cliScroll_) { cliSizer_->Layout(); cliScroll_->FitInside(); }
+        });
         if (theme_.dark) { DarkTitleBar(this); DarkenTree(this); }
     }
 
@@ -1017,6 +1577,17 @@ private:
         std::string host;
         bool server;
         std::chrono::steady_clock::time_point seen;
+        std::string key;            // announced public key (proven only by the handshake)
+        bool sameGroup = false;
+    };
+    // connected to us but neither in our group nor mutually trusted (yet)
+    struct PendInfo {
+        std::uint32_t inst = 0;
+        std::string key;
+        wxString name;
+        std::string addr;
+        bool incoming = false;
+        bool theyTrust = false;
     };
     struct Scanned {
         wxString name;
@@ -1030,6 +1601,7 @@ private:
         std::string addr;
         std::vector<wxRect> mons;
         bool incoming = false;
+        bool viaGroup = false;      // accepted because of the group password (else: mutual trust)
         bool placed = false;
         bool share = false;         // send my audio (system audio) to this device
         bool mic = false;           // send my microphone to this device
@@ -1038,53 +1610,138 @@ private:
     };
 
     // ---------------------------------------------------------------- pages
+    // Network tab: clients + other hosts on the left; group, manual connect and activity log on the right.
     wxWindow* BuildNetworkPage(wxWindow* parent)
     {
         auto* p = new wxPanel(parent);
         p->SetBackgroundColour(theme_.page);
-        auto* bottom = new wxBoxSizer(wxHORIZONTAL);
+        auto* root = new wxBoxSizer(wxHORIZONTAL);
 
+        // ================= left: clients, other hosts
         auto* left = new wxBoxSizer(wxVERTICAL);
-        searchLbl_ = new wxStaticText(p, wxID_ANY, "");
-        left->Add(searchLbl_, 0, wxBOTTOM, 4);
 
-        list_ = new wxListCtrl(p, wxID_ANY, wxDefaultPosition, wxDefaultSize,
-                               wxLC_REPORT | wxLC_SINGLE_SEL);
-        list_->InsertColumn(0, "Name", wxLIST_FORMAT_LEFT, 200);
-        list_->InsertColumn(1, "Address", wxLIST_FORMAT_LEFT, 130);
-        list_->InsertColumn(2, "Status", wxLIST_FORMAT_LEFT, 140);
-        left->Add(list_, 1, wxEXPAND);
+        left->Add(MakeSection(p, "Clients", clientsCount_), 0, wxEXPAND | wxBOTTOM, 6);
+        cliScroll_ = new wxScrolledWindow(p, wxID_ANY, wxDefaultPosition, wxSize(-1, 200),
+                                          wxVSCROLL | wxBORDER_NONE);
+        cliScroll_->SetBackgroundColour(theme_.page);
+        cliScroll_->SetScrollRate(0, 12);
+        cliSizer_ = new wxBoxSizer(wxVERTICAL);
+        cliEmpty_ = new wxStaticText(cliScroll_, wxID_ANY,
+            "No seamless-input clients found yet.\nStart it on another PC in this network.",
+            wxDefaultPosition, wxDefaultSize, wxALIGN_CENTRE_HORIZONTAL);
+        cliEmpty_->SetForegroundColour(theme_.sub);
+        cliSizer_->Add(cliEmpty_, 0, wxALIGN_CENTER_HORIZONTAL | wxTOP, 22);
+        cliScroll_->SetSizer(cliSizer_);
+        othDivider_ = new SectionDivider(cliScroll_, theme_);
+        othDivider_->SetBackgroundColour(theme_.page);
+        othEmpty_ = new wxStaticText(cliScroll_, wxID_ANY, "No other hosts found yet.",
+                                     wxDefaultPosition, wxDefaultSize, wxALIGN_CENTRE_HORIZONTAL);
+        othEmpty_->SetForegroundColour(theme_.sub);
+        othEmpty_->SetBackgroundColour(theme_.page);
+        cliSizer_->Add(othDivider_, 0, wxEXPAND | wxTOP | wxBOTTOM, 4);
+        cliSizer_->Add(othEmpty_, 0, wxALIGN_CENTER_HORIZONTAL | wxTOP, 10);
+        left->Add(cliScroll_, 1, wxEXPAND);
 
-        auto* row = new wxBoxSizer(wxHORIZONTAL);
-        target_ = new wxTextCtrl(p, wxID_ANY, "", wxDefaultPosition, wxDefaultSize, wxTE_PROCESS_ENTER);
-        target_->SetHint("target IP");
-        goBtn_ = new wxButton(p, wxID_ANY, "Go");
-        scanBtn_ = new wxButton(p, wxID_ANY, "Scan LAN");
-        row->Add(target_, 1, wxRIGHT, 6);
-        row->Add(goBtn_, 0, wxRIGHT, 6);
-        row->Add(scanBtn_, 0);
-        left->Add(row, 0, wxEXPAND | wxTOP, 6);
+        // ================= right: group, connect, activity
+        auto* right = new wxBoxSizer(wxVERTICAL);
 
-        log_ = new wxTextCtrl(p, wxID_ANY, "", wxDefaultPosition, wxDefaultSize,
-                              wxTE_MULTILINE | wxTE_READONLY);
-        log_->SetFont(wxFont(wxFontInfo(wxSystemSettings::GetFont(wxSYS_DEFAULT_GUI_FONT).GetPointSize()).Family(wxFONTFAMILY_TELETYPE)));
-
-        searchLbl_->SetForegroundColour(theme_.sub);
-        for (wxWindow* w : std::initializer_list<wxWindow*>{list_, target_, log_}) {
-            w->SetBackgroundColour(theme_.card);
-            w->SetForegroundColour(theme_.text);
+        // --- group
+        auto* groupCard = new CardPanel(p, theme_, false);
+        {
+            auto* gv = new wxBoxSizer(wxVERTICAL);
+            gv->Add(MakeHeader(groupCard, "Group"), 0, wxBOTTOM, 2);
+            gv->Add(MakeLabel(groupCard, "PCs with the same password connect automatically. Leave empty for no password.", true), 0, wxBOTTOM, 8);
+            auto* gr = new wxBoxSizer(wxHORIZONTAL);
+            auto* groupBox = new InputBox(groupCard, theme_, wxTE_PASSWORD | wxTE_PROCESS_ENTER,
+                                          wxString::FromUTF8(groupPwd_), "password");
+            groupCtl_ = groupBox->ctl;
+            groupBtn_ = new FlatButton(groupCard, theme_, "Apply", true);
+            gr->Add(groupBox, 1, wxALIGN_CENTER_VERTICAL | wxRIGHT, 8);
+            gr->Add(groupBtn_, 0, wxALIGN_CENTER_VERTICAL);
+            gv->Add(gr, 0, wxEXPAND);
+            groupLbl_ = MakeLabel(groupCard, "", true);
+            gv->Add(groupLbl_, 0, wxTOP, 8);
+            auto* go = new wxBoxSizer(wxVERTICAL);
+            go->Add(gv, 1, wxEXPAND | wxALL, 14);
+            groupCard->SetSizer(go);
+            ApplyBackground(groupCard, theme_.card);
         }
+        right->Add(groupCard, 0, wxEXPAND | wxBOTTOM, 8);
 
-        bottom->Add(left, 1, wxEXPAND | wxALL, 10);
-        bottom->Add(log_, 1, wxEXPAND | wxTOP | wxRIGHT | wxBOTTOM, 10);
-        p->SetSizer(bottom);
+        // --- connect by address
+        auto* connCard = new CardPanel(p, theme_, false);
+        {
+            auto* cv = new wxBoxSizer(wxVERTICAL);
+            cv->Add(MakeHeader(connCard, "Connect"), 0, wxBOTTOM, 8);
+            auto* r1 = new wxBoxSizer(wxHORIZONTAL);
+            auto* targetBox = new InputBox(connCard, theme_, wxTE_PROCESS_ENTER, "", "target IP address");
+            target_ = targetBox->ctl;
+            goBtn_ = new FlatButton(connCard, theme_, "Go", true);
+            r1->Add(targetBox, 1, wxALIGN_CENTER_VERTICAL | wxRIGHT, 8);
+            r1->Add(goBtn_, 0, wxALIGN_CENTER_VERTICAL);
+            cv->Add(r1, 0, wxEXPAND);
+            auto* r2 = new wxBoxSizer(wxHORIZONTAL);
+            scanBtn_ = new FlatButton(connCard, theme_, "Scan LAN");
+            searchLbl_ = new wxStaticText(connCard, wxID_ANY, "");
+            r2->Add(scanBtn_, 0, wxALIGN_CENTER_VERTICAL | wxRIGHT, 10);
+            r2->Add(searchLbl_, 1, wxALIGN_CENTER_VERTICAL);
+            cv->Add(r2, 0, wxEXPAND | wxTOP, 8);
+            auto* co = new wxBoxSizer(wxVERTICAL);
+            co->Add(cv, 1, wxEXPAND | wxALL, 14);
+            connCard->SetSizer(co);
+            ApplyBackground(connCard, theme_.card);
+            searchLbl_->SetForegroundColour(theme_.sub);
+        }
+        right->Add(connCard, 0, wxEXPAND | wxBOTTOM, 8);
+
+        // --- activity log
+        auto* logCard = new CardPanel(p, theme_, false);
+        {
+            auto* lv = new wxBoxSizer(wxVERTICAL);
+            lv->Add(MakeHeader(logCard, "Activity"), 0, wxBOTTOM, 6);
+            auto* logBox = new InputBox(logCard, theme_, wxTE_MULTILINE | wxTE_READONLY, "", "");
+            log_ = logBox->ctl;
+            log_->SetFont(wxFont(wxFontInfo(wxSystemSettings::GetFont(wxSYS_DEFAULT_GUI_FONT).GetPointSize()).Family(wxFONTFAMILY_TELETYPE)));
+            logBox->SetMinSize(wxSize(-1, 70));
+            lv->Add(logBox, 1, wxEXPAND);
+            auto* lo = new wxBoxSizer(wxVERTICAL);
+            lo->Add(lv, 1, wxEXPAND | wxALL, 14);
+            logCard->SetSizer(lo);
+            ApplyBackground(logCard, theme_.card);
+        }
+        right->Add(logCard, 1, wxEXPAND);
+
+        root->Add(left, 3, wxEXPAND | wxALL, 10);
+        root->Add(right, 2, wxEXPAND | wxTOP | wxRIGHT | wxBOTTOM, 10);
+        p->SetSizer(root);
         return p;
+    }
+
+    // "Title ............ count"
+    wxSizer* MakeSection(wxWindow* parent, const wxString& title, wxStaticText*& count)
+    {
+        auto* h = new wxBoxSizer(wxHORIZONTAL);
+        h->Add(MakeHeader(parent, title), 0, wxALIGN_CENTER_VERTICAL);
+        h->AddStretchSpacer();
+        count = MakeLabel(parent, "", true);
+        h->Add(count, 0, wxALIGN_CENTER_VERTICAL);
+        return h;
+    }
+
+    wxStaticText* MakeHeader(wxWindow* parent, const wxString& text)
+    {
+        auto* l = new wxStaticText(parent, wxID_ANY, text);
+        wxFont f = l->GetFont();
+        f.SetWeight(wxFONTWEIGHT_BOLD);
+        l->SetFont(f);
+        l->SetForegroundColour(theme_.text);
+        return l;
     }
 
     wxStaticText* MakeLabel(wxWindow* parent, const wxString& text, bool subtle = false)
     {
         auto* l = new wxStaticText(parent, wxID_ANY, text);
-        if (subtle) l->SetForegroundColour(theme_.sub);
+        l->SetForegroundColour(subtle ? theme_.sub : theme_.text);
         return l;
     }
 
@@ -1099,7 +1756,7 @@ private:
         auto* bv = new wxBoxSizer(wxVERTICAL);
 
         masterMute_ = new SpeakerButton(bar, theme_, 32);
-        volSlider_ = new wxSlider(bar, wxID_ANY, 100, 0, 100, wxDefaultPosition, wxSize(150, -1));
+        volSlider_ = new FlatSlider(bar, theme_, 0, 100, 100, 150);
         masterPct_ = MakeLabel(bar, "100%", true);
         masterPct_->SetMinSize(wxSize(44, -1));
 
@@ -1123,7 +1780,7 @@ private:
         devScroll_->SetScrollRate(0, 12);
         devSizer_ = new wxBoxSizer(wxVERTICAL);
         emptyLbl_ = new wxStaticText(devScroll_, wxID_ANY,
-            "No devices connected yet.\nOther seamless-input PCs on your network connect automatically.",
+            "No devices connected yet.\nUse the same password on your PCs (or none on all of them).",
             wxDefaultPosition, wxDefaultSize, wxALIGN_CENTRE_HORIZONTAL);
         emptyLbl_->SetForegroundColour(theme_.sub);
         devSizer_->Add(emptyLbl_, 0, wxALIGN_CENTER_HORIZONTAL | wxTOP, 28);
@@ -1138,9 +1795,9 @@ private:
     struct DevRow {
         CardPanel* card = nullptr;
         wxStaticText *name = nullptr, *sub = nullptr, *detail = nullptr, *pct = nullptr, *audioState = nullptr;
-        wxCheckBox *share = nullptr, *mic = nullptr, *allow = nullptr;
+        FlatCheck *share = nullptr, *mic = nullptr, *allow = nullptr;
         SpeakerButton* mute = nullptr;
-        wxSlider* vol = nullptr;
+        FlatSlider* vol = nullptr;
         LevelBar* level = nullptr;
     };
 
@@ -1156,6 +1813,7 @@ private:
         nf.SetWeight(wxFONTWEIGHT_BOLD);
         nf.SetPointSize(nf.GetPointSize() + 2);
         r.name->SetFont(nf);
+        r.name->SetForegroundColour(theme_.text);
         r.sub = MakeLabel(c, "", true);
         r.detail = MakeLabel(c, "", true);
         auto* info = new wxBoxSizer(wxVERTICAL);
@@ -1164,15 +1822,15 @@ private:
         info->Add(r.detail, 0);
 
         // switches
-        r.share = new wxCheckBox(c, wxID_ANY, "Share my audio");
+        r.share = new FlatCheck(c, theme_, "Share my audio");
         r.share->SetToolTip("Send what this PC plays (system audio) to this device only.\nIt may echo if this device sends its audio back.");
         if (!AudioEngine::SystemAudioSupported()) {
             r.share->Disable();
             r.share->SetToolTip("Sharing system audio is not supported on this platform");
         }
-        r.mic = new wxCheckBox(c, wxID_ANY, "Share my microphone");
+        r.mic = new FlatCheck(c, theme_, "Share my microphone");
         r.mic->SetToolTip("Send this PC's microphone to this device only");
-        r.allow = new wxCheckBox(c, wxID_ANY, "Allow remote control");
+        r.allow = new FlatCheck(c, theme_, "Allow remote control");
         r.allow->SetToolTip("Let this device use this PC's keyboard and mouse");
         auto* checks = new wxBoxSizer(wxVERTICAL);
         checks->Add(r.share, 0, wxBOTTOM, 8);
@@ -1181,7 +1839,7 @@ private:
 
         // audio from this device
         r.mute = new SpeakerButton(c, theme_, 34);
-        r.vol = new wxSlider(c, wxID_ANY, 100, 0, 100, wxDefaultPosition, wxSize(170, -1));
+        r.vol = new FlatSlider(c, theme_, 0, 100, 100, 170);
         r.pct = MakeLabel(c, "100%", true);
         r.pct->SetMinSize(wxSize(44, -1));
         r.level = new LevelBar(c, theme_, wxSize(-1, 8));
@@ -1302,6 +1960,296 @@ private:
         for (auto& kv : devRows_) RefreshDeviceRow(kv.second);
     }
 
+    // ----------------------------------------------------------- group password
+    void UpdateGroupLabel()
+    {
+        groupLbl_->SetLabelText(groupPwd_.empty()
+            ? wxString::FromUTF8("\xE2\x97\x8F  No password - open to PCs without a password")
+            : wxString::FromUTF8("\xE2\x97\x8F  Password active"));
+        groupLbl_->SetForegroundColour(groupPwd_.empty() ? theme_.warn : theme_.ok);
+        groupLbl_->Refresh();
+    }
+
+    void ApplyGroupPassword()
+    {
+        groupPwd_ = std::string(groupCtl_->GetValue().utf8_str());
+        std::error_code ec;
+        if (groupPwd_.empty()) {
+            std::filesystem::remove(groupFile_, ec);
+        } else {
+            std::filesystem::create_directories(groupFile_.parent_path(), ec);
+            {
+                std::ofstream out(groupFile_, std::ios::trunc);
+                out << groupPwd_ << "\n";
+            }
+            // owner-only: the password lets other PCs join this group
+            std::filesystem::permissions(groupFile_, std::filesystem::perms::owner_read | std::filesystem::perms::owner_write,
+                                         std::filesystem::perm_options::replace, ec);
+        }
+        net_->SetGroup(groupPwd_);
+        UpdateGroupLabel();
+        Log(groupPwd_.empty() ? "Password removed - reconnecting"
+                              : "Password set - reconnecting");
+    }
+
+    // ------------------------------------------------------------ clients (Network tab)
+    struct CliView {
+        std::string key, ip;
+        wxString name;
+        bool connected = false, viaGroup = false;
+        bool pending = false, theyTrust = false;
+        bool sameGroup = false, seen = false;
+    };
+
+    // One entry per PC (by public key) that runs seamless-input: seen on the LAN, connected,
+    // waiting for trust, or trusted earlier.
+    std::vector<CliView> ClientViews() const
+    {
+        std::map<std::string, CliView> m;
+        auto at = [&m](const std::string& key) -> CliView& { CliView& v = m[key]; v.key = key; return v; };
+        for (const auto& kv : disc_) {
+            if (kv.second.key.empty()) continue;
+            CliView& v = at(kv.second.key);
+            v.ip = kv.first;
+            v.name = wxString::FromUTF8(kv.second.host);
+            v.sameGroup = kv.second.sameGroup;
+            v.seen = true;
+        }
+        for (const auto& kv : pend_) {
+            CliView& v = at(kv.second.key);
+            v.pending = true;
+            v.theyTrust = kv.second.theyTrust;
+            v.ip = kv.second.addr;
+            if (v.name.empty()) v.name = kv.second.name;
+        }
+        for (const auto& kv : peers_) {
+            if (kv.second.key.empty()) continue;
+            CliView& v = at(kv.second.key);
+            v.connected = true;
+            v.viaGroup = kv.second.viaGroup;
+            v.ip = kv.second.addr;
+            v.name = kv.second.name;
+        }
+        std::vector<CliView> out;
+        for (auto& kv : m) out.push_back(std::move(kv.second));
+        std::sort(out.begin(), out.end(), [](const CliView& a, const CliView& b) {
+            const int c = a.name.CmpNoCase(b.name);
+            return c != 0 ? c < 0 : a.key < b.key;
+        });
+        return out;
+    }
+
+    wxColour ClientTint() const
+    {
+        auto mix = [](int a, int b) { return (unsigned char)(a + (b - a) * 12 / 100); };   // 12 % accent
+        return wxColour(mix(theme_.card.Red(), theme_.accent.Red()),
+                        mix(theme_.card.Green(), theme_.accent.Green()),
+                        mix(theme_.card.Blue(), theme_.accent.Blue()));
+    }
+
+    struct CliRow {
+        CardPanel* card = nullptr;
+        Avatar* avatar = nullptr;
+        wxStaticText *name = nullptr, *sub = nullptr, *detail = nullptr;
+        StatusPill* pill = nullptr;
+    };
+
+    void BuildClientRow(const CliView& v)
+    {
+        CliRow r;
+        const wxColour tint = ClientTint();
+        r.card = new CardPanel(cliScroll_, theme_, true);
+        r.card->SetFill(tint);                    // tinted background = "this PC runs seamless-input"
+        wxWindow* c = r.card;
+
+        r.avatar = new Avatar(c, theme_, 40);
+        r.name = new wxStaticText(c, wxID_ANY, "");
+        wxFont nf = r.name->GetFont();
+        nf.SetWeight(wxFONTWEIGHT_BOLD);
+        nf.SetPointSize(nf.GetPointSize() + 2);
+        r.name->SetFont(nf);
+        r.name->SetForegroundColour(theme_.text);
+        r.sub = MakeLabel(c, "", true);
+        r.detail = MakeLabel(c, "", true);
+        auto* info = new wxBoxSizer(wxVERTICAL);
+        info->Add(r.name, 0, wxBOTTOM, 2);
+        info->Add(r.sub, 0, wxBOTTOM, 2);
+        info->Add(r.detail, 0);
+
+        r.pill = new StatusPill(c, theme_);
+        auto* right = new wxBoxSizer(wxVERTICAL);
+        right->Add(r.pill, 0, wxALIGN_RIGHT);
+
+        auto* h = new wxBoxSizer(wxHORIZONTAL);
+        h->Add(r.avatar, 0, wxALIGN_CENTER_VERTICAL | wxRIGHT, 12);
+        h->Add(info, 1, wxALIGN_CENTER_VERTICAL | wxRIGHT, 12);
+        h->Add(right, 0, wxALIGN_CENTER_VERTICAL);
+        auto* outer = new wxBoxSizer(wxHORIZONTAL);
+        outer->AddSpacer(28);
+        outer->Add(h, 1, wxEXPAND | wxTOP | wxBOTTOM | wxRIGHT, 12);
+        r.card->SetSizer(outer);
+        ApplyBackground(r.card, tint);
+        r.sub->SetForegroundColour(theme_.sub);
+        r.detail->SetForegroundColour(theme_.sub);
+
+        cliRows_[v.key] = r;
+    }
+
+    void RefreshClientRow(CliRow& r, const CliView& v)
+    {
+        const wxString dot = wxString::FromUTF8("  \xC2\xB7  ");
+
+        SetText(r.name, v.name.empty() ? wxString("(unknown)") : v.name);
+        SetText(r.sub, (v.ip.empty() ? wxString("offline") : wxString::FromUTF8(v.ip)) + dot + "Key " +
+                       wxString::FromUTF8(Identity::Fingerprint(v.key)));
+
+        wxString pill, detail;
+        wxColour col = theme_.sub;
+        if (v.connected) {
+            pill = "Connected";
+            detail = groupPwd_.empty() ? "No password" : "Same password";
+            col = theme_.ok;
+        } else if (v.sameGroup) {
+            pill = "Connecting";
+            detail = groupPwd_.empty() ? "No password" : "Same password";
+            col = theme_.accent;
+        } else {
+            pill = "Different password";
+            detail = groupPwd_.empty() ? "That PC uses a password" : "Set the same password (or none) on both PCs";
+            col = theme_.warn;
+        }
+        SetText(r.detail, detail);
+        r.pill->Set(pill, col);
+        r.avatar->Set(v.name, v.connected || v.sameGroup ? col : theme_.sub);
+        r.card->SetAccent(col == theme_.sub ? theme_.border : col);
+    }
+
+    // ------------------------------------------------------------ other hosts (Network tab)
+    struct OthRow {
+        CardPanel* card = nullptr;
+        Avatar* avatar = nullptr;
+        wxStaticText *name = nullptr, *sub = nullptr, *detail = nullptr;
+        StatusPill* pill = nullptr;
+    };
+
+    // Clicking anywhere on a card (or its labels) selects that host.
+    void BindCardClick(wxWindow* w, const std::function<void()>& fn)
+    {
+        w->SetCursor(wxCursor(wxCURSOR_HAND));
+        w->Bind(wxEVT_LEFT_UP, [fn](wxMouseEvent& e) { fn(); e.Skip(); });
+        for (wxWindow* c : w->GetChildren()) BindCardClick(c, fn);
+    }
+
+    void BuildOtherRow(const Entry& e)
+    {
+        OthRow r;
+        r.card = new CardPanel(cliScroll_, theme_, true);
+        wxWindow* c = r.card;
+
+        r.avatar = new Avatar(c, theme_, 40);
+        r.name = new wxStaticText(c, wxID_ANY, "");
+        wxFont nf = r.name->GetFont();
+        nf.SetWeight(wxFONTWEIGHT_BOLD);
+        nf.SetPointSize(nf.GetPointSize() + 2);
+        r.name->SetFont(nf);
+        r.name->SetForegroundColour(theme_.text);
+        r.sub = MakeLabel(c, "", true);
+        r.detail = MakeLabel(c, "", true);
+        auto* info = new wxBoxSizer(wxVERTICAL);
+        info->Add(r.name, 0, wxBOTTOM, 2);
+        info->Add(r.sub, 0, wxBOTTOM, 2);
+        info->Add(r.detail, 0);
+
+        r.pill = new StatusPill(c, theme_);
+
+        auto* h = new wxBoxSizer(wxHORIZONTAL);
+        h->Add(r.avatar, 0, wxALIGN_CENTER_VERTICAL | wxRIGHT, 12);
+        h->Add(info, 1, wxALIGN_CENTER_VERTICAL | wxRIGHT, 12);
+        h->Add(r.pill, 0, wxALIGN_CENTER_VERTICAL);
+        auto* outer = new wxBoxSizer(wxHORIZONTAL);
+        outer->AddSpacer(28);
+        outer->Add(h, 1, wxEXPAND | wxTOP | wxBOTTOM | wxRIGHT, 12);
+        r.card->SetSizer(outer);
+        ApplyBackground(r.card, theme_.card);
+        r.sub->SetForegroundColour(theme_.sub);
+        r.detail->SetForegroundColour(theme_.sub);
+
+        const std::string ip = e.ip;
+        r.card->SetToolTip("Click to connect to this host");
+        BindCardClick(r.card, [this, ip] {
+            target_->SetValue(wxString::FromUTF8(ip));
+            Activate(ip);
+        });
+
+        othRows_[ip] = r;
+    }
+
+    void RebuildOthers()
+    {
+        if (!cliScroll_) return;
+        bool same = othRows_.size() == entries_.size();
+        for (const auto& e : entries_) same = same && othRows_.count(e.ip);
+        if (!same) {
+            for (auto& kv : othRows_) kv.second.card->Destroy();
+            othRows_.clear();
+            for (const auto& e : entries_) BuildOtherRow(e);
+            listDirty_ = true;
+        }
+        for (const auto& e : entries_) {
+            OthRow& r = othRows_[e.ip];
+            const bool server = e.status == "Server running";
+            const wxColour col = server ? theme_.accent : theme_.sub;
+            SetText(r.name, e.name);
+            SetText(r.sub, wxString::FromUTF8(e.ip));
+            SetText(r.detail, server ? "Server running - click to connect" : "Click to connect");
+            r.pill->Set(e.status, col);
+            r.avatar->Set(e.name, col);
+            r.card->SetAccent(server ? col : theme_.border);
+        }
+    }
+
+    // One list: client cards, then the "Other hosts" divider and the other-host cards right
+    // below the last client, so the second group follows the first however long it gets.
+    void ReflowList(const std::vector<CliView>& views)
+    {
+        listDirty_ = false;
+        cliScroll_->Freeze();
+        cliSizer_->Clear(false);   // detach only; the windows stay alive
+        cliSizer_->Add(cliEmpty_, 0, wxALIGN_CENTER_HORIZONTAL | wxTOP, 22);
+        cliEmpty_->Show(views.empty());
+        if (views.empty()) cliSizer_->AddSpacer(8);
+        for (const auto& v : views)
+            cliSizer_->Add(cliRows_[v.key].card, 0, wxEXPAND | wxBOTTOM, 8);
+        cliSizer_->Add(othDivider_, 0, wxEXPAND | wxTOP | wxBOTTOM, 4);
+        cliSizer_->Add(othEmpty_, 0, wxALIGN_CENTER_HORIZONTAL | wxTOP | wxBOTTOM, 10);
+        othEmpty_->Show(entries_.empty());
+        for (const auto& e : entries_)
+            cliSizer_->Add(othRows_[e.ip].card, 0, wxEXPAND | wxBOTTOM, 8);
+        cliSizer_->Layout();
+        cliScroll_->FitInside();
+        cliScroll_->Thaw();
+        cliScroll_->Refresh();
+    }
+
+    void RebuildClients()
+    {
+        if (!cliScroll_) return;
+        const auto views = ClientViews();
+        bool same = cliRows_.size() == views.size();
+        for (const auto& v : views) same = same && cliRows_.count(v.key);
+        if (!same) {
+            for (auto& kv : cliRows_) kv.second.card->Destroy();
+            cliRows_.clear();
+            for (const auto& v : views) BuildClientRow(v);
+            listDirty_ = true;
+        }
+        if (listDirty_) ReflowList(views);
+        for (const auto& v : views) RefreshClientRow(cliRows_[v.key], v);
+        int conn = 0;
+        for (const auto& v : views) conn += v.connected ? 1 : 0;
+        SetText(clientsCount_, wxString::Format("%d found, %d connected", (int)views.size(), conn));
+    }
+
     // ---------------------------------------------------------------- actions
     void Activate(const std::string& ip)
     {
@@ -1313,15 +2261,6 @@ private:
         if (isLocal) Log("Selected this machine (" + wxString::FromUTF8(ip) + ")");
         else         Log("Selected " + wxString::FromUTF8(ip) + " - trying to connect");
         net_->Select(ip, isLocal);
-    }
-
-    void OnListSelected(wxListEvent& e)
-    {
-        if (rebuilding_) return;
-        long i = e.GetIndex();
-        if (i < 0 || i >= (long)entries_.size()) return;
-        target_->SetValue(wxString::FromUTF8(entries_[i].ip));
-        Activate(entries_[i].ip);
     }
 
     // With 3+ PCs every PC keeps the whole layout in its own frame. When the user drags PC X
@@ -1598,10 +2537,26 @@ private:
     }
 
     // ------------------------------------------------------- network results
-    void OnPeerReady(int id, std::uint32_t inst, const std::string& key, const wxString& name,
-                     const std::string& addr, bool incoming)
+    void OnPeerPending(int id, std::uint32_t inst, const std::string& key, const wxString& name,
+                       const std::string& addr, bool incoming, bool theyTrust)
     {
+        PendInfo& pi = pend_[id];
+        const bool isNew = pi.key.empty();
+        const bool trustChanged = !isNew && pi.theyTrust != theyTrust;
+        pi.inst = inst; pi.key = key; pi.name = name; pi.addr = addr; pi.incoming = incoming; pi.theyTrust = theyTrust;
+        if (isNew)
+            Log(name + " (" + wxString::FromUTF8(addr) + "), key " + wxString::FromUTF8(Identity::Fingerprint(key)) +
+                " verified - different password, not connected");
+        if (trustChanged) Log(name + (theyTrust ? " trusts this PC" : " no longer trusts this PC"));
+        RebuildClients();
+    }
+
+    void OnPeerReady(int id, std::uint32_t inst, const std::string& key, const wxString& name,
+                     const std::string& addr, bool incoming, bool viaGroup)
+    {
+        pend_.erase(id);
         PeerInfo& p = peers_[id];
+        p.viaGroup = viaGroup;
         p.inst = inst;
         p.key = key;
         p.name = name;
@@ -1621,6 +2576,7 @@ private:
 
     void OnPeerLost(int id)
     {
+        pend_.erase(id);
         auto it = peers_.find(id);
         if (it != peers_.end()) {
             Log("Disconnected from " + it->second.name);
@@ -1691,11 +2647,12 @@ private:
         }
     }
 
-    void OnBeacon(const std::string& ip, const std::string& host, bool server)
+    void OnBeacon(const BeaconInfo& b)
     {
-        auto it = disc_.find(ip);
-        bool changed = it == disc_.end() || it->second.host != host || it->second.server != server;
-        disc_[ip] = {host, server, std::chrono::steady_clock::now()};
+        auto it = disc_.find(b.ip);
+        bool changed = it == disc_.end() || it->second.host != b.host || it->second.server != b.server ||
+                       it->second.key != b.key || it->second.sameGroup != b.sameGroup;
+        disc_[b.ip] = {b.host, b.server, std::chrono::steady_clock::now(), b.key, b.sameGroup};
         if (changed) RebuildList();
     }
 
@@ -1719,8 +2676,11 @@ private:
     // -------------------------------------------------------------------- GUI
     void RebuildList()
     {
-        auto isConnected = [this](const std::string& ip) {
+        // PCs that run seamless-input are shown as client cards, not in this list
+        auto isClient = [this](const std::string& ip) {
+            if (disc_.count(ip)) return true;
             for (auto& kv : peers_) if (kv.second.addr == ip) return true;
+            for (auto& kv : pend_)  if (kv.second.addr == ip) return true;
             return false;
         };
 
@@ -1730,35 +2690,25 @@ private:
             return (std::uint32_t)((a << 24) | (b << 16) | (c << 8) | d);
         };
 
-        // remote hosts: scan results first, UDP beacons override (they know the real host name)
+        // other hosts found by the scan (everything that is not a seamless-input client)
         std::map<std::uint32_t, Entry> remote;
         for (const auto& kv : scan_) {
+            if (isClient(kv.first)) continue;
             const auto& s = kv.second;
             remote[key(kv.first)] = {s.name.empty() ? wxString("(unknown)") : s.name, kv.first,
                                      s.server ? "Server running" : "Online", false};
         }
-        for (const auto& kv : disc_)
-            remote[key(kv.first)] = {wxString::FromUTF8(kv.second.host), kv.first,
-                                     kv.second.server ? "Server running" : "No server", false};
 
         entries_.clear();
-        for (const auto& a : local_)
-            entries_.push_back({host_ + " (" + wxString::FromUTF8(a.ifname) + ")", a.ip, "This machine", true});
         for (auto& kv : remote) entries_.push_back(kv.second);
 
-        rebuilding_ = true;
-        list_->Freeze();
-        list_->DeleteAllItems();
-        for (size_t i = 0; i < entries_.size(); ++i) {
-            const auto& e = entries_[i];
-            long row = list_->InsertItem((long)i, e.name);
-            list_->SetItem(row, 1, wxString::FromUTF8(e.ip));
-            list_->SetItem(row, 2, e.status + (isConnected(e.ip) ? "  [connected]" : ""));
-            if (e.ip == selectedIp_)
-                list_->SetItemState(row, wxLIST_STATE_SELECTED, wxLIST_STATE_SELECTED);
+        RebuildOthers();
+        {
+            int others = 0;
+            for (const auto& e : entries_) others += e.local ? 0 : 1;
+            othDivider_->Set(wxString::Format("Other hosts  (IP addresses)  -  %d", others));
         }
-        list_->Thaw();
-        rebuilding_ = false;
+        RebuildClients();
     }
 
     // Devices tab: one card per connected PC. Cards are only recreated when the set of
@@ -1854,6 +2804,8 @@ private:
     std::vector<wxRect> localMons_;
     std::vector<Entry> entries_;
     std::map<std::string, Discovered> disc_;
+    std::map<int, PendInfo> pend_;
+    std::map<std::string, CliRow> cliRows_;
     std::map<std::string, Scanned> scan_;
     std::map<int, PeerInfo> peers_;
     std::string selectedIp_;
@@ -1865,7 +2817,20 @@ private:
     Canvas* canvas_ = nullptr;
     TabBar* tabs_ = nullptr;
     wxSimplebook* pages_ = nullptr;
-    wxListCtrl* list_ = nullptr;
+    SectionDivider* othDivider_ = nullptr;
+    wxStaticText* othEmpty_ = nullptr;
+    bool listDirty_ = false;
+    std::map<std::string, OthRow> othRows_;
+    wxTextCtrl* groupCtl_ = nullptr;
+    FlatButton* groupBtn_ = nullptr;
+    wxStaticText* groupLbl_ = nullptr;
+    wxScrolledWindow* cliScroll_ = nullptr;
+    wxBoxSizer* cliSizer_ = nullptr;
+    wxStaticText* cliEmpty_ = nullptr;
+    wxStaticText* clientsCount_ = nullptr;
+    std::filesystem::path groupFile_;
+    std::string groupPwd_;
+    std::unique_ptr<TrustStore> netTrust_;       // keys we trust for network pairing (network-trust.txt)
     wxScrolledWindow* devScroll_ = nullptr;
     wxBoxSizer* devSizer_ = nullptr;
     wxStaticText* emptyLbl_ = nullptr;
@@ -1873,12 +2838,12 @@ private:
     Theme theme_ = MakeTheme();
     wxTextCtrl* target_ = nullptr;
     wxTextCtrl* log_ = nullptr;
-    wxButton* goBtn_ = nullptr;
-    wxButton* scanBtn_ = nullptr;
+    FlatButton* goBtn_ = nullptr;
+    FlatButton* scanBtn_ = nullptr;
     wxStaticText* searchLbl_ = nullptr;
     SpeakerButton* masterMute_ = nullptr;
     wxStaticText* masterPct_ = nullptr;
-    wxSlider* volSlider_ = nullptr;
+    FlatSlider* volSlider_ = nullptr;
     wxTimer timer_;
     wxTimer animTimer_;
     wxTimer statTimer_;
