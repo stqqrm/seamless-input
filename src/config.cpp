@@ -55,12 +55,13 @@ fs::path ConfigStore::PathFor(const std::vector<std::string>& members) const
 //   rev <ms>
 //   member <public key>            (one per PC of the set, this PC included)
 //   audio.send 0|1                 (legacy, read only)
-//   audio.source 0|1
+//   audio.source 0|1               (legacy, read only: which source the old "send" meant)
 //   audio.mute 0|1                 (master)
 //   audio.volume 0..100            (master)
 //   input.enabled 0|1
 //   peer <public key> <ox> <oy> <name...>
-//   peeraudio <public key> <send 0|1> <mute 0|1> <volume 0..100>
+//   peeraudio <public key> <send 0|1> <mute 0|1> <volume 0..100> [<mic 0|1>]
+//                     send = share my (system) audio, mic = share my microphone
 bool ConfigStore::Save(const SavedConfig& in, std::string* err) const
 {
     SavedConfig cfg = in;
@@ -77,7 +78,6 @@ bool ConfigStore::Save(const SavedConfig& in, std::string* err) const
         out << "label " << cfg.label << "\n";
         out << "rev " << cfg.rev << "\n";
         for (const auto& m : cfg.members) out << "member " << m << "\n";
-        out << "audio.source " << cfg.audio.source << "\n";
         out << "audio.mute " << (cfg.audio.mute ? 1 : 0) << "\n";
         out << "audio.volume " << cfg.audio.volume << "\n";
         out << "input.enabled " << (cfg.inputEnabled ? 1 : 0) << "\n";
@@ -86,7 +86,7 @@ bool ConfigStore::Save(const SavedConfig& in, std::string* err) const
                 << " " << p.name << "\n";
         for (const auto& p : cfg.peers)
             out << "peeraudio " << p.key << " " << (p.send ? 1 : 0) << " " << (p.mute ? 1 : 0)
-                << " " << std::clamp(p.volume, 0, 100) << "\n";
+                << " " << std::clamp(p.volume, 0, 100) << " " << (p.mic ? 1 : 0) << "\n";
         out.flush();
         if (!out) { if (err) *err = "write failed: " + tmp.string(); return false; }
     }
@@ -133,15 +133,24 @@ bool ConfigStore::Load(const std::vector<std::string>& wanted, SavedConfig& out)
         }
         else if (k == "peeraudio") {
             std::string key;
-            int snd = 0, mut = 0, vol = 100;
+            int snd = 0, mut = 0, vol = 100, mic = 0;
             if (is >> key >> snd >> mut >> vol && Identity::IsValidPublicHex(key)) {
                 SavedPeer& p = cfg.PeerRef(key);
                 p.hasAudio = true;
                 p.send = snd != 0;
                 p.mute = mut != 0;
                 p.volume = std::clamp(vol, 0, 100);
+                if (is >> mic) { p.mic = mic != 0; p.hasMic = true; }
             }
         }
+    }
+
+    // Old files had one "send" switch per device and one source for all of them:
+    // when that source was the microphone, the switch means "share my microphone" now.
+    for (auto& p : cfg.peers) {
+        if (!p.hasAudio || p.hasMic) continue;
+        if (cfg.audio.source == 0) { p.mic = p.send; p.send = false; }
+        p.hasMic = true;
     }
 
     // A file only counts when it really describes THIS set (guards against renamed/copied files).

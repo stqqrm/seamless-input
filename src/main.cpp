@@ -3,8 +3,14 @@
 #include <wx/dcgraph.h>
 #include <wx/graphics.h>
 #include <wx/scrolwin.h>
+#include <wx/simplebook.h>
 #include <wx/settings.h>
 #include <wx/statline.h>
+
+#ifdef __WXMSW__
+#include <dwmapi.h>
+#include <uxtheme.h>
+#endif
 #include <wx/display.h>
 #include <wx/listctrl.h>
 #include <wx/notebook.h>
@@ -706,6 +712,132 @@ private:
     bool muted_ = false, hover_ = false, down_ = false;
 };
 
+
+// Dark-mode helpers for native Windows controls (wxWidgets 3.2 draws them light otherwise).
+static void DarkenNative(wxWindow* w, const wchar_t* theme = L"DarkMode_Explorer")
+{
+#ifdef __WXMSW__
+    if (w && w->GetHWND()) SetWindowTheme((HWND)w->GetHWND(), theme, nullptr);
+#else
+    (void)w; (void)theme;
+#endif
+}
+
+static void DarkenTree(wxWindow* w)
+{
+#ifdef __WXMSW__
+    if (!w) return;
+    if (dynamic_cast<wxChoice*>(w))        DarkenNative(w, L"DarkMode_CFD");
+    else if (auto* lc = dynamic_cast<wxListCtrl*>(w)) {
+        DarkenNative(w, L"DarkMode_Explorer");
+        if (HWND hdr = ListView_GetHeader((HWND)lc->GetHWND())) SetWindowTheme(hdr, L"DarkMode_ItemsView", nullptr);
+    }
+    else if (dynamic_cast<wxButton*>(w) || dynamic_cast<wxTextCtrl*>(w) || dynamic_cast<wxScrolledWindow*>(w))
+        DarkenNative(w, L"DarkMode_Explorer");
+    for (wxWindow* c : w->GetChildren()) DarkenTree(c);
+#else
+    (void)w;
+#endif
+}
+
+static void DarkTitleBar(wxWindow* w)
+{
+#ifdef __WXMSW__
+    if (!w || !w->GetHWND()) return;
+    BOOL on = TRUE;
+    DwmSetWindowAttribute((HWND)w->GetHWND(), 20 /*DWMWA_USE_IMMERSIVE_DARK_MODE*/, &on, sizeof on);
+    DwmSetWindowAttribute((HWND)w->GetHWND(), 19 /*same, Windows 10 before 20H1*/, &on, sizeof on);
+#else
+    (void)w;
+#endif
+}
+
+// Flat tab strip (replaces wxNotebook, whose white frame cannot be themed).
+class TabBar : public wxControl {
+public:
+    std::function<void(int)> onSelect;
+
+    TabBar(wxWindow* parent, const Theme& t, std::vector<wxString> labels)
+        : wxControl(parent, wxID_ANY, wxDefaultPosition, wxSize(-1, 38), wxBORDER_NONE),
+          t_(t), labels_(std::move(labels))
+    {
+        SetBackgroundStyle(wxBG_STYLE_PAINT);
+        SetMinSize(wxSize(-1, 38));
+        Bind(wxEVT_PAINT, &TabBar::OnPaint, this);
+        Bind(wxEVT_MOTION, [this](wxMouseEvent& e) {
+            const int h = HitTest(e.GetPosition());
+            if (h != hover_) { hover_ = h; SetCursor(h >= 0 ? wxCursor(wxCURSOR_HAND) : wxNullCursor); Refresh(); }
+        });
+        Bind(wxEVT_LEAVE_WINDOW, [this](wxMouseEvent&) { hover_ = -1; Refresh(); });
+        Bind(wxEVT_LEFT_UP, [this](wxMouseEvent& e) {
+            const int h = HitTest(e.GetPosition());
+            if (h < 0 || h == sel_) return;
+            sel_ = h;
+            Refresh();
+            if (onSelect) onSelect(h);
+        });
+    }
+
+    void SetSelection(int i) { sel_ = i; Refresh(); }
+
+private:
+    static constexpr int kPad = 20;
+
+    int TabWidth(wxDC& dc, size_t i) const { return dc.GetTextExtent(labels_[i]).x + 2 * kPad; }
+
+    wxFont BoldFont() const
+    {
+        wxFont f = GetFont();
+        f.SetWeight(wxFONTWEIGHT_BOLD);
+        return f;
+    }
+
+    int HitTest(const wxPoint& p) const
+    {
+        wxClientDC dc(const_cast<TabBar*>(this));
+        dc.SetFont(BoldFont());
+        int x = 4;
+        for (size_t i = 0; i < labels_.size(); ++i) {
+            const int w = TabWidth(dc, i);
+            if (p.x >= x && p.x < x + w) return (int)i;
+            x += w;
+        }
+        return -1;
+    }
+
+    void OnPaint(wxPaintEvent&)
+    {
+        wxAutoBufferedPaintDC pdc(this);
+        pdc.SetBackground(wxBrush(t_.page));
+        pdc.Clear();
+        wxGCDC dc(pdc);
+        dc.SetFont(BoldFont());
+        const wxSize s = GetClientSize();
+
+        dc.SetPen(wxPen(t_.border, 1));
+        dc.DrawLine(0, s.y - 1, s.x, s.y - 1);
+
+        int x = 4;
+        for (size_t i = 0; i < labels_.size(); ++i) {
+            const int w = TabWidth(dc, i);
+            const bool sel = (int)i == sel_;
+            dc.SetTextForeground(sel ? t_.text : ((int)i == hover_ ? t_.text : t_.sub));
+            const wxSize ext = dc.GetTextExtent(labels_[i]);
+            dc.DrawText(labels_[i], x + kPad, (s.y - ext.y) / 2 - 1);
+            if (sel) {
+                dc.SetPen(*wxTRANSPARENT_PEN);
+                dc.SetBrush(wxBrush(t_.accent));
+                dc.DrawRoundedRectangle(x + 8, s.y - 3, w - 16, 3, 1.5);
+            }
+            x += w;
+        }
+    }
+
+    Theme t_;
+    std::vector<wxString> labels_;
+    int sel_ = 0, hover_ = -1;
+};
+
 // ============================================================================
 // Main window
 // ============================================================================
@@ -768,10 +900,14 @@ public:
         root->Add(canvas_, 2, wxEXPAND | wxALL, 10);
 
         // ---- lower part: tabs
-        notebook_ = new wxNotebook(this, wxID_ANY);
-        notebook_->AddPage(BuildDevicesPage(notebook_), "Devices", true);
-        notebook_->AddPage(BuildNetworkPage(notebook_), "Network");
-        root->Add(notebook_, 3, wxEXPAND | wxLEFT | wxRIGHT | wxBOTTOM, 10);
+        tabs_ = new TabBar(this, theme_, {"Devices", "Network"});
+        root->Add(tabs_, 0, wxEXPAND | wxLEFT | wxRIGHT, 10);
+        pages_ = new wxSimplebook(this, wxID_ANY);
+        pages_->SetBackgroundColour(theme_.page);
+        pages_->AddPage(BuildDevicesPage(pages_), "Devices", true);
+        pages_->AddPage(BuildNetworkPage(pages_), "Network");
+        tabs_->onSelect = [this](int i) { pages_->ChangeSelection((size_t)i); };
+        root->Add(pages_, 3, wxEXPAND | wxLEFT | wxRIGHT | wxBOTTOM, 10);
         SetSizer(root);
 
         // ---- events
@@ -780,7 +916,6 @@ public:
         target_->Bind(wxEVT_TEXT_ENTER, [this](wxCommandEvent&) { Activate(target_->GetValue().ToStdString()); });
         scanBtn_->Bind(wxEVT_BUTTON, [this](wxCommandEvent&) { StartScan(); });
 
-        srcChoice_->Bind(wxEVT_CHOICE, [this](wxCommandEvent&) { if (sendingNow_) RefreshCapture(); MarkCfgDirty(); });
         masterMute_->onToggle = [this](bool m) { audio_->SetMuted(m); MarkCfgDirty(); };
         volSlider_->Bind(wxEVT_SLIDER, [this](wxCommandEvent&) {
             audio_->SetVolume(volSlider_->GetValue() / 100.0f);
@@ -869,6 +1004,7 @@ public:
         net_->Start();
         StartScan();
         Centre();
+        if (theme_.dark) { DarkTitleBar(this); DarkenTree(this); }
     }
 
 private:
@@ -895,7 +1031,8 @@ private:
         std::vector<wxRect> mons;
         bool incoming = false;
         bool placed = false;
-        bool share = false;         // send my audio to this device
+        bool share = false;         // send my audio (system audio) to this device
+        bool mic = false;           // send my microphone to this device
         bool mute = false;          // mute what it sends me
         int  vol = 100;             // 0..100, what I hear from it
     };
@@ -904,6 +1041,7 @@ private:
     wxWindow* BuildNetworkPage(wxWindow* parent)
     {
         auto* p = new wxPanel(parent);
+        p->SetBackgroundColour(theme_.page);
         auto* bottom = new wxBoxSizer(wxHORIZONTAL);
 
         auto* left = new wxBoxSizer(wxVERTICAL);
@@ -931,8 +1069,14 @@ private:
                               wxTE_MULTILINE | wxTE_READONLY);
         log_->SetFont(wxFont(wxFontInfo(wxSystemSettings::GetFont(wxSYS_DEFAULT_GUI_FONT).GetPointSize()).Family(wxFONTFAMILY_TELETYPE)));
 
-        bottom->Add(left, 1, wxEXPAND | wxALL, 6);
-        bottom->Add(log_, 1, wxEXPAND | wxTOP | wxRIGHT | wxBOTTOM, 6);
+        searchLbl_->SetForegroundColour(theme_.sub);
+        for (wxWindow* w : std::initializer_list<wxWindow*>{list_, target_, log_}) {
+            w->SetBackgroundColour(theme_.card);
+            w->SetForegroundColour(theme_.text);
+        }
+
+        bottom->Add(left, 1, wxEXPAND | wxALL, 10);
+        bottom->Add(log_, 1, wxEXPAND | wxTOP | wxRIGHT | wxBOTTOM, 10);
         p->SetSizer(bottom);
         return p;
     }
@@ -950,45 +1094,26 @@ private:
         p->SetBackgroundColour(theme_.page);
         auto* v = new wxBoxSizer(wxVERTICAL);
 
-        // ---- toolbar: audio source, master output, keyboard/mouse master switch
+        // ---- toolbar: master output + a reminder of the hotkey
         auto* bar = new CardPanel(p, theme_, false);
         auto* bv = new wxBoxSizer(wxVERTICAL);
-
-        auto* r1 = new wxBoxSizer(wxHORIZONTAL);
-        srcChoice_ = new wxChoice(bar, wxID_ANY);
-        srcChoice_->Append("Microphone");
-        if (AudioEngine::SystemAudioSupported()) srcChoice_->Append("System audio (may echo)");
-        srcChoice_->SetSelection(0);
-        srcChoice_->SetToolTip("What is sent to the devices that have \"Share my audio\" ticked");
-        inGauge_ = new LevelBar(bar, theme_, wxSize(120, 8));
 
         masterMute_ = new SpeakerButton(bar, theme_, 32);
         volSlider_ = new wxSlider(bar, wxID_ANY, 100, 0, 100, wxDefaultPosition, wxSize(150, -1));
         masterPct_ = MakeLabel(bar, "100%", true);
         masterPct_->SetMinSize(wxSize(44, -1));
 
-        r1->Add(MakeLabel(bar, "Audio source", true), 0, wxALIGN_CENTER_VERTICAL | wxRIGHT, 8);
-        r1->Add(srcChoice_, 0, wxALIGN_CENTER_VERTICAL | wxRIGHT, 12);
-        r1->Add(MakeLabel(bar, "Sending", true), 0, wxALIGN_CENTER_VERTICAL | wxRIGHT, 6);
-        r1->Add(inGauge_, 0, wxALIGN_CENTER_VERTICAL);
+        auto* r1 = new wxBoxSizer(wxHORIZONTAL);
+        r1->Add(MakeLabel(bar, "Scroll Lock returns control to this PC", true), 0, wxALIGN_CENTER_VERTICAL);
         r1->AddStretchSpacer();
         r1->Add(MakeLabel(bar, "Master output", true), 0, wxALIGN_CENTER_VERTICAL | wxRIGHT, 8);
         r1->Add(masterMute_, 0, wxALIGN_CENTER_VERTICAL | wxRIGHT, 4);
         r1->Add(volSlider_, 0, wxALIGN_CENTER_VERTICAL | wxRIGHT, 4);
         r1->Add(masterPct_, 0, wxALIGN_CENTER_VERTICAL);
-        bv->Add(r1, 0, wxEXPAND | wxLEFT | wxRIGHT | wxTOP, 14);
-
-        auto* r2 = new wxBoxSizer(wxHORIZONTAL);
-        inputChk_ = new wxCheckBox(bar, wxID_ANY, "Share keyboard && mouse");
-        inputChk_->SetValue(true);
-        inputChk_->SetToolTip("Master switch for moving the cursor onto other PCs");
-        r2->Add(inputChk_, 0, wxALIGN_CENTER_VERTICAL | wxRIGHT, 14);
-        r2->Add(MakeLabel(bar, "Scroll Lock returns control to this PC", true), 0, wxALIGN_CENTER_VERTICAL);
-        bv->Add(r2, 0, wxEXPAND | wxALL, 14);
+        bv->Add(r1, 0, wxEXPAND | wxALL, 14);
         bar->SetSizer(bv);
         ApplyBackground(bar, theme_.card);
         masterPct_->SetForegroundColour(theme_.sub);
-        inputChk_->Bind(wxEVT_CHECKBOX, [this](wxCommandEvent&) { input_->SetEnabled(inputChk_->GetValue()); MarkCfgDirty(); });
 
         v->Add(bar, 0, wxEXPAND | wxALL, 10);
 
@@ -1009,11 +1134,11 @@ private:
         return p;
     }
 
-    // ---- one device card: info | share audio + allow control | mute, volume, level
+    // ---- one device card: info | share audio / microphone + allow control | mute, volume, level
     struct DevRow {
         CardPanel* card = nullptr;
         wxStaticText *name = nullptr, *sub = nullptr, *detail = nullptr, *pct = nullptr, *audioState = nullptr;
-        wxCheckBox *share = nullptr, *allow = nullptr;
+        wxCheckBox *share = nullptr, *mic = nullptr, *allow = nullptr;
         SpeakerButton* mute = nullptr;
         wxSlider* vol = nullptr;
         LevelBar* level = nullptr;
@@ -1040,11 +1165,18 @@ private:
 
         // switches
         r.share = new wxCheckBox(c, wxID_ANY, "Share my audio");
-        r.share->SetToolTip("Send this PC's audio (source chosen in the toolbar) to this device only");
+        r.share->SetToolTip("Send what this PC plays (system audio) to this device only.\nIt may echo if this device sends its audio back.");
+        if (!AudioEngine::SystemAudioSupported()) {
+            r.share->Disable();
+            r.share->SetToolTip("Sharing system audio is not supported on this platform");
+        }
+        r.mic = new wxCheckBox(c, wxID_ANY, "Share my microphone");
+        r.mic->SetToolTip("Send this PC's microphone to this device only");
         r.allow = new wxCheckBox(c, wxID_ANY, "Allow remote control");
         r.allow->SetToolTip("Let this device use this PC's keyboard and mouse");
         auto* checks = new wxBoxSizer(wxVERTICAL);
         checks->Add(r.share, 0, wxBOTTOM, 8);
+        checks->Add(r.mic, 0, wxBOTTOM, 8);
         checks->Add(r.allow, 0);
 
         // audio from this device
@@ -1082,8 +1214,18 @@ private:
             auto it = peers_.find(id);
             if (it == peers_.end()) return;
             it->second.share = e.IsChecked();
-            audio_->SetPeerSend(it->second.inst, it->second.share);
+            audio_->SetPeerSend(it->second.inst, AudioSource::System, it->second.share);
             Log((it->second.share ? "Sharing audio with " : "Stopped sharing audio with ") + it->second.name);
+            RefreshCapture();
+            RecordPeerAudio(it->second);
+            RefreshDeviceRows();
+        });
+        r.mic->Bind(wxEVT_CHECKBOX, [this, id](wxCommandEvent& e) {
+            auto it = peers_.find(id);
+            if (it == peers_.end()) return;
+            it->second.mic = e.IsChecked();
+            audio_->SetPeerSend(it->second.inst, AudioSource::Microphone, it->second.mic);
+            Log((it->second.mic ? "Sharing microphone with " : "Stopped sharing microphone with ") + it->second.name);
             RefreshCapture();
             RecordPeerAudio(it->second);
             RefreshDeviceRows();
@@ -1148,6 +1290,7 @@ private:
         r.card->SetAccent(accent);
 
         r.share->SetValue(p.share);
+        r.mic->SetValue(p.mic);
         r.allow->SetValue(ts == TrustStore::State::Allowed);
         r.mute->SetMuted(p.mute);
         r.vol->SetValue(p.vol);
@@ -1213,10 +1356,9 @@ private:
     // shortly afterwards; when the set changes the matching config is loaded.
     void UpdateCfgFromUi()
     {
-        cfg_.audio.source = srcChoice_->GetSelection() == 1 ? 1 : 0;
         cfg_.audio.mute   = masterMute_->IsMuted();
         cfg_.audio.volume = volSlider_->GetValue();
-        cfg_.inputEnabled = inputChk_->GetValue();
+        cfg_.inputEnabled = true;     // legacy field: permissions live in trust.txt, per device
         for (const auto& kv : peers_) RecordPeerAudio(kv.second, true);
     }
 
@@ -1240,6 +1382,8 @@ private:
         SavedPeer& sp = cfg_.PeerRef(p.key);
         sp.hasAudio = true;
         sp.send = p.share;
+        sp.mic = p.mic;
+        sp.hasMic = true;
         sp.mute = p.mute;
         sp.volume = p.vol;
         if (!force) TouchCfg();
@@ -1292,7 +1436,8 @@ private:
 
     void PushPeerAudio(const PeerInfo& p)
     {
-        audio_->SetPeerSend(p.inst, p.share);
+        audio_->SetPeerSend(p.inst, AudioSource::System, p.share);
+        audio_->SetPeerSend(p.inst, AudioSource::Microphone, p.mic);
         audio_->SetPeerMuted(p.inst, p.mute);
         audio_->SetPeerVolume(p.inst, p.vol / 100.0f);
     }
@@ -1308,23 +1453,21 @@ private:
         masterPct_->SetLabelText(wxString::Format("%d%%", a.volume));
         audio_->SetVolume(a.volume / 100.0f);
 
-        const int src = (a.source == 1 && srcChoice_->GetCount() > 1) ? 1 : 0;
-        srcChoice_->SetSelection(src);
-
         for (auto& kv : peers_) {
             PeerInfo& p = kv.second;
             const SavedPeer* sp = cfg_.FindPeer(p.key);
-            if (sp && sp->hasAudio) { p.share = sp->send; p.mute = sp->mute; p.vol = sp->volume; }
-            else                    { p.share = a.send;   p.mute = false;    p.vol = 100; }   // old file: one switch for all
+            if (sp && sp->hasAudio) { p.share = sp->send; p.mic = sp->mic; p.mute = sp->mute; p.vol = sp->volume; }
+            else {                                                      // old file: one switch and one source for all
+                p.share = a.send && a.source == 1;
+                p.mic   = a.send && a.source != 1;
+                p.mute = false; p.vol = 100;
+            }
             PushPeerAudio(p);
         }
         RefreshCapture();
-        if (sendingNow_) Log("Audio sharing switched on by the saved config");
+        if (sysCapturing_ || micCapturing_) Log("Audio sharing switched on by the saved config");
         RefreshDeviceRows();
 
-        const bool inputWas = inputChk_->GetValue();
-        inputChk_->SetValue(cfg_.inputEnabled);
-        if (inputWas != cfg_.inputEnabled) input_->SetEnabled(cfg_.inputEnabled);
     }
 
     // Called whenever a PC joins or leaves: save the old config, load (or start) the one
@@ -1375,29 +1518,35 @@ private:
         return s;
     }
 
-    // Capture runs while at least one device has "Share my audio" ticked.
+    // Each source is captured (on its default device) while at least one device has the
+    // matching box ticked: "Share my audio" = system audio, "Share my microphone" = mic.
     void RefreshCapture()
     {
-        bool any = false;
-        for (const auto& kv : peers_) any = any || kv.second.share;
-        const AudioSource src = srcChoice_->GetSelection() == 1 ? AudioSource::System : AudioSource::Microphone;
-        const int srcIdx = src == AudioSource::System ? 1 : 0;
-        if (any == sendingNow_ && (!any || srcIdx == sendingSrc_)) return;   // nothing to (re)start
+        bool anySys = false, anyMic = false;
+        for (const auto& kv : peers_) { anySys = anySys || kv.second.share; anyMic = anyMic || kv.second.mic; }
 
+        UpdateCapture(AudioSource::System,     anySys, sysCapturing_, "system audio");
+        UpdateCapture(AudioSource::Microphone, anyMic, micCapturing_, "microphone");
+    }
+
+    void UpdateCapture(AudioSource src, bool want, bool& capturing, const char* what)
+    {
+        if (want == capturing) return;
         std::string err;
-        if (!audio_->SetSending(any, src, &err)) {
-            Log("Audio capture failed: " + wxString::FromUTF8(err));
-            for (auto& kv : peers_) { kv.second.share = false; audio_->SetPeerSend(kv.second.inst, false); }
-            sendingNow_ = false;
-            inGauge_->SetLevel(0);
+        if (!audio_->SetCapture(src, want, &err)) {
+            Log(wxString("Capturing ") + what + " failed: " + wxString::FromUTF8(err));
+            for (auto& kv : peers_) {
+                bool& flag = src == AudioSource::System ? kv.second.share : kv.second.mic;
+                flag = false;
+                audio_->SetPeerSend(kv.second.inst, src, false);
+                RecordPeerAudio(kv.second);
+            }
+            capturing = false;
             RefreshDeviceRows();
             return;
         }
-        sendingNow_ = any;
-        sendingSrc_ = srcIdx;
-        if (!any)                              Log("Stopped capturing audio");
-        else if (src == AudioSource::System)   Log("Capturing system audio");
-        else                                   Log("Capturing microphone");
+        capturing = want;
+        Log(wxString(want ? "Capturing " : "Stopped capturing ") + what);
     }
 
     // ------------------------------------------------------------------- scan
@@ -1661,8 +1810,6 @@ private:
 
     void UpdateAudioStats()
     {
-        inGauge_->SetLevel(sendingNow_ ? std::min(1.0f, std::sqrt(audio_->InputLevel())) : 0.0f);
-
         const auto stats = audio_->Stats();
         for (auto& kv : devRows_) {
             auto pit = peers_.find(kv.first);
@@ -1677,7 +1824,10 @@ private:
 
             r.level->SetLevel(recv ? std::sqrt(level) : 0.0f);
             wxString txt = recv ? wxString::Format("Receiving %.0f kbps", kbps) : wxString("No incoming audio");
-            if (pit->second.share && sendingNow_) txt += wxString::FromUTF8("  \xC2\xB7  Sending my audio");
+            const bool sendSys = pit->second.share && sysCapturing_;
+            const bool sendMic = pit->second.mic && micCapturing_;
+            if (sendSys || sendMic)
+                txt += wxString::FromUTF8("  \xC2\xB7  Sending my ") + (sendSys && sendMic ? "audio + microphone" : sendSys ? "audio" : "microphone");
             SetText(r.audioState, txt);
         }
     }
@@ -1713,7 +1863,8 @@ private:
     int animStep_ = 0;
 
     Canvas* canvas_ = nullptr;
-    wxNotebook* notebook_ = nullptr;
+    TabBar* tabs_ = nullptr;
+    wxSimplebook* pages_ = nullptr;
     wxListCtrl* list_ = nullptr;
     wxScrolledWindow* devScroll_ = nullptr;
     wxBoxSizer* devSizer_ = nullptr;
@@ -1727,10 +1878,7 @@ private:
     wxStaticText* searchLbl_ = nullptr;
     SpeakerButton* masterMute_ = nullptr;
     wxStaticText* masterPct_ = nullptr;
-    wxChoice* srcChoice_ = nullptr;
-    LevelBar* inGauge_ = nullptr;
     wxSlider* volSlider_ = nullptr;
-    wxCheckBox* inputChk_ = nullptr;
     wxTimer timer_;
     wxTimer animTimer_;
     wxTimer statTimer_;
@@ -1747,8 +1895,8 @@ private:
     bool cfgDirty_ = false;
     bool loading_ = false;
     std::chrono::steady_clock::time_point dirtyAt_;
-    bool sendingNow_ = false;
-    int sendingSrc_ = 0;
+    bool sysCapturing_ = false;   // system audio capture running
+    bool micCapturing_ = false;   // microphone capture running
     InputEngine::Mode inputMode_ = InputEngine::Mode::Local;
     int inputPeer_ = -1;
 };

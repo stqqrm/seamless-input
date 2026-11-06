@@ -12,6 +12,7 @@
 #include <bitset>
 #include <cmath>
 #include <cstdlib>
+#include <cstring>
 #include <condition_variable>
 #include <mutex>
 #include <thread>
@@ -58,10 +59,13 @@ class WindowsBackend : public InputBackend {
 public:
     const char* Name() const override { return "Windows (SetWindowsHookEx / SendInput)"; }
 
+    ~WindowsBackend() override { ShowCursorAgain(); }
+
     bool Start(BackendSink sink, std::string* err) override
     {
         sink_ = std::move(sink);
         self_ = this;
+        RestoreSystemCursors();             // a previous run that crashed may have left them invisible
         std::unique_lock<std::mutex> lk(initMu_);
         th_ = std::thread([this] { Run(); });
         initCv_.wait(lk, [this] { return initDone_; });
@@ -80,6 +84,7 @@ public:
             th_.join();
         }
         if (self_ == this) self_ = nullptr;
+        ShowCursorAgain();
     }
 
     bool BeginForwarding(int parkX, int parkY, std::string*) override
@@ -90,6 +95,7 @@ public:
             if (GetAsyncKeyState(vk) & 0x8000) held_.set((size_t)vk);
         anchorX_ = parkX;
         anchorY_ = parkY;
+        HideCursor();
         SetCursorPos(parkX, parkY);
         fwd_ = true;
         PostThreadMessageW(tid_, kMsgKbdOn, 0, 0);
@@ -101,6 +107,7 @@ public:
         fwd_ = false;
         PostThreadMessageW(tid_, kMsgKbdOff, 0, 0);
         SetCursorPos(x, y);
+        ShowCursorAgain();
     }
 
     // ------------------------------------------------------------ injection
@@ -188,6 +195,37 @@ public:
     }
 
 private:
+    // ------------------------------------------------------------ cursor visibility
+    // ShowCursor() only affects the calling thread's windows. The reliable way to hide the
+    // pointer everywhere is to replace every system cursor with a fully transparent one and
+    // to reload the user's cursor scheme afterwards.
+    static void RestoreSystemCursors() { SystemParametersInfoW(SPI_SETCURSORS, 0, nullptr, 0); }
+
+    void HideCursor()
+    {
+        if (hidden_.exchange(true)) return;
+        static const DWORD ids[] = {
+            32512 /*arrow*/, 32513 /*I-beam*/, 32514 /*wait*/, 32515 /*cross*/, 32516 /*up arrow*/,
+            32642 /*size NW-SE*/, 32643 /*size NE-SW*/, 32644 /*size W-E*/, 32645 /*size N-S*/,
+            32646 /*size all*/, 32648 /*no*/, 32649 /*hand*/, 32650 /*app starting*/, 32651 /*help*/,
+        };
+        BYTE andMask[32 * 4];
+        BYTE xorMask[32 * 4];
+        std::memset(andMask, 0xFF, sizeof andMask);     // AND 1 + XOR 0 = transparent
+        std::memset(xorMask, 0x00, sizeof xorMask);
+        for (DWORD id : ids) {
+            // SetSystemCursor takes ownership of (and destroys) the handle: one per id
+            HCURSOR c = CreateCursor(GetModuleHandleW(nullptr), 0, 0, 32, 32, andMask, xorMask);
+            if (c) SetSystemCursor(c, id);
+        }
+    }
+
+    void ShowCursorAgain()
+    {
+        if (!hidden_.exchange(false)) return;
+        RestoreSystemCursors();
+    }
+
     // ------------------------------------------------------------ hook thread
     void Run()
     {
@@ -327,6 +365,7 @@ private:
     DWORD initErr_ = 0;
 
     std::atomic<bool> fwd_{false};
+    std::atomic<bool> hidden_{false};
     std::atomic<int> mask_{0};
     int lastPtX_ = 0, lastPtY_ = 0;      // hook thread only
     int anchorX_ = 0, anchorY_ = 0;

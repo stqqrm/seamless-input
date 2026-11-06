@@ -204,7 +204,7 @@ if(WIN32)
         WIN32_EXECUTABLE TRUE
     )
     target_compile_definitions(${PROJECT_NAME} PRIVATE _WIN32_WINNT=0x0A00)
-    target_link_libraries(${PROJECT_NAME} PRIVATE ws2_32 mswsock iphlpapi)
+    target_link_libraries(${PROJECT_NAME} PRIVATE ws2_32 mswsock iphlpapi dwmapi uxtheme)
 endif()
 
 # DPI awareness: without it Windows reports scaled (virtualized) monitor sizes

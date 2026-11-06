@@ -497,10 +497,7 @@ void InputEngine::SetEnabled(bool on)
 {
     std::lock_guard<std::mutex> lk(d_->mu);
     d_->enabled = on;
-    if (!on && d_->be) {
-        d_->StopForwardingLocked(true, -1, -1);
-        d_->StopControlledLocked(true);
-    }
+    if (!on && d_->be) d_->StopForwardingLocked(true, -1, -1);   // being controlled is unaffected
 }
 
 void InputEngine::SetPeer(int id, const std::vector<InputRect>& mons, double ox, double oy)
@@ -566,10 +563,11 @@ bool InputEngine::HandleMessage(int id, const std::string& line)
             std::lock_guard<std::mutex> lk(d_->mu);
             auto it = d_->peers.find(id);
             const bool known = it != d_->peers.end() && it->second.placed;
-            const bool ok = d_->started && d_->enabled && known && it->second.allowed &&
-                            d_->mode == Mode::Local;
+            // 'enabled' (the master switch) only governs OUR cursor leaving this PC; who may
+            // control this PC is decided per device by 'allowed'.
+            const bool ok = d_->started && known && it->second.allowed && d_->mode == Mode::Local;
             if (!ok) {
-                if (d_->started && d_->enabled && known && !it->second.allowed && !it->second.requested) {
+                if (d_->started && known && !it->second.allowed && !it->second.requested) {
                     it->second.requested = true;
                     ask = true;
                 }
