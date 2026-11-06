@@ -76,6 +76,7 @@ public:
 
     const std::string& RemoteAddr() const { return addr_; }
     bool Authed() const { return authed_ && !closed_; }
+    bool Closed() const { return closed_; }
     const std::string& PeerKey() const { return peerKey_; }
     std::uint32_t PeerInstance() const { return peerInst_; }
     bool Incoming() const { return incoming_; }
@@ -218,8 +219,12 @@ private:
             }
         } else if (ready_) {
             Close();                                // trust withdrawn / group changed
-        } else {
+        } else if (ev_.trusted(peerKey_)) {
             ev_.pending(id_, peerInst_, peerKey_, peerName_, addr_, incoming_, theyTrust_);
+        } else {
+            // Different password: close it. A parked half-open link would count as "already
+            // connected" and block the real connection once both PCs use the same password.
+            Close();
         }
     }
 
@@ -385,7 +390,7 @@ struct Network::Impl {
     {
         if (connectingIp.count(ip)) { if (manual) Status("Already connecting to " + ip); return; }
         for (auto& kv : sessions)
-            if (kv.second->RemoteAddr() == ip) { if (manual) Status("Already connected to " + ip); return; }
+            if (!kv.second->Closed() && kv.second->RemoteAddr() == ip) { if (manual) Status("Already connected to " + ip); return; }
         if (inst && (HasSessionFor(inst) || connectingInst.count(inst))) return;
 
         error_code ec;
@@ -544,7 +549,7 @@ struct Network::Impl {
 
         auto now = std::chrono::steady_clock::now();
         auto it = lastTry.find(b.instance);
-        if (it != lastTry.end() && now - it->second < std::chrono::seconds(10)) return;
+        if (it != lastTry.end() && now - it->second < std::chrono::seconds(3)) return;
         lastTry[b.instance] = now;
 
         Status("Found seamless-input peer at " + b.ip + (b.sameGroup ? " (same group)" : " (trusted)") +
@@ -555,7 +560,9 @@ struct Network::Impl {
     void ApplyGroup(const std::string& secret)
     {
         groupSecret = secret;
+        Status("Password changed - reconnecting");
         lastTry.clear();
+        connectingInst.clear();
         knownInst.clear();                // answer every peer's next beacon again
         auto copy = sessions;             // links made under the old group are re-judged by reconnecting
         for (auto& kv : copy) kv.second->Close();
