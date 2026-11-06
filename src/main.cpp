@@ -916,7 +916,6 @@ public:
         target_->Bind(wxEVT_TEXT_ENTER, [this](wxCommandEvent&) { Activate(target_->GetValue().ToStdString()); });
         scanBtn_->Bind(wxEVT_BUTTON, [this](wxCommandEvent&) { StartScan(); });
 
-        srcChoice_->Bind(wxEVT_CHOICE, [this](wxCommandEvent&) { if (sendingNow_) RefreshCapture(); MarkCfgDirty(); });
         masterMute_->onToggle = [this](bool m) { audio_->SetMuted(m); MarkCfgDirty(); };
         volSlider_->Bind(wxEVT_SLIDER, [this](wxCommandEvent&) {
             audio_->SetVolume(volSlider_->GetValue() / 100.0f);
@@ -1032,7 +1031,8 @@ private:
         std::vector<wxRect> mons;
         bool incoming = false;
         bool placed = false;
-        bool share = false;         // send my audio to this device
+        bool share = false;         // send my audio (system audio) to this device
+        bool mic = false;           // send my microphone to this device
         bool mute = false;          // mute what it sends me
         int  vol = 100;             // 0..100, what I hear from it
     };
@@ -1094,53 +1094,26 @@ private:
         p->SetBackgroundColour(theme_.page);
         auto* v = new wxBoxSizer(wxVERTICAL);
 
-        // ---- toolbar: audio source, master output, keyboard/mouse master switch
+        // ---- toolbar: master output + a reminder of the hotkey
         auto* bar = new CardPanel(p, theme_, false);
         auto* bv = new wxBoxSizer(wxVERTICAL);
-
-        auto* r1 = new wxBoxSizer(wxHORIZONTAL);
-        srcChoice_ = new wxChoice(bar, wxID_ANY);
-        srcChoice_->Append("Microphone");
-        if (AudioEngine::SystemAudioSupported()) srcChoice_->Append("System audio (may echo)");
-        srcChoice_->SetSelection(0);
-        srcChoice_->SetToolTip("What is sent to the devices that have \"Share my audio\" ticked");
-        inGauge_ = new LevelBar(bar, theme_, wxSize(120, 8));
 
         masterMute_ = new SpeakerButton(bar, theme_, 32);
         volSlider_ = new wxSlider(bar, wxID_ANY, 100, 0, 100, wxDefaultPosition, wxSize(150, -1));
         masterPct_ = MakeLabel(bar, "100%", true);
         masterPct_->SetMinSize(wxSize(44, -1));
 
-        r1->Add(MakeLabel(bar, "Audio source", true), 0, wxALIGN_CENTER_VERTICAL | wxRIGHT, 8);
-        r1->Add(srcChoice_, 0, wxALIGN_CENTER_VERTICAL | wxRIGHT, 12);
-        r1->Add(MakeLabel(bar, "Sending", true), 0, wxALIGN_CENTER_VERTICAL | wxRIGHT, 6);
-        r1->Add(inGauge_, 0, wxALIGN_CENTER_VERTICAL);
+        auto* r1 = new wxBoxSizer(wxHORIZONTAL);
+        r1->Add(MakeLabel(bar, "Scroll Lock returns control to this PC", true), 0, wxALIGN_CENTER_VERTICAL);
         r1->AddStretchSpacer();
         r1->Add(MakeLabel(bar, "Master output", true), 0, wxALIGN_CENTER_VERTICAL | wxRIGHT, 8);
         r1->Add(masterMute_, 0, wxALIGN_CENTER_VERTICAL | wxRIGHT, 4);
         r1->Add(volSlider_, 0, wxALIGN_CENTER_VERTICAL | wxRIGHT, 4);
         r1->Add(masterPct_, 0, wxALIGN_CENTER_VERTICAL);
-        bv->Add(r1, 0, wxEXPAND | wxLEFT | wxRIGHT | wxTOP, 14);
-
-        auto* r2 = new wxBoxSizer(wxHORIZONTAL);
-        inputChk_ = new wxCheckBox(bar, wxID_ANY, "Allow remote control for all devices");
-        inputChk_->SetValue(false);
-        inputChk_->SetToolTip("Shortcut: ticks or unticks \"Allow remote control\" on every connected device.\nEach device can still be changed on its own, and that is what counts.");
-        r2->Add(inputChk_, 0, wxALIGN_CENTER_VERTICAL | wxRIGHT, 14);
-        r2->Add(MakeLabel(bar, "Scroll Lock returns control to this PC", true), 0, wxALIGN_CENTER_VERTICAL);
-        bv->Add(r2, 0, wxEXPAND | wxALL, 14);
+        bv->Add(r1, 0, wxEXPAND | wxALL, 14);
         bar->SetSizer(bv);
         ApplyBackground(bar, theme_.card);
         masterPct_->SetForegroundColour(theme_.sub);
-        inputChk_->Bind(wxEVT_CHECKBOX, [this](wxCommandEvent&) {
-            const bool on = inputChk_->GetValue();
-            for (auto& kv : peers_) {
-                SetTrust(kv.second, on ? TrustStore::State::Allowed : TrustStore::State::Denied);
-                input_->SetPeerAllowed(kv.first, on);
-            }
-            Log(on ? "Allowed remote control for all devices" : "Blocked remote control for all devices");
-            RefreshDeviceRows();
-        });
 
         v->Add(bar, 0, wxEXPAND | wxALL, 10);
 
@@ -1161,11 +1134,11 @@ private:
         return p;
     }
 
-    // ---- one device card: info | share audio + allow control | mute, volume, level
+    // ---- one device card: info | share audio / microphone + allow control | mute, volume, level
     struct DevRow {
         CardPanel* card = nullptr;
         wxStaticText *name = nullptr, *sub = nullptr, *detail = nullptr, *pct = nullptr, *audioState = nullptr;
-        wxCheckBox *share = nullptr, *allow = nullptr;
+        wxCheckBox *share = nullptr, *mic = nullptr, *allow = nullptr;
         SpeakerButton* mute = nullptr;
         wxSlider* vol = nullptr;
         LevelBar* level = nullptr;
@@ -1192,11 +1165,18 @@ private:
 
         // switches
         r.share = new wxCheckBox(c, wxID_ANY, "Share my audio");
-        r.share->SetToolTip("Send this PC's audio (source chosen in the toolbar) to this device only");
+        r.share->SetToolTip("Send what this PC plays (system audio) to this device only.\nIt may echo if this device sends its audio back.");
+        if (!AudioEngine::SystemAudioSupported()) {
+            r.share->Disable();
+            r.share->SetToolTip("Sharing system audio is not supported on this platform");
+        }
+        r.mic = new wxCheckBox(c, wxID_ANY, "Share my microphone");
+        r.mic->SetToolTip("Send this PC's microphone to this device only");
         r.allow = new wxCheckBox(c, wxID_ANY, "Allow remote control");
         r.allow->SetToolTip("Let this device use this PC's keyboard and mouse");
         auto* checks = new wxBoxSizer(wxVERTICAL);
         checks->Add(r.share, 0, wxBOTTOM, 8);
+        checks->Add(r.mic, 0, wxBOTTOM, 8);
         checks->Add(r.allow, 0);
 
         // audio from this device
@@ -1234,8 +1214,18 @@ private:
             auto it = peers_.find(id);
             if (it == peers_.end()) return;
             it->second.share = e.IsChecked();
-            audio_->SetPeerSend(it->second.inst, it->second.share);
+            audio_->SetPeerSend(it->second.inst, AudioSource::System, it->second.share);
             Log((it->second.share ? "Sharing audio with " : "Stopped sharing audio with ") + it->second.name);
+            RefreshCapture();
+            RecordPeerAudio(it->second);
+            RefreshDeviceRows();
+        });
+        r.mic->Bind(wxEVT_CHECKBOX, [this, id](wxCommandEvent& e) {
+            auto it = peers_.find(id);
+            if (it == peers_.end()) return;
+            it->second.mic = e.IsChecked();
+            audio_->SetPeerSend(it->second.inst, AudioSource::Microphone, it->second.mic);
+            Log((it->second.mic ? "Sharing microphone with " : "Stopped sharing microphone with ") + it->second.name);
             RefreshCapture();
             RecordPeerAudio(it->second);
             RefreshDeviceRows();
@@ -1300,6 +1290,7 @@ private:
         r.card->SetAccent(accent);
 
         r.share->SetValue(p.share);
+        r.mic->SetValue(p.mic);
         r.allow->SetValue(ts == TrustStore::State::Allowed);
         r.mute->SetMuted(p.mute);
         r.vol->SetValue(p.vol);
@@ -1309,9 +1300,6 @@ private:
     void RefreshDeviceRows()
     {
         for (auto& kv : devRows_) RefreshDeviceRow(kv.second);
-        bool all = !peers_.empty();
-        for (const auto& kv : peers_) all = all && trust_->Get(kv.second.key) == TrustStore::State::Allowed;
-        inputChk_->SetValue(all);
     }
 
     // ---------------------------------------------------------------- actions
@@ -1368,7 +1356,6 @@ private:
     // shortly afterwards; when the set changes the matching config is loaded.
     void UpdateCfgFromUi()
     {
-        cfg_.audio.source = srcChoice_->GetSelection() == 1 ? 1 : 0;
         cfg_.audio.mute   = masterMute_->IsMuted();
         cfg_.audio.volume = volSlider_->GetValue();
         cfg_.inputEnabled = true;     // legacy field: permissions live in trust.txt, per device
@@ -1395,6 +1382,8 @@ private:
         SavedPeer& sp = cfg_.PeerRef(p.key);
         sp.hasAudio = true;
         sp.send = p.share;
+        sp.mic = p.mic;
+        sp.hasMic = true;
         sp.mute = p.mute;
         sp.volume = p.vol;
         if (!force) TouchCfg();
@@ -1447,7 +1436,8 @@ private:
 
     void PushPeerAudio(const PeerInfo& p)
     {
-        audio_->SetPeerSend(p.inst, p.share);
+        audio_->SetPeerSend(p.inst, AudioSource::System, p.share);
+        audio_->SetPeerSend(p.inst, AudioSource::Microphone, p.mic);
         audio_->SetPeerMuted(p.inst, p.mute);
         audio_->SetPeerVolume(p.inst, p.vol / 100.0f);
     }
@@ -1463,18 +1453,19 @@ private:
         masterPct_->SetLabelText(wxString::Format("%d%%", a.volume));
         audio_->SetVolume(a.volume / 100.0f);
 
-        const int src = (a.source == 1 && srcChoice_->GetCount() > 1) ? 1 : 0;
-        srcChoice_->SetSelection(src);
-
         for (auto& kv : peers_) {
             PeerInfo& p = kv.second;
             const SavedPeer* sp = cfg_.FindPeer(p.key);
-            if (sp && sp->hasAudio) { p.share = sp->send; p.mute = sp->mute; p.vol = sp->volume; }
-            else                    { p.share = a.send;   p.mute = false;    p.vol = 100; }   // old file: one switch for all
+            if (sp && sp->hasAudio) { p.share = sp->send; p.mic = sp->mic; p.mute = sp->mute; p.vol = sp->volume; }
+            else {                                                      // old file: one switch and one source for all
+                p.share = a.send && a.source == 1;
+                p.mic   = a.send && a.source != 1;
+                p.mute = false; p.vol = 100;
+            }
             PushPeerAudio(p);
         }
         RefreshCapture();
-        if (sendingNow_) Log("Audio sharing switched on by the saved config");
+        if (sysCapturing_ || micCapturing_) Log("Audio sharing switched on by the saved config");
         RefreshDeviceRows();
 
     }
@@ -1527,29 +1518,35 @@ private:
         return s;
     }
 
-    // Capture runs while at least one device has "Share my audio" ticked.
+    // Each source is captured (on its default device) while at least one device has the
+    // matching box ticked: "Share my audio" = system audio, "Share my microphone" = mic.
     void RefreshCapture()
     {
-        bool any = false;
-        for (const auto& kv : peers_) any = any || kv.second.share;
-        const AudioSource src = srcChoice_->GetSelection() == 1 ? AudioSource::System : AudioSource::Microphone;
-        const int srcIdx = src == AudioSource::System ? 1 : 0;
-        if (any == sendingNow_ && (!any || srcIdx == sendingSrc_)) return;   // nothing to (re)start
+        bool anySys = false, anyMic = false;
+        for (const auto& kv : peers_) { anySys = anySys || kv.second.share; anyMic = anyMic || kv.second.mic; }
 
+        UpdateCapture(AudioSource::System,     anySys, sysCapturing_, "system audio");
+        UpdateCapture(AudioSource::Microphone, anyMic, micCapturing_, "microphone");
+    }
+
+    void UpdateCapture(AudioSource src, bool want, bool& capturing, const char* what)
+    {
+        if (want == capturing) return;
         std::string err;
-        if (!audio_->SetSending(any, src, &err)) {
-            Log("Audio capture failed: " + wxString::FromUTF8(err));
-            for (auto& kv : peers_) { kv.second.share = false; audio_->SetPeerSend(kv.second.inst, false); }
-            sendingNow_ = false;
-            inGauge_->SetLevel(0);
+        if (!audio_->SetCapture(src, want, &err)) {
+            Log(wxString("Capturing ") + what + " failed: " + wxString::FromUTF8(err));
+            for (auto& kv : peers_) {
+                bool& flag = src == AudioSource::System ? kv.second.share : kv.second.mic;
+                flag = false;
+                audio_->SetPeerSend(kv.second.inst, src, false);
+                RecordPeerAudio(kv.second);
+            }
+            capturing = false;
             RefreshDeviceRows();
             return;
         }
-        sendingNow_ = any;
-        sendingSrc_ = srcIdx;
-        if (!any)                              Log("Stopped capturing audio");
-        else if (src == AudioSource::System)   Log("Capturing system audio");
-        else                                   Log("Capturing microphone");
+        capturing = want;
+        Log(wxString(want ? "Capturing " : "Stopped capturing ") + what);
     }
 
     // ------------------------------------------------------------------- scan
@@ -1813,8 +1810,6 @@ private:
 
     void UpdateAudioStats()
     {
-        inGauge_->SetLevel(sendingNow_ ? std::min(1.0f, std::sqrt(audio_->InputLevel())) : 0.0f);
-
         const auto stats = audio_->Stats();
         for (auto& kv : devRows_) {
             auto pit = peers_.find(kv.first);
@@ -1829,7 +1824,10 @@ private:
 
             r.level->SetLevel(recv ? std::sqrt(level) : 0.0f);
             wxString txt = recv ? wxString::Format("Receiving %.0f kbps", kbps) : wxString("No incoming audio");
-            if (pit->second.share && sendingNow_) txt += wxString::FromUTF8("  \xC2\xB7  Sending my audio");
+            const bool sendSys = pit->second.share && sysCapturing_;
+            const bool sendMic = pit->second.mic && micCapturing_;
+            if (sendSys || sendMic)
+                txt += wxString::FromUTF8("  \xC2\xB7  Sending my ") + (sendSys && sendMic ? "audio + microphone" : sendSys ? "audio" : "microphone");
             SetText(r.audioState, txt);
         }
     }
@@ -1880,10 +1878,7 @@ private:
     wxStaticText* searchLbl_ = nullptr;
     SpeakerButton* masterMute_ = nullptr;
     wxStaticText* masterPct_ = nullptr;
-    wxChoice* srcChoice_ = nullptr;
-    LevelBar* inGauge_ = nullptr;
     wxSlider* volSlider_ = nullptr;
-    wxCheckBox* inputChk_ = nullptr;
     wxTimer timer_;
     wxTimer animTimer_;
     wxTimer statTimer_;
@@ -1900,8 +1895,8 @@ private:
     bool cfgDirty_ = false;
     bool loading_ = false;
     std::chrono::steady_clock::time_point dirtyAt_;
-    bool sendingNow_ = false;
-    int sendingSrc_ = 0;
+    bool sysCapturing_ = false;   // system audio capture running
+    bool micCapturing_ = false;   // microphone capture running
     InputEngine::Mode inputMode_ = InputEngine::Mode::Local;
     int inputPeer_ = -1;
 };

@@ -20,14 +20,16 @@ struct SavedPeer {
 
     // per-device audio (saved with the set, like the position)
     bool hasAudio = false; // false: the file had no "peeraudio" line for this peer
-    bool send = false;     // share my audio with this device
+    bool send = false;     // share my audio (system audio) with this device
+    bool mic = false;      // share my microphone with this device
+    bool hasMic = false;   // false: line from before the microphone switch existed (migrated on load)
     bool mute = false;     // mute what this device sends me
     int  volume = 100;     // 0..100 slider units (what I hear from this device)
 };
 
 struct SavedAudio {
     bool send = false;     // legacy (one switch for all devices); only used to migrate old files
-    int  source = 0;       // 0 microphone, 1 system audio
+    int  source = 0;       // legacy (one source for all devices: 0 microphone, 1 system audio); only used to migrate old files
     bool mute = false;     // master mute of everything incoming
     int  volume = 100;     // master volume, 0..100 (slider units)
 };

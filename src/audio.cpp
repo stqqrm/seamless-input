@@ -33,7 +33,8 @@ using Clock = std::chrono::steady_clock;
 namespace {
 
 // ---- wire format: 12 byte header + 5 ms of 48 kHz stereo 16-bit PCM (960 bytes)
-//   [0..1] magic 'SA'  [2] version  [3] channels  [4..7] sender instance  [8..11] sequence
+//   [0..1] magic 'SA'  [2] version  [3] stream (0 microphone, 1 system audio)
+//   [4..7] sender instance  [8..11] sequence (counted per stream)
 constexpr int            kRate          = 48000;
 constexpr int            kChannels      = 2;
 constexpr int            kPacketFrames  = 240;
@@ -41,7 +42,8 @@ constexpr std::size_t    kPacketSamples = kPacketFrames * kChannels;
 constexpr std::size_t    kPayloadBytes  = kPacketSamples * sizeof(std::int16_t);
 constexpr std::size_t    kHeaderBytes   = 12;
 constexpr std::uint16_t  kMagic         = 0x5341;
-constexpr std::uint8_t   kVersion       = 1;
+constexpr std::uint8_t   kVersion       = 2;
+constexpr int            kStreams       = 2;    // microphone, system audio
 
 // ---- receive side jitter buffer (all in samples = frames * channels)
 constexpr std::size_t kTargetSamples = 30  * kRate / 1000 * kChannels;   // start playing at 30 ms
@@ -64,29 +66,34 @@ std::uint32_t Get32(const unsigned char* p)
            ((std::uint32_t)p[2] << 16) | ((std::uint32_t)p[3] << 24);
 }
 
-struct Peer {
-    std::string ip;
-    udp::endpoint ep;
-
-    // per-device settings (guarded by Impl::mtx like everything else here)
-    bool  send  = false;     // send OUR audio to this peer
-    bool  muted = false;     // silence what this peer sends us
-    float vol   = 1.0f;      // 0..1.5, applied to what this peer sends us
-
+// One incoming stream of a peer (its microphone or its system audio) with its own jitter buffer.
+struct Stream {
     std::vector<std::int16_t> ring = std::vector<std::int16_t>(kRingSamples, 0);
     std::size_t head = 0, count = 0;
     bool primed = false;
     bool haveSeq = false;
     std::uint32_t lastSeq = 0;
+    float level = 0;
+};
+
+struct Peer {
+    std::string ip;
+    udp::endpoint ep;
+
+    // per-device settings (guarded by Impl::mtx like everything else here)
+    bool  send[kStreams] = {false, false};   // send OUR microphone / system audio to this peer
+    bool  muted = false;     // silence what this peer sends us
+    float vol   = 1.0f;      // 0..1.5, applied to what this peer sends us
+
+    Stream in[kStreams];
 
     std::uint64_t bytes = 0, statBytes = 0;
     Clock::time_point lastPkt{};
     Clock::time_point statT = Clock::now();
     double kbps = 0;
-    float level = 0;
 };
 
-void Push(Peer& p, const std::int16_t* s, std::size_t n)
+void Push(Stream& p, const std::int16_t* s, std::size_t n)
 {
     if (n > kRingSamples) { s += n - kRingSamples; n = kRingSamples; }
     if (p.count + n > kRingSamples) {                       // overflow: drop oldest
@@ -104,7 +111,10 @@ void Push(Peer& p, const std::int16_t* s, std::size_t n)
 } // namespace
 
 struct AudioEngine::Impl {
-    explicit Impl(std::uint32_t s) : self(s) { dests.reserve(64); }
+    explicit Impl(std::uint32_t s) : self(s)
+    {
+        for (int i = 0; i < kStreams; ++i) { cap[i].owner = this; cap[i].stream = i; cap[i].dests.reserve(64); }
+    }
 
     const std::uint32_t self;
 
@@ -123,9 +133,23 @@ struct AudioEngine::Impl {
 
     // ---- devices
     ma_device playback;
-    ma_device capture;
     bool playbackOn = false;
-    bool captureOn  = false;
+
+    // One capture device per source (index = AudioSource), each with its own packet
+    // staging buffer and sequence counter.
+    struct Cap {
+        Impl* owner = nullptr;
+        int stream = 0;
+        ma_device dev;
+        bool on = false;
+        std::atomic<bool>  sending{false};
+        std::atomic<float> level{0.0f};
+        std::array<std::int16_t, kPacketSamples> stage{};
+        std::size_t stageCount = 0;
+        std::uint32_t seq = 0;
+        std::vector<udp::endpoint> dests;   // scratch for SendPacket, only touched by this source's thread
+    };
+    Cap cap[kStreams];
 #if defined(__linux__)
     // System audio on Linux = the PulseAudio/PipeWire "monitor" of the default output.
     // miniaudio's loopback device type only exists for WASAPI, so we open that monitor
@@ -135,16 +159,9 @@ struct AudioEngine::Impl {
 #endif
     bool stopped    = false;
 
-    std::atomic<bool>  sending{false};
     std::atomic<bool>  muted{false};
     std::atomic<float> volume{1.0f};
-    std::atomic<float> inLevel{0.0f};
 
-    // capture thread state
-    std::array<std::int16_t, kPacketSamples> stage{};
-    std::size_t stageCount = 0;
-    std::uint32_t seq = 0;
-    std::vector<udp::endpoint> dests;
 
     // ------------------------------------------------------------------ start / stop
     bool Start(std::string* err)
@@ -192,8 +209,10 @@ struct AudioEngine::Impl {
     {
         if (stopped) return;
         stopped = true;
-        sending = false;
-        if (captureOn)  { ma_device_uninit(&capture);  captureOn = false; }
+        for (auto& c : cap) {
+            c.sending = false;
+            if (c.on) { ma_device_uninit(&c.dev); c.on = false; }
+        }
         CloseSysCtx();
         if (playbackOn) { ma_device_uninit(&playback); playbackOn = false; }
         if (th.joinable()) {
@@ -223,11 +242,11 @@ struct AudioEngine::Impl {
         peers.erase(inst);
     }
 
-    void SetPeerSend(std::uint32_t inst, bool on)
+    void SetPeerSend(std::uint32_t inst, AudioSource src, bool on)
     {
         std::lock_guard<std::mutex> lk(mtx);
         auto it = peers.find(inst);
-        if (it != peers.end()) it->second.send = on;
+        if (it != peers.end()) it->second.send[(int)src] = on;
     }
 
     void SetPeerMuted(std::uint32_t inst, bool m)
@@ -245,23 +264,24 @@ struct AudioEngine::Impl {
     }
 
     // ------------------------------------------------------------------ capture / send
-    bool SetSending(bool on, AudioSource src, std::string* err)
+    bool SetCapture(AudioSource src, bool on, std::string* err)
     {
-        if (captureOn) { ma_device_uninit(&capture); captureOn = false; }
-        CloseSysCtx();
-        sending = false;
-        inLevel = 0.0f;
+        const bool system = src == AudioSource::System;
+        Cap& c = cap[(int)src];
+        if (c.on) { ma_device_uninit(&c.dev); c.on = false; }
+        if (system) CloseSysCtx();
+        c.sending = false;
+        c.level = 0.0f;
         if (!on) return true;
 
 #if defined(__linux__)
-        const bool system = src == AudioSource::System;
         ma_device_id monitorId;
         if (system && !OpenMonitor(&monitorId, err)) return false;
         ma_device_config cfg = ma_device_config_init(ma_device_type_capture);
-        if (system) cfg.capture.pDeviceID = &monitorId;
+        if (system) cfg.capture.pDeviceID = &monitorId;    // microphone: default input device
 #else
         ma_device_config cfg = ma_device_config_init(
-            src == AudioSource::System ? ma_device_type_loopback : ma_device_type_capture);
+            system ? ma_device_type_loopback : ma_device_type_capture);
 #endif
         cfg.capture.format    = ma_format_s16;
         cfg.capture.channels  = kChannels;
@@ -269,26 +289,26 @@ struct AudioEngine::Impl {
         cfg.periodSizeInFrames = kPacketFrames;
         cfg.performanceProfile = ma_performance_profile_low_latency;
         cfg.dataCallback      = &Impl::CaptureCb;
-        cfg.pUserData         = this;
+        cfg.pUserData         = &c;
 
 #if defined(__linux__)
         ma_context* ctx = (system && sysCtxOn) ? &sysCtx : nullptr;
 #else
         ma_context* ctx = nullptr;
 #endif
-        ma_result r = ma_device_init(ctx, &cfg, &capture);
-        if (r != MA_SUCCESS) { CloseSysCtx(); if (err) *err = ma_result_description(r); return false; }
+        ma_result r = ma_device_init(ctx, &cfg, &c.dev);
+        if (r != MA_SUCCESS) { if (system) CloseSysCtx(); if (err) *err = ma_result_description(r); return false; }
 
-        stageCount = 0;
-        r = ma_device_start(&capture);
+        c.stageCount = 0;
+        r = ma_device_start(&c.dev);
         if (r != MA_SUCCESS) {
-            ma_device_uninit(&capture);
-            CloseSysCtx();
+            ma_device_uninit(&c.dev);
+            if (system) CloseSysCtx();
             if (err) *err = ma_result_description(r);
             return false;
         }
-        captureOn = true;
-        sending = true;
+        c.on = true;
+        c.sending = true;
         return true;
     }
 
@@ -343,12 +363,13 @@ struct AudioEngine::Impl {
 
     static void CaptureCb(ma_device* dev, void*, const void* in, ma_uint32 frames)
     {
-        static_cast<Impl*>(dev->pUserData)->OnCapture(static_cast<const std::int16_t*>(in), frames);
+        Cap* c = static_cast<Cap*>(dev->pUserData);
+        c->owner->OnCapture(*c, static_cast<const std::int16_t*>(in), frames);
     }
 
-    void OnCapture(const std::int16_t* in, ma_uint32 frames)
+    void OnCapture(Cap& c, const std::int16_t* in, ma_uint32 frames)
     {
-        if (!sending.load() || !in) return;
+        if (!c.sending.load() || !in) return;
         const std::size_t n = (std::size_t)frames * kChannels;
 
         int peak = 0;
@@ -356,37 +377,38 @@ struct AudioEngine::Impl {
             const int a = in[i] < 0 ? -in[i] : in[i];
             if (a > peak) peak = a;
         }
-        inLevel = std::max(peak / 32768.0f, inLevel.load() * 0.9f);
+        c.level = std::max(peak / 32768.0f, c.level.load() * 0.9f);
 
         std::size_t pos = 0;
         while (pos < n) {
-            const std::size_t take = std::min(n - pos, kPacketSamples - stageCount);
-            std::memcpy(stage.data() + stageCount, in + pos, take * sizeof(std::int16_t));
-            stageCount += take;
+            const std::size_t take = std::min(n - pos, kPacketSamples - c.stageCount);
+            std::memcpy(c.stage.data() + c.stageCount, in + pos, take * sizeof(std::int16_t));
+            c.stageCount += take;
             pos += take;
-            if (stageCount == kPacketSamples) {
-                SendPacket(stage.data());
-                stageCount = 0;
+            if (c.stageCount == kPacketSamples) {
+                SendPacket(c, c.stage.data());
+                c.stageCount = 0;
             }
         }
     }
 
-    void SendPacket(const std::int16_t* samples)
+    void SendPacket(Cap& c, const std::int16_t* samples)
     {
         unsigned char pkt[kHeaderBytes + kPayloadBytes];
         pkt[0] = (unsigned char)(kMagic & 0xFF);
         pkt[1] = (unsigned char)(kMagic >> 8);
         pkt[2] = kVersion;
-        pkt[3] = (unsigned char)kChannels;
+        pkt[3] = (unsigned char)c.stream;
         Put32(pkt + 4, self);
-        Put32(pkt + 8, seq++);
+        Put32(pkt + 8, c.seq++);
         std::memcpy(pkt + kHeaderBytes, samples, kPayloadBytes);
 
+        auto& dests = c.dests;
         dests.clear();
         {
             std::lock_guard<std::mutex> lk(mtx);
             for (auto& kv : peers)
-                if (kv.second.send) dests.push_back(kv.second.ep);   // only devices we share with
+                if (kv.second.send[c.stream]) dests.push_back(kv.second.ep);   // only devices we share with
         }
         for (auto& ep : dests) {
             error_code ec;
@@ -409,6 +431,8 @@ struct AudioEngine::Impl {
         if (n != kHeaderBytes + kPayloadBytes) return;
         const unsigned char* b = rx.data();
         if (b[0] != (kMagic & 0xFF) || b[1] != (kMagic >> 8) || b[2] != kVersion) return;
+        const int stream = b[3];
+        if (stream < 0 || stream >= kStreams) return;
 
         const std::uint32_t inst = Get32(b + 4);
         const std::uint32_t sq   = Get32(b + 8);
@@ -424,7 +448,8 @@ struct AudioEngine::Impl {
         std::lock_guard<std::mutex> lk(mtx);
         auto it = peers.find(inst);
         if (it == peers.end()) return;            // only audio from connected peers
-        Peer& p = it->second;
+        Peer& pe = it->second;
+        Stream& p = pe.in[stream];
 
         if (p.haveSeq) {
             const std::int32_t diff = (std::int32_t)(sq - p.lastSeq);
@@ -447,8 +472,8 @@ struct AudioEngine::Impl {
             p.count -= drop;
         }
 
-        p.bytes += n;
-        p.lastPkt = Clock::now();
+        pe.bytes += n;
+        pe.lastPkt = Clock::now();
         p.level = std::max(peak / 32768.0f, p.level * 0.97f);
     }
 
@@ -468,21 +493,23 @@ struct AudioEngine::Impl {
         {
             std::lock_guard<std::mutex> lk(mtx);
             for (auto& kv : peers) {
-                Peer& p = kv.second;
-                if (!p.primed) {
-                    if (p.count >= kTargetSamples) p.primed = true;
-                    else continue;
+                Peer& pe = kv.second;
+                const float vol = pe.muted ? 0.0f : master * pe.vol;   // a muted device is still drained: no stale audio on unmute
+                for (Stream& p : pe.in) {         // microphone + system audio of this device
+                    if (!p.primed) {
+                        if (p.count >= kTargetSamples) p.primed = true;
+                        else continue;
+                    }
+                    const std::size_t take = std::min(n, p.count);
+                    std::size_t idx = p.head;
+                    for (std::size_t i = 0; i < take; ++i) {
+                        o[i] += vol * (float)p.ring[idx];
+                        if (++idx == kRingSamples) idx = 0;
+                    }
+                    p.head = idx;
+                    p.count -= take;
+                    if (take < n) p.primed = false;   // underrun: re-buffer
                 }
-                const std::size_t take = std::min(n, p.count);
-                const float vol = p.muted ? 0.0f : master * p.vol;   // a muted device is still drained: no stale audio on unmute
-                std::size_t idx = p.head;
-                for (std::size_t i = 0; i < take; ++i) {
-                    o[i] += vol * (float)p.ring[idx];
-                    if (++idx == kRingSamples) idx = 0;
-                }
-                p.head = idx;
-                p.count -= take;
-                if (take < n) p.primed = false;   // underrun: re-buffer
             }
         }
         for (std::size_t i = 0; i < n; ++i) o[i] = std::clamp(o[i], -1.0f, 1.0f);
@@ -504,7 +531,8 @@ struct AudioEngine::Impl {
             }
             const bool recv = p.lastPkt != Clock::time_point{} &&
                               now - p.lastPkt < std::chrono::seconds(1);
-            out.push_back({kv.first, p.ip, recv ? p.kbps : 0.0, recv ? p.level : 0.0f, recv});
+            const float lvl = std::max(p.in[0].level, p.in[1].level);
+            out.push_back({kv.first, p.ip, recv ? p.kbps : 0.0, recv ? lvl : 0.0f, recv});
         }
         return out;
     }
@@ -518,14 +546,14 @@ bool AudioEngine::Start(std::string* err)                 { return d_->Start(err
 void AudioEngine::Stop()                                  { d_->Stop(); }
 void AudioEngine::AddPeer(std::uint32_t i, const std::string& ip) { d_->AddPeer(i, ip); }
 void AudioEngine::RemovePeer(std::uint32_t i)             { d_->RemovePeer(i); }
-bool AudioEngine::SetSending(bool on, AudioSource s, std::string* e) { return d_->SetSending(on, s, e); }
-void AudioEngine::SetPeerSend(std::uint32_t i, bool on)   { d_->SetPeerSend(i, on); }
+bool AudioEngine::SetCapture(AudioSource s, bool on, std::string* e) { return d_->SetCapture(s, on, e); }
+void AudioEngine::SetPeerSend(std::uint32_t i, AudioSource s, bool on) { d_->SetPeerSend(i, s, on); }
 void AudioEngine::SetPeerMuted(std::uint32_t i, bool m)   { d_->SetPeerMuted(i, m); }
 void AudioEngine::SetPeerVolume(std::uint32_t i, float v) { d_->SetPeerVolume(i, v); }
 void AudioEngine::SetMuted(bool m)                        { d_->muted = m; }
 void AudioEngine::SetVolume(float v)                      { d_->volume = std::clamp(v, 0.0f, 1.5f); }
 std::vector<AudioPeerStat> AudioEngine::Stats()           { return d_->Stats(); }
-float AudioEngine::InputLevel() const                     { return d_->inLevel.load(); }
+float AudioEngine::InputLevel() const                     { return std::max(d_->cap[0].level.load(), d_->cap[1].level.load()); }
 
 bool AudioEngine::SystemAudioSupported()
 {
