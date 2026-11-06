@@ -501,8 +501,9 @@ static Theme MakeTheme()
 {
     Theme t;
     t.dark = wxSystemSettings::GetAppearance().IsDark();
-    t.text = wxSystemSettings::GetColour(wxSYS_COLOUR_WINDOWTEXT);
+    // Explicit colours: on Windows the system text colour stays black even in dark mode.
     if (t.dark) {
+        t.text   = wxColour(232, 234, 240);
         t.page   = wxColour(30, 32, 37);
         t.card   = wxColour(41, 44, 52);
         t.border = wxColour(62, 66, 77);
@@ -513,6 +514,7 @@ static Theme MakeTheme()
         t.warn   = wxColour(245, 185, 66);
         t.bad    = wxColour(240, 96, 96);
     } else {
+        t.text   = wxColour(28, 31, 38);
         t.page   = wxColour(241, 243, 248);
         t.card   = wxColour(255, 255, 255);
         t.border = wxColour(220, 224, 233);
@@ -526,10 +528,326 @@ static Theme MakeTheme()
     return t;
 }
 
+
+// Blend two colours (pct = share of b, 0..100).
+static wxColour MixColour(const wxColour& a, const wxColour& b, int pct)
+{
+    auto m = [pct](int x, int y) { return (unsigned char)(x + (y - x) * pct / 100); };
+    return wxColour(m(a.Red(), b.Red()), m(a.Green(), b.Green()), m(a.Blue(), b.Blue()));
+}
+
+// Text field drawn by us (rounded, themed border, accent ring on focus). The real text control
+// sits inside it without any native border, so it looks the same on every OS.
+class InputBox : public wxPanel {
+public:
+    wxTextCtrl* ctl = nullptr;
+
+    InputBox(wxWindow* parent, const Theme& t, long style, const wxString& value, const wxString& hint)
+        : wxPanel(parent, wxID_ANY, wxDefaultPosition, wxDefaultSize, wxBORDER_NONE | wxTAB_TRAVERSAL), t_(t)
+    {
+        SetBackgroundStyle(wxBG_STYLE_PAINT);
+        ctl = new wxTextCtrl(this, wxID_ANY, value, wxDefaultPosition, wxDefaultSize, style | wxBORDER_NONE);
+        ctl->SetBackgroundColour(t.page);
+        ctl->SetForegroundColour(t.text);
+        if (!hint.empty()) ctl->SetHint(hint);
+        auto* sz = new wxBoxSizer(wxVERTICAL);
+        const bool multi = (style & wxTE_MULTILINE) != 0;
+        sz->Add(ctl, 1, wxEXPAND | wxLEFT | wxRIGHT | wxTOP | wxBOTTOM, multi ? 8 : 7);
+        SetSizer(sz);
+        Bind(wxEVT_PAINT, &InputBox::OnPaint, this);
+        Bind(wxEVT_SIZE, [this](wxSizeEvent& e) { Refresh(); e.Skip(); });
+        Bind(wxEVT_LEFT_DOWN, [this](wxMouseEvent&) { ctl->SetFocus(); });
+        ctl->Bind(wxEVT_SET_FOCUS,  [this](wxFocusEvent& e) { focus_ = true;  Refresh(); e.Skip(); });
+        ctl->Bind(wxEVT_KILL_FOCUS, [this](wxFocusEvent& e) { focus_ = false; Refresh(); e.Skip(); });
+    }
+
+private:
+    void OnPaint(wxPaintEvent&)
+    {
+        wxAutoBufferedPaintDC pdc(this);
+        pdc.SetBackground(wxBrush(GetBackgroundColour()));
+        pdc.Clear();
+        wxGCDC dc(pdc);
+        const wxSize s = GetClientSize();
+        dc.SetPen(wxPen(focus_ ? t_.accent : t_.border, 1));
+        dc.SetBrush(wxBrush(t_.page));
+        dc.DrawRoundedRectangle(0, 0, s.x, s.y, 8);
+    }
+
+    Theme t_;
+    bool focus_ = false;
+};
+
+// Rounded push button. Sends a normal wxEVT_BUTTON, so it is bound like a wxButton.
+class FlatButton : public wxControl {
+public:
+    FlatButton(wxWindow* parent, const Theme& t, const wxString& label, bool primary = false)
+        : wxControl(parent, wxID_ANY, wxDefaultPosition, wxDefaultSize, wxBORDER_NONE),
+          t_(t), label_(label), primary_(primary)
+    {
+        SetBackgroundStyle(wxBG_STYLE_PAINT);
+        SetCursor(wxCursor(wxCURSOR_HAND));
+        wxFont f = GetFont();
+        f.SetWeight(wxFONTWEIGHT_BOLD);
+        SetFont(f);
+        Bind(wxEVT_PAINT, &FlatButton::OnPaint, this);
+        Bind(wxEVT_ENTER_WINDOW, [this](wxMouseEvent&) { hover_ = true; Refresh(); });
+        Bind(wxEVT_LEAVE_WINDOW, [this](wxMouseEvent&) { hover_ = false; down_ = false; Refresh(); });
+        Bind(wxEVT_LEFT_DOWN, [this](wxMouseEvent&) { if (IsEnabled()) { down_ = true; Refresh(); } });
+        Bind(wxEVT_LEFT_UP, [this](wxMouseEvent&) {
+            const bool fire = down_ && hover_;
+            down_ = false;
+            Refresh();
+            if (fire) Fire();
+        });
+        Bind(wxEVT_SET_FOCUS,  [this](wxFocusEvent& e) { focus_ = true;  Refresh(); e.Skip(); });
+        Bind(wxEVT_KILL_FOCUS, [this](wxFocusEvent& e) { focus_ = false; Refresh(); e.Skip(); });
+        Bind(wxEVT_KEY_DOWN, [this](wxKeyEvent& e) {
+            if (e.GetKeyCode() == WXK_SPACE || e.GetKeyCode() == WXK_RETURN) Fire();
+            else e.Skip();
+        });
+    }
+
+    bool AcceptsFocus() const override { return IsEnabled(); }
+    bool Enable(bool on = true) override { const bool r = wxControl::Enable(on); Refresh(); return r; }
+
+    void SetLabel(const wxString& l) override { label_ = l; InvalidateBestSize(); Refresh(); }
+
+protected:
+    wxSize DoGetBestSize() const override
+    {
+        const wxSize te = GetTextExtent(label_);
+        return wxSize(te.x + 32, te.y + 16);
+    }
+
+private:
+    void Fire()
+    {
+        if (!IsEnabled()) return;
+        wxCommandEvent ev(wxEVT_BUTTON, GetId());
+        ev.SetEventObject(this);
+        ProcessWindowEvent(ev);
+    }
+
+    void OnPaint(wxPaintEvent&)
+    {
+        wxAutoBufferedPaintDC pdc(this);
+        pdc.SetBackground(wxBrush(GetBackgroundColour()));
+        pdc.Clear();
+        wxGCDC dc(pdc);
+        const wxSize s = GetClientSize();
+        wxColour fill = primary_ ? t_.accent : t_.track;
+        wxColour ink  = primary_ ? wxColour(255, 255, 255) : t_.text;
+        if (hover_) fill = MixColour(fill, primary_ ? wxColour(255, 255, 255) : t_.text, primary_ ? 12 : 8);
+        if (down_)  fill = MixColour(fill, wxColour(0, 0, 0), 18);
+        if (!IsEnabled()) { fill = MixColour(t_.card, t_.track, 60); ink = t_.sub; }
+        dc.SetPen(wxPen(focus_ ? t_.accent : (primary_ ? fill : t_.border), 1));
+        dc.SetBrush(wxBrush(fill));
+        dc.DrawRoundedRectangle(0, 0, s.x, s.y, 8);
+        dc.SetFont(GetFont());
+        dc.SetTextForeground(ink);
+        const wxSize te = dc.GetTextExtent(label_);
+        dc.DrawText(label_, (s.x - te.x) / 2, (s.y - te.y) / 2);
+    }
+
+    Theme t_;
+    wxString label_;
+    bool primary_;
+    bool hover_ = false, down_ = false, focus_ = false;
+};
+
+// Check box with a label. Sends wxEVT_CHECKBOX (IsChecked() works as usual).
+class FlatCheck : public wxControl {
+public:
+    FlatCheck(wxWindow* parent, const Theme& t, const wxString& label)
+        : wxControl(parent, wxID_ANY, wxDefaultPosition, wxDefaultSize, wxBORDER_NONE), t_(t), label_(label)
+    {
+        SetBackgroundStyle(wxBG_STYLE_PAINT);
+        SetCursor(wxCursor(wxCURSOR_HAND));
+        Bind(wxEVT_PAINT, &FlatCheck::OnPaint, this);
+        Bind(wxEVT_ENTER_WINDOW, [this](wxMouseEvent&) { hover_ = true; Refresh(); });
+        Bind(wxEVT_LEAVE_WINDOW, [this](wxMouseEvent&) { hover_ = false; Refresh(); });
+        Bind(wxEVT_LEFT_UP, [this](wxMouseEvent&) { Toggle(); });
+        Bind(wxEVT_SET_FOCUS,  [this](wxFocusEvent& e) { focus_ = true;  Refresh(); e.Skip(); });
+        Bind(wxEVT_KILL_FOCUS, [this](wxFocusEvent& e) { focus_ = false; Refresh(); e.Skip(); });
+        Bind(wxEVT_KEY_DOWN, [this](wxKeyEvent& e) {
+            if (e.GetKeyCode() == WXK_SPACE) Toggle(); else e.Skip();
+        });
+    }
+
+    bool AcceptsFocus() const override { return IsEnabled(); }
+    bool Enable(bool on = true) override { const bool r = wxControl::Enable(on); Refresh(); return r; }
+
+    void SetValue(bool v) { if (v != on_) { on_ = v; Refresh(); } }
+    bool GetValue() const { return on_; }
+
+protected:
+    wxSize DoGetBestSize() const override
+    {
+        const wxSize te = GetTextExtent(label_);
+        return wxSize(kBox + 9 + te.x + 2, std::max(kBox, te.y) + 4);
+    }
+
+private:
+    static constexpr int kBox = 18;
+
+    void Toggle()
+    {
+        if (!IsEnabled()) return;
+        on_ = !on_;
+        Refresh();
+        wxCommandEvent ev(wxEVT_CHECKBOX, GetId());
+        ev.SetEventObject(this);
+        ev.SetInt(on_ ? 1 : 0);
+        ProcessWindowEvent(ev);
+    }
+
+    void OnPaint(wxPaintEvent&)
+    {
+        wxAutoBufferedPaintDC pdc(this);
+        pdc.SetBackground(wxBrush(GetBackgroundColour()));
+        pdc.Clear();
+        wxGCDC dc(pdc);
+        const wxSize s = GetClientSize();
+        const bool en = IsEnabled();
+        const int by = (s.y - kBox) / 2;
+        wxColour fill = on_ ? t_.accent : t_.page;
+        wxColour edge = on_ ? t_.accent : (hover_ ? t_.sub : t_.border);
+        if (!en) { fill = on_ ? MixColour(t_.card, t_.sub, 40) : t_.card; edge = t_.border; }
+        dc.SetPen(wxPen(focus_ ? t_.accent : edge, focus_ ? 2 : 1));
+        dc.SetBrush(wxBrush(fill));
+        dc.DrawRoundedRectangle(1, by + 1, kBox - 2, kBox - 2, 5);
+        if (on_) {
+            dc.SetPen(wxPen(wxColour(255, 255, 255), 2, wxPENSTYLE_SOLID));
+            const wxPoint pts[3] = { wxPoint(5, by + 9), wxPoint(8, by + 12), wxPoint(13, by + 6) };
+            dc.DrawLines(3, pts);
+        }
+        dc.SetFont(GetFont());
+        dc.SetTextForeground(en ? t_.text : t_.sub);
+        const wxSize te = dc.GetTextExtent(label_);
+        dc.DrawText(label_, kBox + 9, (s.y - te.y) / 2);
+    }
+
+    Theme t_;
+    wxString label_;
+    bool on_ = false, hover_ = false, focus_ = false;
+};
+
+// Horizontal slider: thin track, accent fill, round thumb. Sends wxEVT_SLIDER (GetInt()).
+class FlatSlider : public wxControl {
+public:
+    FlatSlider(wxWindow* parent, const Theme& t, int minV, int maxV, int value, int width)
+        : wxControl(parent, wxID_ANY, wxDefaultPosition, wxSize(width, 26), wxBORDER_NONE),
+          t_(t), min_(minV), max_(maxV), val_(value), width_(width)
+    {
+        SetBackgroundStyle(wxBG_STYLE_PAINT);
+        SetCursor(wxCursor(wxCURSOR_HAND));
+        Bind(wxEVT_PAINT, &FlatSlider::OnPaint, this);
+        Bind(wxEVT_ENTER_WINDOW, [this](wxMouseEvent&) { hover_ = true; Refresh(); });
+        Bind(wxEVT_LEAVE_WINDOW, [this](wxMouseEvent&) { hover_ = false; Refresh(); });
+        Bind(wxEVT_LEFT_DOWN, [this](wxMouseEvent& e) {
+            if (!IsEnabled()) return;
+            drag_ = true;
+            if (!HasCapture()) CaptureMouse();
+            SetFromX(e.GetX());
+        });
+        Bind(wxEVT_MOTION, [this](wxMouseEvent& e) { if (drag_) SetFromX(e.GetX()); });
+        Bind(wxEVT_LEFT_UP, [this](wxMouseEvent&) {
+            drag_ = false;
+            if (HasCapture()) ReleaseMouse();
+            Refresh();
+        });
+        Bind(wxEVT_MOUSE_CAPTURE_LOST, [this](wxMouseCaptureLostEvent&) { drag_ = false; Refresh(); });
+        Bind(wxEVT_MOUSEWHEEL, [this](wxMouseEvent& e) {
+            if (!IsEnabled()) return;
+            Change(val_ + (e.GetWheelRotation() > 0 ? 5 : -5));
+        });
+        Bind(wxEVT_SET_FOCUS,  [this](wxFocusEvent& e) { focus_ = true;  Refresh(); e.Skip(); });
+        Bind(wxEVT_KILL_FOCUS, [this](wxFocusEvent& e) { focus_ = false; Refresh(); e.Skip(); });
+        Bind(wxEVT_KEY_DOWN, [this](wxKeyEvent& e) {
+            switch (e.GetKeyCode()) {
+                case WXK_LEFT:  case WXK_DOWN: Change(val_ - 1);  break;
+                case WXK_RIGHT: case WXK_UP:   Change(val_ + 1);  break;
+                case WXK_PAGEDOWN:             Change(val_ - 10); break;
+                case WXK_PAGEUP:               Change(val_ + 10); break;
+                default: e.Skip();
+            }
+        });
+    }
+
+    bool AcceptsFocus() const override { return IsEnabled(); }
+    bool Enable(bool on = true) override { const bool r = wxControl::Enable(on); Refresh(); return r; }
+
+    void SetValue(int v) { v = std::clamp(v, min_, max_); if (v != val_) { val_ = v; Refresh(); } }
+    int GetValue() const { return val_; }
+
+protected:
+    wxSize DoGetBestSize() const override { return wxSize(width_, 26); }
+
+private:
+    static constexpr int kPad = 10;
+
+    void SetFromX(int x)
+    {
+        const double w = std::max(1, GetClientSize().x - 2 * kPad);
+        const double f = std::clamp((x - kPad) / w, 0.0, 1.0);
+        Change(min_ + (int)std::lround(f * (max_ - min_)));
+    }
+
+    void Change(int v)
+    {
+        v = std::clamp(v, min_, max_);
+        if (v == val_) return;
+        val_ = v;
+        Refresh();
+        wxCommandEvent ev(wxEVT_SLIDER, GetId());
+        ev.SetEventObject(this);
+        ev.SetInt(val_);
+        ProcessWindowEvent(ev);
+    }
+
+    void OnPaint(wxPaintEvent&)
+    {
+        wxAutoBufferedPaintDC pdc(this);
+        pdc.SetBackground(wxBrush(GetBackgroundColour()));
+        pdc.Clear();
+        wxGCDC dc(pdc);
+        const wxSize s = GetClientSize();
+        const bool en = IsEnabled();
+        const double cy = s.y / 2.0, th = 6.0;
+        const double span = std::max(1, s.x - 2 * kPad);
+        const double frac = max_ > min_ ? double(val_ - min_) / (max_ - min_) : 0.0;
+        const double tx = kPad + span * frac;
+        const wxColour fillCol = en ? t_.accent : t_.sub;
+
+        dc.SetPen(*wxTRANSPARENT_PEN);
+        dc.SetBrush(wxBrush(t_.track));
+        dc.DrawRoundedRectangle(kPad, cy - th / 2, span, th, th / 2);
+        if (tx > kPad) {
+            dc.SetBrush(wxBrush(fillCol));
+            dc.DrawRoundedRectangle(kPad, cy - th / 2, tx - kPad, th, th / 2);
+        }
+        const double r = (drag_ || hover_) ? 8.5 : 7.5;
+        if (focus_) {
+            dc.SetPen(wxPen(wxColour(fillCol.Red(), fillCol.Green(), fillCol.Blue(), 90), 3));
+            dc.SetBrush(*wxTRANSPARENT_BRUSH);
+            dc.DrawCircle(wxPoint((int)tx, (int)cy), (int)(r + 3));
+        }
+        dc.SetPen(wxPen(fillCol, 2));
+        dc.SetBrush(wxBrush(wxColour(255, 255, 255)));
+        dc.DrawCircle(wxPoint((int)tx, (int)cy), (int)r);
+    }
+
+    Theme t_;
+    int min_, max_, val_, width_;
+    bool hover_ = false, drag_ = false, focus_ = false;
+};
+
 // Children of a card must paint with the card's colour.
 static void ApplyBackground(wxWindow* w, const wxColour& bg)
 {
     w->SetBackgroundColour(bg);
+    if (dynamic_cast<InputBox*>(w)) return;     // its text control keeps the field colour
     for (wxWindow* c : w->GetChildren()) ApplyBackground(c, bg);
 }
 
@@ -720,71 +1038,6 @@ private:
     Theme t_;
     wxString text_;
     wxColour col_;
-};
-
-// Small outlined rounded button (used instead of a toggle: "Pair", "Unpair", ...).
-class PillButton : public wxControl {
-public:
-    std::function<void()> onClick;
-
-    PillButton(wxWindow* parent, const Theme& t)
-        : wxControl(parent, wxID_ANY, wxDefaultPosition, wxDefaultSize, wxBORDER_NONE), t_(t), col_(t.accent)
-    {
-        SetBackgroundStyle(wxBG_STYLE_PAINT);
-        SetCursor(wxCursor(wxCURSOR_HAND));
-        wxFont f = GetFont();
-        f.SetWeight(wxFONTWEIGHT_BOLD);
-        SetFont(f);
-        Bind(wxEVT_PAINT, &PillButton::OnPaint, this);
-        Bind(wxEVT_ENTER_WINDOW, [this](wxMouseEvent&) { hover_ = true; Refresh(); });
-        Bind(wxEVT_LEAVE_WINDOW, [this](wxMouseEvent&) { hover_ = false; down_ = false; Refresh(); });
-        Bind(wxEVT_LEFT_DOWN, [this](wxMouseEvent&) { down_ = true; Refresh(); });
-        Bind(wxEVT_LEFT_UP, [this](wxMouseEvent&) {
-            if (!down_) return;
-            down_ = false;
-            Refresh();
-            if (onClick) onClick();
-        });
-        Set("-", t.accent);
-    }
-
-    void Set(const wxString& text, const wxColour& c)
-    {
-        if (text == text_ && c == col_) return;
-        const bool resize = text != text_;
-        text_ = text;
-        col_ = c;
-        if (resize) {
-            const wxSize te = GetTextExtent(text_);
-            SetMinSize(wxSize(te.x + 28, te.y + 10));
-            InvalidateBestSize();
-            if (GetParent()) GetParent()->Layout();
-        }
-        Refresh();
-    }
-
-private:
-    void OnPaint(wxPaintEvent&)
-    {
-        wxAutoBufferedPaintDC pdc(this);
-        pdc.SetBackground(wxBrush(GetBackgroundColour()));
-        pdc.Clear();
-        wxGCDC dc(pdc);
-        const wxSize s = GetClientSize();
-        const int a = down_ ? 70 : hover_ ? 52 : 0;
-        dc.SetPen(wxPen(wxColour(col_.Red(), col_.Green(), col_.Blue(), 150), 1));
-        dc.SetBrush(wxBrush(wxColour(col_.Red(), col_.Green(), col_.Blue(), a)));
-        dc.DrawRoundedRectangle(0, 0, s.x, s.y, s.y / 2.0);
-        dc.SetFont(GetFont());
-        dc.SetTextForeground(col_);
-        const wxSize te = dc.GetTextExtent(text_);
-        dc.DrawText(text_, (s.x - te.x) / 2, (s.y - te.y) / 2);
-    }
-
-    Theme t_;
-    wxString text_;
-    wxColour col_;
-    bool hover_ = false, down_ = false;
 };
 
 // Horizontal divider with a caption in the middle: ---- Other hosts ----
@@ -1147,6 +1400,7 @@ public:
         }
 
         SetBackgroundColour(theme_.page);
+        SetForegroundColour(theme_.text);
         auto* root = new wxBoxSizer(wxVERTICAL);
 
         // ---- header: host name, addresses, key
@@ -1158,6 +1412,7 @@ public:
             tf.SetWeight(wxFONTWEIGHT_BOLD);
             tf.SetPointSize(tf.GetPointSize() + 5);
             title->SetFont(tf);
+            title->SetForegroundColour(theme_.text);
             auto* sub = new wxStaticText(this, wxID_ANY,
                 wxString::Format("IP %s   |   Key %s   |   TCP %d   UDP %d (discovery)   UDP %d (audio)",
                                  ips.empty() ? wxString("-") : ips,
@@ -1397,11 +1652,11 @@ private:
             gv->Add(MakeHeader(groupCard, "Group"), 0, wxBOTTOM, 2);
             gv->Add(MakeLabel(groupCard, "PCs with the same password connect automatically. Leave empty for no password.", true), 0, wxBOTTOM, 8);
             auto* gr = new wxBoxSizer(wxHORIZONTAL);
-            groupCtl_ = new wxTextCtrl(groupCard, wxID_ANY, wxString::FromUTF8(groupPwd_), wxDefaultPosition,
-                                       wxDefaultSize, wxTE_PASSWORD | wxTE_PROCESS_ENTER);
-            groupCtl_->SetHint("password");
-            groupBtn_ = new wxButton(groupCard, wxID_ANY, "Apply");
-            gr->Add(groupCtl_, 1, wxALIGN_CENTER_VERTICAL | wxRIGHT, 6);
+            auto* groupBox = new InputBox(groupCard, theme_, wxTE_PASSWORD | wxTE_PROCESS_ENTER,
+                                          wxString::FromUTF8(groupPwd_), "password");
+            groupCtl_ = groupBox->ctl;
+            groupBtn_ = new FlatButton(groupCard, theme_, "Apply", true);
+            gr->Add(groupBox, 1, wxALIGN_CENTER_VERTICAL | wxRIGHT, 8);
             gr->Add(groupBtn_, 0, wxALIGN_CENTER_VERTICAL);
             gv->Add(gr, 0, wxEXPAND);
             groupLbl_ = MakeLabel(groupCard, "", true);
@@ -1410,8 +1665,6 @@ private:
             go->Add(gv, 1, wxEXPAND | wxALL, 14);
             groupCard->SetSizer(go);
             ApplyBackground(groupCard, theme_.card);
-            groupCtl_->SetBackgroundColour(theme_.page);
-            groupCtl_->SetForegroundColour(theme_.text);
         }
         right->Add(groupCard, 0, wxEXPAND | wxBOTTOM, 8);
 
@@ -1421,14 +1674,14 @@ private:
             auto* cv = new wxBoxSizer(wxVERTICAL);
             cv->Add(MakeHeader(connCard, "Connect"), 0, wxBOTTOM, 8);
             auto* r1 = new wxBoxSizer(wxHORIZONTAL);
-            target_ = new wxTextCtrl(connCard, wxID_ANY, "", wxDefaultPosition, wxDefaultSize, wxTE_PROCESS_ENTER);
-            target_->SetHint("target IP address");
-            goBtn_ = new wxButton(connCard, wxID_ANY, "Go");
-            r1->Add(target_, 1, wxALIGN_CENTER_VERTICAL | wxRIGHT, 6);
+            auto* targetBox = new InputBox(connCard, theme_, wxTE_PROCESS_ENTER, "", "target IP address");
+            target_ = targetBox->ctl;
+            goBtn_ = new FlatButton(connCard, theme_, "Go", true);
+            r1->Add(targetBox, 1, wxALIGN_CENTER_VERTICAL | wxRIGHT, 8);
             r1->Add(goBtn_, 0, wxALIGN_CENTER_VERTICAL);
             cv->Add(r1, 0, wxEXPAND);
             auto* r2 = new wxBoxSizer(wxHORIZONTAL);
-            scanBtn_ = new wxButton(connCard, wxID_ANY, "Scan LAN");
+            scanBtn_ = new FlatButton(connCard, theme_, "Scan LAN");
             searchLbl_ = new wxStaticText(connCard, wxID_ANY, "");
             r2->Add(scanBtn_, 0, wxALIGN_CENTER_VERTICAL | wxRIGHT, 10);
             r2->Add(searchLbl_, 1, wxALIGN_CENTER_VERTICAL);
@@ -1437,8 +1690,6 @@ private:
             co->Add(cv, 1, wxEXPAND | wxALL, 14);
             connCard->SetSizer(co);
             ApplyBackground(connCard, theme_.card);
-            target_->SetBackgroundColour(theme_.page);
-            target_->SetForegroundColour(theme_.text);
             searchLbl_->SetForegroundColour(theme_.sub);
         }
         right->Add(connCard, 0, wxEXPAND | wxBOTTOM, 8);
@@ -1448,15 +1699,15 @@ private:
         {
             auto* lv = new wxBoxSizer(wxVERTICAL);
             lv->Add(MakeHeader(logCard, "Activity"), 0, wxBOTTOM, 6);
-            log_ = new wxTextCtrl(logCard, wxID_ANY, "", wxDefaultPosition, wxSize(-1, 60),
-                                  wxTE_MULTILINE | wxTE_READONLY | wxBORDER_NONE);
+            auto* logBox = new InputBox(logCard, theme_, wxTE_MULTILINE | wxTE_READONLY, "", "");
+            log_ = logBox->ctl;
             log_->SetFont(wxFont(wxFontInfo(wxSystemSettings::GetFont(wxSYS_DEFAULT_GUI_FONT).GetPointSize()).Family(wxFONTFAMILY_TELETYPE)));
-            lv->Add(log_, 1, wxEXPAND);
+            logBox->SetMinSize(wxSize(-1, 70));
+            lv->Add(logBox, 1, wxEXPAND);
             auto* lo = new wxBoxSizer(wxVERTICAL);
             lo->Add(lv, 1, wxEXPAND | wxALL, 14);
             logCard->SetSizer(lo);
             ApplyBackground(logCard, theme_.card);
-            log_->SetForegroundColour(theme_.text);
         }
         right->Add(logCard, 1, wxEXPAND);
 
@@ -1483,13 +1734,14 @@ private:
         wxFont f = l->GetFont();
         f.SetWeight(wxFONTWEIGHT_BOLD);
         l->SetFont(f);
+        l->SetForegroundColour(theme_.text);
         return l;
     }
 
     wxStaticText* MakeLabel(wxWindow* parent, const wxString& text, bool subtle = false)
     {
         auto* l = new wxStaticText(parent, wxID_ANY, text);
-        if (subtle) l->SetForegroundColour(theme_.sub);
+        l->SetForegroundColour(subtle ? theme_.sub : theme_.text);
         return l;
     }
 
@@ -1504,7 +1756,7 @@ private:
         auto* bv = new wxBoxSizer(wxVERTICAL);
 
         masterMute_ = new SpeakerButton(bar, theme_, 32);
-        volSlider_ = new wxSlider(bar, wxID_ANY, 100, 0, 100, wxDefaultPosition, wxSize(150, -1));
+        volSlider_ = new FlatSlider(bar, theme_, 0, 100, 100, 150);
         masterPct_ = MakeLabel(bar, "100%", true);
         masterPct_->SetMinSize(wxSize(44, -1));
 
@@ -1543,9 +1795,9 @@ private:
     struct DevRow {
         CardPanel* card = nullptr;
         wxStaticText *name = nullptr, *sub = nullptr, *detail = nullptr, *pct = nullptr, *audioState = nullptr;
-        wxCheckBox *share = nullptr, *mic = nullptr, *allow = nullptr;
+        FlatCheck *share = nullptr, *mic = nullptr, *allow = nullptr;
         SpeakerButton* mute = nullptr;
-        wxSlider* vol = nullptr;
+        FlatSlider* vol = nullptr;
         LevelBar* level = nullptr;
     };
 
@@ -1561,6 +1813,7 @@ private:
         nf.SetWeight(wxFONTWEIGHT_BOLD);
         nf.SetPointSize(nf.GetPointSize() + 2);
         r.name->SetFont(nf);
+        r.name->SetForegroundColour(theme_.text);
         r.sub = MakeLabel(c, "", true);
         r.detail = MakeLabel(c, "", true);
         auto* info = new wxBoxSizer(wxVERTICAL);
@@ -1569,15 +1822,15 @@ private:
         info->Add(r.detail, 0);
 
         // switches
-        r.share = new wxCheckBox(c, wxID_ANY, "Share my audio");
+        r.share = new FlatCheck(c, theme_, "Share my audio");
         r.share->SetToolTip("Send what this PC plays (system audio) to this device only.\nIt may echo if this device sends its audio back.");
         if (!AudioEngine::SystemAudioSupported()) {
             r.share->Disable();
             r.share->SetToolTip("Sharing system audio is not supported on this platform");
         }
-        r.mic = new wxCheckBox(c, wxID_ANY, "Share my microphone");
+        r.mic = new FlatCheck(c, theme_, "Share my microphone");
         r.mic->SetToolTip("Send this PC's microphone to this device only");
-        r.allow = new wxCheckBox(c, wxID_ANY, "Allow remote control");
+        r.allow = new FlatCheck(c, theme_, "Allow remote control");
         r.allow->SetToolTip("Let this device use this PC's keyboard and mouse");
         auto* checks = new wxBoxSizer(wxVERTICAL);
         checks->Add(r.share, 0, wxBOTTOM, 8);
@@ -1586,7 +1839,7 @@ private:
 
         // audio from this device
         r.mute = new SpeakerButton(c, theme_, 34);
-        r.vol = new wxSlider(c, wxID_ANY, 100, 0, 100, wxDefaultPosition, wxSize(170, -1));
+        r.vol = new FlatSlider(c, theme_, 0, 100, 100, 170);
         r.pct = MakeLabel(c, "100%", true);
         r.pct->SetMinSize(wxSize(44, -1));
         r.level = new LevelBar(c, theme_, wxSize(-1, 8));
@@ -1815,6 +2068,7 @@ private:
         nf.SetWeight(wxFONTWEIGHT_BOLD);
         nf.SetPointSize(nf.GetPointSize() + 2);
         r.name->SetFont(nf);
+        r.name->SetForegroundColour(theme_.text);
         r.sub = MakeLabel(c, "", true);
         r.detail = MakeLabel(c, "", true);
         auto* info = new wxBoxSizer(wxVERTICAL);
@@ -1898,6 +2152,7 @@ private:
         nf.SetWeight(wxFONTWEIGHT_BOLD);
         nf.SetPointSize(nf.GetPointSize() + 2);
         r.name->SetFont(nf);
+        r.name->SetForegroundColour(theme_.text);
         r.sub = MakeLabel(c, "", true);
         r.detail = MakeLabel(c, "", true);
         auto* info = new wxBoxSizer(wxVERTICAL);
@@ -2567,7 +2822,7 @@ private:
     bool listDirty_ = false;
     std::map<std::string, OthRow> othRows_;
     wxTextCtrl* groupCtl_ = nullptr;
-    wxButton* groupBtn_ = nullptr;
+    FlatButton* groupBtn_ = nullptr;
     wxStaticText* groupLbl_ = nullptr;
     wxScrolledWindow* cliScroll_ = nullptr;
     wxBoxSizer* cliSizer_ = nullptr;
@@ -2583,12 +2838,12 @@ private:
     Theme theme_ = MakeTheme();
     wxTextCtrl* target_ = nullptr;
     wxTextCtrl* log_ = nullptr;
-    wxButton* goBtn_ = nullptr;
-    wxButton* scanBtn_ = nullptr;
+    FlatButton* goBtn_ = nullptr;
+    FlatButton* scanBtn_ = nullptr;
     wxStaticText* searchLbl_ = nullptr;
     SpeakerButton* masterMute_ = nullptr;
     wxStaticText* masterPct_ = nullptr;
-    wxSlider* volSlider_ = nullptr;
+    FlatSlider* volSlider_ = nullptr;
     wxTimer timer_;
     wxTimer animTimer_;
     wxTimer statTimer_;
