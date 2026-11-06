@@ -263,11 +263,30 @@ private:
                      GetSystemMetrics(SM_CXVIRTUALSCREEN), GetSystemMetrics(SM_CYVIRTUALSCREEN),
                      SWP_NOACTIVATE | SWP_SHOWWINDOW);
         SetCursor(nullptr);
+        // ShowCursor() is per thread and applies over this thread's windows - and the overlay
+        // (ours) covers the whole desktop, so this hides the pointer everywhere as well.
+        if (!cursorCounted_) { ShowCursor(FALSE); cursorCounted_ = true; }
+        // Other topmost windows (taskbar, menus, full-screen apps) can climb above the overlay
+        // and bring the pointer back; re-assert it a few times a second while forwarding.
+        overlayTimer_ = SetTimer(nullptr, overlayTimer_, 150, nullptr);
         SetCursorPos(anchorX_, anchorY_);   // makes Windows re-evaluate the cursor under the pointer
+    }
+
+    void Reassert()
+    {
+        if (!overlay_ || !fwd_) return;
+        SetWindowPos(overlay_, HWND_TOPMOST, 0, 0, 0, 0,
+                     SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_SHOWWINDOW);
+        SetCursor(nullptr);
+        POINT p{};
+        if (GetCursorPos(&p) && (p.x != anchorX_ || p.y != anchorY_))
+            SetCursorPos(anchorX_, anchorY_);   // also re-triggers WM_SETCURSOR
     }
 
     void HideOverlay()
     {
+        if (overlayTimer_) { KillTimer(nullptr, overlayTimer_); overlayTimer_ = 0; }
+        if (cursorCounted_) { ShowCursor(TRUE); cursorCounted_ = false; }
         if (overlay_) ShowWindow(overlay_, SW_HIDE);
     }
 
@@ -295,6 +314,8 @@ private:
             } else if (msg.message == kMsgKbdOff) {
                 if (kbd_) { UnhookWindowsHookEx(kbd_); kbd_ = nullptr; }
                 HideOverlay();
+            } else if (msg.message == WM_TIMER && msg.hwnd == nullptr) {
+                Reassert();
             } else {
                 TranslateMessage(&msg);
                 DispatchMessageW(&msg);
@@ -408,6 +429,8 @@ private:
     DWORD tid_ = 0;
     HHOOK mouse_ = nullptr, kbd_ = nullptr;
     HWND overlay_ = nullptr;             // hook thread only
+    bool cursorCounted_ = false;         // hook thread only: ShowCursor(FALSE) is in effect
+    UINT_PTR overlayTimer_ = 0;          // hook thread only
     std::mutex initMu_;
     std::condition_variable initCv_;
     bool initDone_ = false, hookOk_ = false;
