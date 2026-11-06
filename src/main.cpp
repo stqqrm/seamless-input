@@ -1123,16 +1123,24 @@ private:
         bv->Add(r1, 0, wxEXPAND | wxLEFT | wxRIGHT | wxTOP, 14);
 
         auto* r2 = new wxBoxSizer(wxHORIZONTAL);
-        inputChk_ = new wxCheckBox(bar, wxID_ANY, "Share keyboard && mouse");
-        inputChk_->SetValue(true);
-        inputChk_->SetToolTip("Lets this PC's keyboard and mouse move onto other PCs.\nWho may control THIS PC is set per device with \"Allow remote control\".");
+        inputChk_ = new wxCheckBox(bar, wxID_ANY, "Allow remote control for all devices");
+        inputChk_->SetValue(false);
+        inputChk_->SetToolTip("Shortcut: ticks or unticks \"Allow remote control\" on every connected device.\nEach device can still be changed on its own, and that is what counts.");
         r2->Add(inputChk_, 0, wxALIGN_CENTER_VERTICAL | wxRIGHT, 14);
         r2->Add(MakeLabel(bar, "Scroll Lock returns control to this PC", true), 0, wxALIGN_CENTER_VERTICAL);
         bv->Add(r2, 0, wxEXPAND | wxALL, 14);
         bar->SetSizer(bv);
         ApplyBackground(bar, theme_.card);
         masterPct_->SetForegroundColour(theme_.sub);
-        inputChk_->Bind(wxEVT_CHECKBOX, [this](wxCommandEvent&) { input_->SetEnabled(inputChk_->GetValue()); MarkCfgDirty(); });
+        inputChk_->Bind(wxEVT_CHECKBOX, [this](wxCommandEvent&) {
+            const bool on = inputChk_->GetValue();
+            for (auto& kv : peers_) {
+                SetTrust(kv.second, on ? TrustStore::State::Allowed : TrustStore::State::Denied);
+                input_->SetPeerAllowed(kv.first, on);
+            }
+            Log(on ? "Allowed remote control for all devices" : "Blocked remote control for all devices");
+            RefreshDeviceRows();
+        });
 
         v->Add(bar, 0, wxEXPAND | wxALL, 10);
 
@@ -1301,6 +1309,9 @@ private:
     void RefreshDeviceRows()
     {
         for (auto& kv : devRows_) RefreshDeviceRow(kv.second);
+        bool all = !peers_.empty();
+        for (const auto& kv : peers_) all = all && trust_->Get(kv.second.key) == TrustStore::State::Allowed;
+        inputChk_->SetValue(all);
     }
 
     // ---------------------------------------------------------------- actions
@@ -1360,7 +1371,7 @@ private:
         cfg_.audio.source = srcChoice_->GetSelection() == 1 ? 1 : 0;
         cfg_.audio.mute   = masterMute_->IsMuted();
         cfg_.audio.volume = volSlider_->GetValue();
-        cfg_.inputEnabled = inputChk_->GetValue();
+        cfg_.inputEnabled = true;     // legacy field: permissions live in trust.txt, per device
         for (const auto& kv : peers_) RecordPeerAudio(kv.second, true);
     }
 
@@ -1466,9 +1477,6 @@ private:
         if (sendingNow_) Log("Audio sharing switched on by the saved config");
         RefreshDeviceRows();
 
-        const bool inputWas = inputChk_->GetValue();
-        inputChk_->SetValue(cfg_.inputEnabled);
-        if (inputWas != cfg_.inputEnabled) input_->SetEnabled(cfg_.inputEnabled);
     }
 
     // Called whenever a PC joins or leaves: save the old config, load (or start) the one
