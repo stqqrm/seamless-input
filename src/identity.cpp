@@ -68,7 +68,7 @@ std::string Identity::HashHex(const std::string& data, std::size_t bytes)
 
 std::string Identity::GroupSecret(const std::string& password)
 {
-    if (password.empty()) return {};
+    // An empty password is a valid group too ("no password"): all PCs without one connect.
     constexpr std::uint32_t kBlocks = 8192;                 // 8 MiB
     std::vector<std::uint8_t> work(std::size_t(kBlocks) * 1024);
     static const std::uint8_t salt[16] = {'s','i','-','g','r','o','u','p','-','v','1',0,0,0,0,0};

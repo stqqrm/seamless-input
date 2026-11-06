@@ -60,7 +60,7 @@ public:
             std::string myName, const Identity& ident, SessionEvents ev)
         : sock_(std::move(sock)), id_(id), incoming_(incoming), myInstance_(myInstance),
           myName_(std::move(myName)), ident_(ident), ev_(std::move(ev)), buf_(4096),
-          myNonce_(Identity::RandomHex(16)) {}
+          myNonce_(Identity::RandomHex(16)), hb_(sock_.get_executor()) {}
 
     void Start()
     {
@@ -69,6 +69,8 @@ public:
         auto ep = sock_.remote_endpoint(ec);
         if (!ec) addr_ = ep.address().to_string();
         Send("HELLO " + std::to_string(myInstance_) + " " + ident_.PublicHex() + " " + myNonce_ + " " + myName_);
+        lastRx_ = std::chrono::steady_clock::now();
+        Heartbeat();
         DoRead();
     }
 
@@ -102,6 +104,7 @@ public:
         if (closed_) return;
         closed_ = true;
         error_code ec;
+        hb_.cancel(ec);
         sock_.shutdown(tcp::socket::shutdown_both, ec);
         sock_.close(ec);
         auto self = shared_from_this();
@@ -109,11 +112,32 @@ public:
     }
 
 private:
+    // Liveness: a PC that went to sleep (or lost the network) never closes the TCP link, so
+    // without this the controller would keep forwarding mouse/keyboard into the void and the
+    // user would be stuck. Both sides send PING every second; silence for 5 s drops the link,
+    // which hands the keyboard/mouse back to this PC (see OnPeerLost -> RemovePeer).
+    void Heartbeat()
+    {
+        auto self = shared_from_this();
+        error_code ec;
+        hb_.expires_after(std::chrono::seconds(1), ec);
+        hb_.async_wait([self](error_code e) {
+            if (e || self->closed_) return;
+            if (std::chrono::steady_clock::now() - self->lastRx_ > std::chrono::seconds(5)) {
+                self->Close();
+                return;
+            }
+            if (self->gotHello_) self->Send("PING");
+            self->Heartbeat();
+        });
+    }
+
     void DoRead()
     {
         auto self = shared_from_this();
         asio::async_read_until(sock_, buf_, '\n', [self](error_code ec, std::size_t) {
             if (ec) { self->Close(); return; }
+            self->lastRx_ = std::chrono::steady_clock::now();
             std::istream is(&self->buf_);
             std::string l;
             std::getline(is, l);
@@ -202,6 +226,7 @@ private:
 
     void Handle(const std::string& l)
     {
+        if (l == "PING") return;                    // liveness only; receiving it is what counts
         if (authed_) {
             if (l.rfind("TRUST ", 0) == 0) { HandleTrust(l.substr(6)); return; }
             if (ready_) ev_.line(id_, l);           // pending peers may only talk about trust
@@ -267,6 +292,8 @@ private:
     bool sentTrust_ = false, sentOnce_ = false;
     bool ready_  = false;       // accepted: carries input / audio
     bool closed_ = false;
+    std::chrono::steady_clock::time_point lastRx_;
+    asio::steady_timer hb_;
 };
 
 } // namespace
