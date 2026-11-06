@@ -104,7 +104,7 @@ public:
         if (closed_) return;
         closed_ = true;
         error_code ec;
-        hb_.cancel(ec);
+        try { hb_.cancel(); } catch (...) {}
         sock_.shutdown(tcp::socket::shutdown_both, ec);
         sock_.close(ec);
         auto self = shared_from_this();
@@ -119,8 +119,7 @@ private:
     void Heartbeat()
     {
         auto self = shared_from_this();
-        error_code ec;
-        hb_.expires_after(std::chrono::seconds(1), ec);
+        hb_.expires_after(std::chrono::seconds(1));
         hb_.async_wait([self](error_code e) {
             if (e || self->closed_) return;
             if (std::chrono::steady_clock::now() - self->lastRx_ > std::chrono::seconds(5)) {
