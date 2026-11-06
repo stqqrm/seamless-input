@@ -622,6 +622,151 @@ private:
 };
 
 // Speaker icon that toggles between "sound on" and "muted" (drawn, no bitmaps needed).
+// Small on/off switch (green when on).
+class ToggleSwitch : public wxControl {
+public:
+    std::function<void(bool on)> onToggle;
+
+    ToggleSwitch(wxWindow* parent, const Theme& t)
+        : wxControl(parent, wxID_ANY, wxDefaultPosition, wxSize(42, 24), wxBORDER_NONE), t_(t)
+    {
+        SetBackgroundStyle(wxBG_STYLE_PAINT);
+        SetMinSize(wxSize(42, 24));
+        SetCursor(wxCursor(wxCURSOR_HAND));
+        Bind(wxEVT_PAINT, &ToggleSwitch::OnPaint, this);
+        Bind(wxEVT_ENTER_WINDOW, [this](wxMouseEvent&) { hover_ = true; Refresh(); });
+        Bind(wxEVT_LEAVE_WINDOW, [this](wxMouseEvent&) { hover_ = false; Refresh(); });
+        Bind(wxEVT_LEFT_UP, [this](wxMouseEvent&) {
+            on_ = !on_;
+            Refresh();
+            if (onToggle) onToggle(on_);
+        });
+    }
+
+    void SetValue(bool v) { if (v != on_) { on_ = v; Refresh(); } }
+    bool GetValue() const { return on_; }
+
+private:
+    void OnPaint(wxPaintEvent&)
+    {
+        wxAutoBufferedPaintDC pdc(this);
+        pdc.SetBackground(wxBrush(GetBackgroundColour()));
+        pdc.Clear();
+        wxGCDC dc(pdc);
+        wxGraphicsContext* gc = dc.GetGraphicsContext();
+        if (!gc) return;
+        const wxSize s = GetClientSize();
+        const double h = s.y - 4;
+        wxColour track = on_ ? t_.ok : t_.track;
+        if (hover_ && !on_) track = t_.border;
+        gc->SetPen(*wxTRANSPARENT_PEN);
+        gc->SetBrush(wxBrush(track));
+        gc->DrawRoundedRectangle(0, 2, s.x, h, h / 2);
+        const double d = h - 6;
+        gc->SetBrush(wxBrush(wxColour(255, 255, 255)));
+        gc->DrawEllipse(on_ ? s.x - 3 - d : 3, 2 + 3, d, d);
+    }
+
+    Theme t_;
+    bool on_ = false, hover_ = false;
+};
+
+// Rounded label with a tinted background ("Connected", "Waiting", ...).
+class StatusPill : public wxControl {
+public:
+    StatusPill(wxWindow* parent, const Theme& t)
+        : wxControl(parent, wxID_ANY, wxDefaultPosition, wxDefaultSize, wxBORDER_NONE), t_(t)
+    {
+        SetBackgroundStyle(wxBG_STYLE_PAINT);
+        wxFont f = GetFont();
+        f.SetWeight(wxFONTWEIGHT_BOLD);
+        SetFont(f);
+        Bind(wxEVT_PAINT, &StatusPill::OnPaint, this);
+        Set("-", t.sub);
+    }
+
+    void Set(const wxString& text, const wxColour& c)
+    {
+        if (text == text_ && c == col_) return;
+        const bool resize = text != text_;
+        text_ = text;
+        col_ = c;
+        if (resize) {
+            const wxSize te = GetTextExtent(text_);
+            SetMinSize(wxSize(te.x + 22, te.y + 8));
+            InvalidateBestSize();
+            if (GetParent()) GetParent()->Layout();
+        }
+        Refresh();
+    }
+
+private:
+    void OnPaint(wxPaintEvent&)
+    {
+        wxAutoBufferedPaintDC pdc(this);
+        pdc.SetBackground(wxBrush(GetBackgroundColour()));
+        pdc.Clear();
+        wxGCDC dc(pdc);
+        const wxSize s = GetClientSize();
+        dc.SetPen(*wxTRANSPARENT_PEN);
+        dc.SetBrush(wxBrush(wxColour(col_.Red(), col_.Green(), col_.Blue(), t_.dark ? 46 : 34)));
+        dc.DrawRoundedRectangle(0, 0, s.x, s.y, s.y / 2.0);
+        dc.SetFont(GetFont());
+        dc.SetTextForeground(col_);
+        const wxSize te = dc.GetTextExtent(text_);
+        dc.DrawText(text_, (s.x - te.x) / 2, (s.y - te.y) / 2);
+    }
+
+    Theme t_;
+    wxString text_;
+    wxColour col_;
+};
+
+// Round badge with the first letter of a name.
+class Avatar : public wxControl {
+public:
+    Avatar(wxWindow* parent, const Theme& t, int size = 40)
+        : wxControl(parent, wxID_ANY, wxDefaultPosition, wxSize(size, size), wxBORDER_NONE), t_(t), col_(t.accent)
+    {
+        SetBackgroundStyle(wxBG_STYLE_PAINT);
+        SetMinSize(wxSize(size, size));
+        Bind(wxEVT_PAINT, &Avatar::OnPaint, this);
+    }
+
+    void Set(const wxString& name, const wxColour& c)
+    {
+        wxString l = name.empty() ? wxString("?") : name.Left(1).Upper();
+        if (l == letter_ && c == col_) return;
+        letter_ = l;
+        col_ = c;
+        Refresh();
+    }
+
+private:
+    void OnPaint(wxPaintEvent&)
+    {
+        wxAutoBufferedPaintDC pdc(this);
+        pdc.SetBackground(wxBrush(GetBackgroundColour()));
+        pdc.Clear();
+        wxGCDC dc(pdc);
+        const wxSize s = GetClientSize();
+        dc.SetPen(*wxTRANSPARENT_PEN);
+        dc.SetBrush(wxBrush(wxColour(col_.Red(), col_.Green(), col_.Blue(), t_.dark ? 52 : 38)));
+        dc.DrawEllipse(0, 0, s.x, s.y);
+        wxFont f = GetFont();
+        f.SetWeight(wxFONTWEIGHT_BOLD);
+        f.SetPointSize(f.GetPointSize() + 4);
+        dc.SetFont(f);
+        dc.SetTextForeground(col_);
+        const wxSize te = dc.GetTextExtent(letter_);
+        dc.DrawText(letter_, (s.x - te.x) / 2, (s.y - te.y) / 2);
+    }
+
+    Theme t_;
+    wxString letter_;
+    wxColour col_;
+};
+
 class SpeakerButton : public wxControl {
 public:
     std::function<void(bool muted)> onToggle;
@@ -1085,79 +1230,132 @@ private:
     };
 
     // ---------------------------------------------------------------- pages
+    // Network tab: clients + other hosts on the left; group, manual connect and activity log on the right.
     wxWindow* BuildNetworkPage(wxWindow* parent)
     {
         auto* p = new wxPanel(parent);
         p->SetBackgroundColour(theme_.page);
-        auto* bottom = new wxBoxSizer(wxHORIZONTAL);
+        auto* root = new wxBoxSizer(wxHORIZONTAL);
 
+        // ================= left: clients, other hosts
         auto* left = new wxBoxSizer(wxVERTICAL);
 
-        // ---- group password
-        auto* grow = new wxBoxSizer(wxHORIZONTAL);
-        groupCtl_ = new wxTextCtrl(p, wxID_ANY, wxString::FromUTF8(groupPwd_), wxDefaultPosition, wxDefaultSize,
-                                   wxTE_PASSWORD | wxTE_PROCESS_ENTER);
-        groupCtl_->SetHint("same password on every PC of the group");
-        groupBtn_ = new wxButton(p, wxID_ANY, "Apply");
-        grow->Add(MakeLabel(p, "Group"), 0, wxALIGN_CENTER_VERTICAL | wxRIGHT, 8);
-        grow->Add(groupCtl_, 1, wxRIGHT, 6);
-        grow->Add(groupBtn_, 0);
-        left->Add(grow, 0, wxEXPAND);
-        groupLbl_ = MakeLabel(p, "", true);
-        left->Add(groupLbl_, 0, wxTOP | wxBOTTOM, 4);
-
-        // ---- clients: one card per PC that runs seamless-input
-        left->Add(MakeHeader(p, "Clients"), 0, wxBOTTOM, 4);
+        left->Add(MakeSection(p, "Clients", clientsCount_), 0, wxEXPAND | wxBOTTOM, 6);
         cliScroll_ = new wxScrolledWindow(p, wxID_ANY, wxDefaultPosition, wxSize(-1, 120),
                                           wxVSCROLL | wxBORDER_NONE);
         cliScroll_->SetBackgroundColour(theme_.page);
         cliScroll_->SetScrollRate(0, 12);
         cliSizer_ = new wxBoxSizer(wxVERTICAL);
-        cliEmpty_ = new wxStaticText(cliScroll_, wxID_ANY, "No seamless-input clients found yet.");
+        cliEmpty_ = new wxStaticText(cliScroll_, wxID_ANY,
+            "No seamless-input clients found yet.\nStart it on another PC in this network.",
+            wxDefaultPosition, wxDefaultSize, wxALIGN_CENTRE_HORIZONTAL);
         cliEmpty_->SetForegroundColour(theme_.sub);
-        cliSizer_->Add(cliEmpty_, 0, wxALIGN_CENTER_HORIZONTAL | wxTOP, 14);
+        cliSizer_->Add(cliEmpty_, 0, wxALIGN_CENTER_HORIZONTAL | wxTOP, 22);
         cliScroll_->SetSizer(cliSizer_);
         left->Add(cliScroll_, 3, wxEXPAND);
 
-        // ---- other hosts: plain IP addresses
-        searchLbl_ = new wxStaticText(p, wxID_ANY, "");
-        auto* orow = new wxBoxSizer(wxHORIZONTAL);
-        orow->Add(MakeHeader(p, "Other  (IP addresses)"), 0, wxALIGN_CENTER_VERTICAL);
-        orow->AddStretchSpacer();
-        orow->Add(searchLbl_, 0, wxALIGN_CENTER_VERTICAL);
-        left->Add(orow, 0, wxEXPAND | wxTOP | wxBOTTOM, 4);
+        left->Add(MakeSection(p, "Other hosts  (IP addresses)", otherCount_), 0, wxEXPAND | wxTOP | wxBOTTOM, 6);
+        auto* otherCard = new CardPanel(p, theme_, false);
+        list_ = new wxListCtrl(otherCard, wxID_ANY, wxDefaultPosition, wxSize(-1, 70),
+                               wxLC_REPORT | wxLC_SINGLE_SEL | wxBORDER_NONE);
+        list_->InsertColumn(0, "Name", wxLIST_FORMAT_LEFT, 190);
+        list_->InsertColumn(1, "Address", wxLIST_FORMAT_LEFT, 120);
+        list_->InsertColumn(2, "Status", wxLIST_FORMAT_LEFT, 130);
+        auto* os = new wxBoxSizer(wxVERTICAL);
+        os->Add(list_, 1, wxEXPAND | wxALL, 8);
+        otherCard->SetSizer(os);
+        list_->SetBackgroundColour(theme_.card);
+        list_->SetForegroundColour(theme_.text);
+        left->Add(otherCard, 2, wxEXPAND);
 
-        list_ = new wxListCtrl(p, wxID_ANY, wxDefaultPosition, wxSize(-1, 70),
-                               wxLC_REPORT | wxLC_SINGLE_SEL);
-        list_->InsertColumn(0, "Name", wxLIST_FORMAT_LEFT, 200);
-        list_->InsertColumn(1, "Address", wxLIST_FORMAT_LEFT, 130);
-        list_->InsertColumn(2, "Status", wxLIST_FORMAT_LEFT, 140);
-        left->Add(list_, 2, wxEXPAND);
+        // ================= right: group, connect, activity
+        auto* right = new wxBoxSizer(wxVERTICAL);
 
-        auto* row = new wxBoxSizer(wxHORIZONTAL);
-        target_ = new wxTextCtrl(p, wxID_ANY, "", wxDefaultPosition, wxDefaultSize, wxTE_PROCESS_ENTER);
-        target_->SetHint("target IP");
-        goBtn_ = new wxButton(p, wxID_ANY, "Go");
-        scanBtn_ = new wxButton(p, wxID_ANY, "Scan LAN");
-        row->Add(target_, 1, wxRIGHT, 6);
-        row->Add(goBtn_, 0, wxRIGHT, 6);
-        row->Add(scanBtn_, 0);
-        left->Add(row, 0, wxEXPAND | wxTOP, 6);
-
-        log_ = new wxTextCtrl(p, wxID_ANY, "", wxDefaultPosition, wxDefaultSize,
-                              wxTE_MULTILINE | wxTE_READONLY);
-        log_->SetFont(wxFont(wxFontInfo(wxSystemSettings::GetFont(wxSYS_DEFAULT_GUI_FONT).GetPointSize()).Family(wxFONTFAMILY_TELETYPE)));
-
-        searchLbl_->SetForegroundColour(theme_.sub);
-        for (wxWindow* w : std::initializer_list<wxWindow*>{list_, target_, groupCtl_, log_}) {
-            w->SetBackgroundColour(theme_.card);
-            w->SetForegroundColour(theme_.text);
+        // --- group
+        auto* groupCard = new CardPanel(p, theme_, false);
+        {
+            auto* gv = new wxBoxSizer(wxVERTICAL);
+            gv->Add(MakeHeader(groupCard, "Group"), 0, wxBOTTOM, 2);
+            gv->Add(MakeLabel(groupCard, "PCs with the same password connect automatically.", true), 0, wxBOTTOM, 8);
+            auto* gr = new wxBoxSizer(wxHORIZONTAL);
+            groupCtl_ = new wxTextCtrl(groupCard, wxID_ANY, wxString::FromUTF8(groupPwd_), wxDefaultPosition,
+                                       wxDefaultSize, wxTE_PASSWORD | wxTE_PROCESS_ENTER);
+            groupCtl_->SetHint("password");
+            groupBtn_ = new wxButton(groupCard, wxID_ANY, "Apply");
+            gr->Add(groupCtl_, 1, wxALIGN_CENTER_VERTICAL | wxRIGHT, 6);
+            gr->Add(groupBtn_, 0, wxALIGN_CENTER_VERTICAL);
+            gv->Add(gr, 0, wxEXPAND);
+            groupLbl_ = MakeLabel(groupCard, "", true);
+            gv->Add(groupLbl_, 0, wxTOP, 8);
+            auto* go = new wxBoxSizer(wxVERTICAL);
+            go->Add(gv, 1, wxEXPAND | wxALL, 14);
+            groupCard->SetSizer(go);
+            ApplyBackground(groupCard, theme_.card);
+            groupCtl_->SetBackgroundColour(theme_.page);
+            groupCtl_->SetForegroundColour(theme_.text);
         }
+        right->Add(groupCard, 0, wxEXPAND | wxBOTTOM, 8);
 
-        bottom->Add(left, 1, wxEXPAND | wxALL, 10);
-        bottom->Add(log_, 1, wxEXPAND | wxTOP | wxRIGHT | wxBOTTOM, 10);
-        p->SetSizer(bottom);
+        // --- connect by address
+        auto* connCard = new CardPanel(p, theme_, false);
+        {
+            auto* cv = new wxBoxSizer(wxVERTICAL);
+            cv->Add(MakeHeader(connCard, "Connect"), 0, wxBOTTOM, 8);
+            auto* r1 = new wxBoxSizer(wxHORIZONTAL);
+            target_ = new wxTextCtrl(connCard, wxID_ANY, "", wxDefaultPosition, wxDefaultSize, wxTE_PROCESS_ENTER);
+            target_->SetHint("target IP address");
+            goBtn_ = new wxButton(connCard, wxID_ANY, "Go");
+            r1->Add(target_, 1, wxALIGN_CENTER_VERTICAL | wxRIGHT, 6);
+            r1->Add(goBtn_, 0, wxALIGN_CENTER_VERTICAL);
+            cv->Add(r1, 0, wxEXPAND);
+            auto* r2 = new wxBoxSizer(wxHORIZONTAL);
+            scanBtn_ = new wxButton(connCard, wxID_ANY, "Scan LAN");
+            searchLbl_ = new wxStaticText(connCard, wxID_ANY, "");
+            r2->Add(scanBtn_, 0, wxALIGN_CENTER_VERTICAL | wxRIGHT, 10);
+            r2->Add(searchLbl_, 1, wxALIGN_CENTER_VERTICAL);
+            cv->Add(r2, 0, wxEXPAND | wxTOP, 8);
+            auto* co = new wxBoxSizer(wxVERTICAL);
+            co->Add(cv, 1, wxEXPAND | wxALL, 14);
+            connCard->SetSizer(co);
+            ApplyBackground(connCard, theme_.card);
+            target_->SetBackgroundColour(theme_.page);
+            target_->SetForegroundColour(theme_.text);
+            searchLbl_->SetForegroundColour(theme_.sub);
+        }
+        right->Add(connCard, 0, wxEXPAND | wxBOTTOM, 8);
+
+        // --- activity log
+        auto* logCard = new CardPanel(p, theme_, false);
+        {
+            auto* lv = new wxBoxSizer(wxVERTICAL);
+            lv->Add(MakeHeader(logCard, "Activity"), 0, wxBOTTOM, 6);
+            log_ = new wxTextCtrl(logCard, wxID_ANY, "", wxDefaultPosition, wxSize(-1, 60),
+                                  wxTE_MULTILINE | wxTE_READONLY | wxBORDER_NONE);
+            log_->SetFont(wxFont(wxFontInfo(wxSystemSettings::GetFont(wxSYS_DEFAULT_GUI_FONT).GetPointSize()).Family(wxFONTFAMILY_TELETYPE)));
+            lv->Add(log_, 1, wxEXPAND);
+            auto* lo = new wxBoxSizer(wxVERTICAL);
+            lo->Add(lv, 1, wxEXPAND | wxALL, 14);
+            logCard->SetSizer(lo);
+            ApplyBackground(logCard, theme_.card);
+            log_->SetForegroundColour(theme_.text);
+        }
+        right->Add(logCard, 1, wxEXPAND);
+
+        root->Add(left, 3, wxEXPAND | wxALL, 10);
+        root->Add(right, 2, wxEXPAND | wxTOP | wxRIGHT | wxBOTTOM, 10);
+        p->SetSizer(root);
         return p;
+    }
+
+    // "Title ............ count"
+    wxSizer* MakeSection(wxWindow* parent, const wxString& title, wxStaticText*& count)
+    {
+        auto* h = new wxBoxSizer(wxHORIZONTAL);
+        h->Add(MakeHeader(parent, title), 0, wxALIGN_CENTER_VERTICAL);
+        h->AddStretchSpacer();
+        count = MakeLabel(parent, "", true);
+        h->Add(count, 0, wxALIGN_CENTER_VERTICAL);
+        return h;
     }
 
     wxStaticText* MakeHeader(wxWindow* parent, const wxString& text)
@@ -1394,8 +1592,10 @@ private:
     void UpdateGroupLabel()
     {
         groupLbl_->SetLabelText(groupPwd_.empty()
-            ? "No group: PCs only connect after you tick Trust (on both PCs)."
-            : "Group active: PCs with the same password connect to each other automatically.");
+            ? wxString::FromUTF8("\xE2\x97\x8F  No group - PCs connect only after both tick Trust")
+            : wxString::FromUTF8("\xE2\x97\x8F  Group active"));
+        groupLbl_->SetForegroundColour(groupPwd_.empty() ? theme_.sub : theme_.ok);
+        groupLbl_->Refresh();
     }
 
     void ApplyGroupPassword()
@@ -1481,8 +1681,10 @@ private:
 
     struct CliRow {
         CardPanel* card = nullptr;
-        wxStaticText *name = nullptr, *sub = nullptr, *status = nullptr, *tag = nullptr;
-        wxCheckBox* trust = nullptr;
+        Avatar* avatar = nullptr;
+        wxStaticText *name = nullptr, *sub = nullptr, *detail = nullptr;
+        StatusPill* pill = nullptr;
+        ToggleSwitch* trust = nullptr;
     };
 
     void BuildClientRow(const CliView& v)
@@ -1490,43 +1692,46 @@ private:
         CliRow r;
         const wxColour tint = ClientTint();
         r.card = new CardPanel(cliScroll_, theme_, true);
-        r.card->SetFill(tint);                    // tinted background = "this is a seamless-input client"
+        r.card->SetFill(tint);                    // tinted background = "this PC runs seamless-input"
         wxWindow* c = r.card;
 
+        r.avatar = new Avatar(c, theme_, 40);
         r.name = new wxStaticText(c, wxID_ANY, "");
         wxFont nf = r.name->GetFont();
         nf.SetWeight(wxFONTWEIGHT_BOLD);
-        nf.SetPointSize(nf.GetPointSize() + 1);
+        nf.SetPointSize(nf.GetPointSize() + 2);
         r.name->SetFont(nf);
         r.sub = MakeLabel(c, "", true);
-        r.status = MakeLabel(c, "", true);
+        r.detail = MakeLabel(c, "", true);
         auto* info = new wxBoxSizer(wxVERTICAL);
         info->Add(r.name, 0, wxBOTTOM, 2);
         info->Add(r.sub, 0, wxBOTTOM, 2);
-        info->Add(r.status, 0);
+        info->Add(r.detail, 0);
 
-        r.tag = MakeLabel(c, "seamless-input client", true);
-        r.trust = new wxCheckBox(c, wxID_ANY, "Trust");
-        r.trust->SetToolTip("Pair with this PC using its key. Both PCs must tick Trust for each other\n"
-                            "(unless they share the group password). The handshake proves the key.");
+        r.pill = new StatusPill(c, theme_);
+        r.trust = new ToggleSwitch(c, theme_);
+        r.trust->SetToolTip("Trust this PC: pair using its key.\nBoth PCs must trust each other (or share the group password).");
+        auto* trow = new wxBoxSizer(wxHORIZONTAL);
+        trow->Add(MakeLabel(c, "Trust", true), 0, wxALIGN_CENTER_VERTICAL | wxRIGHT, 8);
+        trow->Add(r.trust, 0, wxALIGN_CENTER_VERTICAL);
         auto* right = new wxBoxSizer(wxVERTICAL);
-        right->Add(r.tag, 0, wxALIGN_RIGHT | wxBOTTOM, 6);
-        right->Add(r.trust, 0, wxALIGN_RIGHT);
+        right->Add(r.pill, 0, wxALIGN_RIGHT | wxBOTTOM, 8);
+        right->Add(trow, 0, wxALIGN_RIGHT);
 
         auto* h = new wxBoxSizer(wxHORIZONTAL);
-        h->Add(info, 1, wxALIGN_CENTER_VERTICAL | wxRIGHT, 16);
+        h->Add(r.avatar, 0, wxALIGN_CENTER_VERTICAL | wxRIGHT, 12);
+        h->Add(info, 1, wxALIGN_CENTER_VERTICAL | wxRIGHT, 12);
         h->Add(right, 0, wxALIGN_CENTER_VERTICAL);
         auto* outer = new wxBoxSizer(wxHORIZONTAL);
         outer->AddSpacer(28);
-        outer->Add(h, 1, wxEXPAND | wxTOP | wxBOTTOM | wxRIGHT, 10);
+        outer->Add(h, 1, wxEXPAND | wxTOP | wxBOTTOM | wxRIGHT, 12);
         r.card->SetSizer(outer);
         ApplyBackground(r.card, tint);
         r.sub->SetForegroundColour(theme_.sub);
-        r.status->SetForegroundColour(theme_.sub);
-        r.tag->SetForegroundColour(theme_.accent);
+        r.detail->SetForegroundColour(theme_.sub);
 
         const std::string key = v.key;
-        r.trust->Bind(wxEVT_CHECKBOX, [this, key](wxCommandEvent& e) { SetNetTrust(key, e.IsChecked()); });
+        r.trust->onToggle = [this, key](bool on) { SetNetTrust(key, on); };
 
         cliSizer_->Add(r.card, 0, wxEXPAND | wxBOTTOM, 8);
         cliRows_[key] = r;
@@ -1541,30 +1746,36 @@ private:
         SetText(r.sub, (v.ip.empty() ? wxString("offline") : wxString::FromUTF8(v.ip)) + dot + "Key " +
                        wxString::FromUTF8(Identity::Fingerprint(v.key)));
 
-        wxString st;
-        wxColour col = theme_.sub, accent = theme_.border;
+        wxString pill, detail;
+        wxColour col = theme_.sub;
         if (v.connected) {
-            st = v.viaGroup ? wxString("Connected") + dot + "same group" : wxString("Connected") + dot + "mutual trust";
-            col = accent = theme_.ok;
+            pill = "Connected";
+            detail = v.viaGroup ? "Same group" : "Mutual trust";
+            col = theme_.ok;
         } else if (v.pending && v.theyTrust && !trusted) {
-            st = "Wants to pair with you - tick Trust to accept";
-            col = accent = theme_.warn;
+            pill = "Wants to pair";
+            detail = "It trusts this PC - switch Trust on to accept";
+            col = theme_.warn;
         } else if (trusted && (v.pending || v.seen)) {
-            st = "Waiting for it to trust you back";
-            col = accent = theme_.warn;
+            pill = "Waiting";
+            detail = "Waiting for it to trust this PC back";
+            col = theme_.warn;
         } else if (trusted) {
-            st = "Trusted" + dot + "offline";
+            pill = "Offline";
+            detail = "Trusted, but not on the network right now";
         } else if (v.sameGroup) {
-            st = "Same group - connecting...";
-            accent = theme_.accent;
-        } else if (v.pending || v.seen) {
-            st = groupPwd_.empty() ? wxString("Not paired - tick Trust to pair")
-                                   : wxString("Different group - tick Trust to pair");
+            pill = "Connecting";
+            detail = "Same group";
+            col = theme_.accent;
+        } else {
+            pill = "Not paired";
+            detail = groupPwd_.empty() ? "Switch Trust on to pair" : "Different group - switch Trust on to pair";
         }
-        SetText(r.status, st);
-        if (r.status->GetForegroundColour() != col) { r.status->SetForegroundColour(col); r.status->Refresh(); }
-        r.card->SetAccent(accent);
-        if (r.trust->GetValue() != trusted) r.trust->SetValue(trusted);
+        SetText(r.detail, detail);
+        r.pill->Set(pill, col);
+        r.avatar->Set(v.name, v.connected || v.sameGroup ? col : theme_.sub);
+        r.card->SetAccent(col == theme_.sub ? theme_.border : col);
+        r.trust->SetValue(trusted);
     }
 
     void RebuildClients()
@@ -1585,6 +1796,9 @@ private:
             cliScroll_->Refresh();
         }
         for (const auto& v : views) RefreshClientRow(cliRows_[v.key], v);
+        int conn = 0;
+        for (const auto& v : views) conn += v.connected ? 1 : 0;
+        SetText(clientsCount_, wxString::Format("%d found, %d connected", (int)views.size(), conn));
     }
 
     // Trust checkbox: remember the key; the network layer connects and runs the signed handshake.
@@ -1909,7 +2123,7 @@ private:
         pi.inst = inst; pi.key = key; pi.name = name; pi.addr = addr; pi.incoming = incoming; pi.theyTrust = theyTrust;
         if (isNew)
             Log(name + " (" + wxString::FromUTF8(addr) + "), key " + wxString::FromUTF8(Identity::Fingerprint(key)) +
-                " verified - not in your group; tick Trust (Network tab) to pair");
+                " verified - not in your group; switch Trust on (Network tab) to pair");
         if (trustChanged) Log(name + (theyTrust ? " trusts this PC" : " no longer trusts this PC"));
         RebuildClients();
     }
@@ -2063,8 +2277,6 @@ private:
         }
 
         entries_.clear();
-        for (const auto& a : local_)
-            entries_.push_back({host_ + " (" + wxString::FromUTF8(a.ifname) + ")", a.ip, "This machine", true});
         for (auto& kv : remote) entries_.push_back(kv.second);
 
         rebuilding_ = true;
@@ -2080,6 +2292,11 @@ private:
         }
         list_->Thaw();
         rebuilding_ = false;
+        {
+            int others = 0;
+            for (const auto& e : entries_) others += e.local ? 0 : 1;
+            SetText(otherCount_, wxString::Format("%d host(s)", others));
+        }
         RebuildClients();
     }
 
@@ -2196,6 +2413,8 @@ private:
     wxScrolledWindow* cliScroll_ = nullptr;
     wxBoxSizer* cliSizer_ = nullptr;
     wxStaticText* cliEmpty_ = nullptr;
+    wxStaticText* clientsCount_ = nullptr;
+    wxStaticText* otherCount_ = nullptr;
     std::filesystem::path groupFile_;
     std::string groupPwd_;
     std::unique_ptr<TrustStore> netTrust_;       // keys we trust for network pairing (network-trust.txt)
