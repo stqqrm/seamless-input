@@ -14,6 +14,7 @@
 #include <wx/display.h>
 #include <wx/listctrl.h>
 #include <wx/notebook.h>
+#include <wx/popupwin.h>
 #include <wx/stdpaths.h>
 #include <wx/timer.h>
 
@@ -1376,6 +1377,380 @@ private:
 };
 
 // ============================================================================
+// Custom menu bar. The native wxMenuBar is drawn by the OS (different look on Windows, GTK and
+// macOS, and it stays light in dark mode), so the menu strip and its drop-down menus are drawn
+// here with the same theme as the rest of the window.
+// ============================================================================
+struct MenuItemDef {
+    int id = 0;
+    wxString label;
+    wxString accel;                 // shortcut text shown on the right (display only)
+    bool separator = false;
+    bool check = false, checked = false;
+    bool enabled = true;
+};
+
+struct MenuDef {
+    wxString title;
+    std::vector<MenuItemDef> items;
+};
+
+// The drop-down list. A transient popup: it closes itself when you click anywhere else.
+class MenuPopup : public wxPopupTransientWindow {
+public:
+    std::function<void(int)> onClosed;                      // chosen item index, or -1
+    std::function<void(int)> onSwitch;                      // Left / Right arrow: -1 or +1
+
+    MenuPopup(wxWindow* parent, const Theme& t, std::vector<MenuItemDef> items)
+        : wxPopupTransientWindow(parent, wxBORDER_NONE), t_(t), items_(std::move(items))
+    {
+        SetBackgroundStyle(wxBG_STYLE_PAINT);
+        SetFont(parent->GetFont());
+
+        pad_   = FromDIP(4);
+        side_  = FromDIP(12);
+        checkW_ = FromDIP(26);
+        const int gap  = FromDIP(28);
+        const int rowH = std::max(FromDIP(28), GetCharHeight() + FromDIP(12));
+        const int sepH = FromDIP(9);
+
+        int textW = 0, y = 1 + pad_;
+        for (const auto& it : items_) {
+            Row r;
+            r.y = y;
+            r.h = it.separator ? sepH : rowH;
+            rows_.push_back(r);
+            y += r.h;
+            if (!it.separator) {
+                int w = GetTextExtent(it.label).x;
+                if (!it.accel.empty()) w += gap + GetTextExtent(it.accel).x;
+                textW = std::max(textW, w);
+            }
+        }
+        const int width = std::max(FromDIP(210), 2 + 2 * pad_ + checkW_ + textW + side_);
+        const int height = y + pad_ + 1;
+        SetClientSize(width, height);
+
+        // A child panel covers the popup, draws the menu and takes the keyboard focus: a bare popup
+        // window gets no key events on GTK.
+        body_ = new wxPanel(this, wxID_ANY, wxPoint(0, 0), wxSize(width, height), wxBORDER_NONE | wxWANTS_CHARS);
+        body_->SetBackgroundStyle(wxBG_STYLE_PAINT);
+        body_->SetFont(GetFont());
+        body_->Bind(wxEVT_PAINT, &MenuPopup::OnPaint, this);
+        body_->Bind(wxEVT_MOTION, &MenuPopup::OnMotion, this);
+        body_->Bind(wxEVT_LEAVE_WINDOW, [this](wxMouseEvent&) { SetHover(-1); });
+        body_->Bind(wxEVT_LEFT_UP, [this](wxMouseEvent& e) {
+            const int i = HitTest(e.GetPosition());
+            if (i >= 0) Choose(i);
+        });
+        // keys reach the popup itself (wx forwards them from the focused child)
+        Bind(wxEVT_KEY_DOWN, &MenuPopup::OnKey, this);
+        body_->Bind(wxEVT_KEY_DOWN, &MenuPopup::OnKey, this);
+    }
+
+    wxWindow* FocusTarget() { return body_; }
+
+    void CloseMenu() { DismissAndNotify(); }
+
+    void OnDismiss() override
+    {
+        if (closed_) return;
+        closed_ = true;
+        if (onClosed) onClosed(chosen_);
+    }
+
+private:
+    struct Row { int y = 0, h = 0; };
+
+    bool Selectable(int i) const
+    {
+        return i >= 0 && i < (int)items_.size() && !items_[(size_t)i].separator && items_[(size_t)i].enabled;
+    }
+
+    int HitTest(const wxPoint& p) const
+    {
+        if (p.x < 0 || p.x >= body_->GetClientSize().x) return -1;
+        for (size_t i = 0; i < rows_.size(); ++i)
+            if (p.y >= rows_[i].y && p.y < rows_[i].y + rows_[i].h) return Selectable((int)i) ? (int)i : -1;
+        return -1;
+    }
+
+    void SetHover(int i)
+    {
+        if (i == hover_) return;
+        hover_ = i;
+        body_->Refresh();
+    }
+
+    void Choose(int i)
+    {
+        if (!Selectable(i)) return;
+        chosen_ = i;
+        DismissAndNotify();
+    }
+
+    void Step(int dir)
+    {
+        const int n = (int)items_.size();
+        if (n == 0) return;
+        int i = hover_;
+        for (int k = 0; k < n; ++k) {
+            i = i < 0 ? (dir > 0 ? 0 : n - 1) : (i + dir + n) % n;
+            if (Selectable(i)) { SetHover(i); return; }
+        }
+    }
+
+    void OnMotion(wxMouseEvent& e)
+    {
+        SetHover(HitTest(e.GetPosition()));
+    }
+
+    void OnKey(wxKeyEvent& e)
+    {
+        switch (e.GetKeyCode()) {
+            case WXK_ESCAPE: DismissAndNotify(); break;
+            case WXK_DOWN:   Step(+1); break;
+            case WXK_UP:     Step(-1); break;
+            case WXK_LEFT:   if (onSwitch) onSwitch(-1); break;
+            case WXK_RIGHT:  if (onSwitch) onSwitch(+1); break;
+            case WXK_RETURN:
+            case WXK_NUMPAD_ENTER:
+            case WXK_SPACE:  Choose(hover_); break;
+            default:         e.Skip(); break;
+        }
+    }
+
+    void OnPaint(wxPaintEvent&)
+    {
+        wxAutoBufferedPaintDC pdc(body_);
+        pdc.SetBackground(wxBrush(t_.card));
+        pdc.Clear();
+        wxGCDC dc(pdc);
+        const wxSize s = body_->GetClientSize();
+        dc.SetPen(wxPen(t_.border, 1));
+        dc.SetBrush(*wxTRANSPARENT_BRUSH);
+        dc.DrawRectangle(0, 0, s.x, s.y);
+        dc.SetFont(GetFont());
+
+        for (size_t i = 0; i < items_.size(); ++i) {
+            const MenuItemDef& it = items_[i];
+            const Row& r = rows_[i];
+            if (it.separator) {
+                dc.SetPen(wxPen(t_.border, 1));
+                dc.DrawLine(pad_ + side_, r.y + r.h / 2, s.x - pad_ - side_, r.y + r.h / 2);
+                continue;
+            }
+            if ((int)i == hover_) {
+                dc.SetPen(*wxTRANSPARENT_PEN);
+                dc.SetBrush(wxBrush(t_.track));
+                dc.DrawRoundedRectangle(1 + pad_, r.y, s.x - 2 * (1 + pad_), r.h, 5);
+            }
+            const wxColour ink = it.enabled ? t_.text : t_.sub;
+            const wxSize te = dc.GetTextExtent(it.label);
+            const int ty = r.y + (r.h - te.y) / 2;
+
+            if (it.check && it.checked) {
+                const int cx = 1 + pad_ + FromDIP(10), cy = r.y + r.h / 2;
+                const wxPoint pts[3] = { wxPoint(cx, cy), wxPoint(cx + FromDIP(4), cy + FromDIP(4)),
+                                         wxPoint(cx + FromDIP(11), cy - FromDIP(4)) };
+                dc.SetPen(wxPen(it.enabled ? t_.accent : t_.sub, 2));
+                dc.DrawLines(3, pts);
+            }
+
+            dc.SetTextForeground(ink);
+            dc.DrawText(it.label, 1 + pad_ + checkW_, ty);
+            if (!it.accel.empty()) {
+                dc.SetTextForeground(t_.sub);
+                const wxSize ae = dc.GetTextExtent(it.accel);
+                dc.DrawText(it.accel, s.x - 1 - pad_ - side_ - ae.x, r.y + (r.h - ae.y) / 2);
+            }
+        }
+    }
+
+    Theme t_;
+    std::vector<MenuItemDef> items_;
+    std::vector<Row> rows_;
+    wxPanel* body_ = nullptr;
+    int pad_ = 4, side_ = 12, checkW_ = 26;
+    int hover_ = -1, chosen_ = -1;
+    bool closed_ = false;
+};
+
+// The strip with the menu titles (File, Settings, ...). Fires onCommand(id, checked) for a chosen item.
+class MenuStrip : public wxControl {
+public:
+    std::function<void(int)> onOpen;                    // a menu is about to open: refresh its items
+    std::function<void(int, bool)> onCommand;           // item id, new checked state (check items)
+
+    MenuStrip(wxWindow* parent, const Theme& t)
+        : wxControl(parent, wxID_ANY, wxDefaultPosition, wxSize(-1, 34), wxBORDER_NONE), t_(t)
+    {
+        SetBackgroundStyle(wxBG_STYLE_PAINT);
+        SetMinSize(wxSize(-1, 34));
+        Bind(wxEVT_PAINT, &MenuStrip::OnPaint, this);
+        Bind(wxEVT_MOTION, [this](wxMouseEvent& e) {
+            const int h = HitTest(e.GetPosition());
+            if (h != hover_) { hover_ = h; SetCursor(h >= 0 ? wxCursor(wxCURSOR_HAND) : wxNullCursor); Refresh(); }
+        });
+        Bind(wxEVT_LEAVE_WINDOW, [this](wxMouseEvent&) { hover_ = -1; Refresh(); });
+        // While a menu is open the popup holds the mouse grab, so the strip gets no mouse events.
+        // Poll the pointer instead: hovering another title slides over to that menu.
+        pollTimer_.SetOwner(this);
+        Bind(wxEVT_TIMER, [this](wxTimerEvent&) {
+            if (open_ < 0) { pollTimer_.Stop(); return; }
+            const wxPoint pos = wxGetMousePosition();
+            if (pos == lastMouse_) return;      // only a real pointer move counts (keyboard switching must stick)
+            lastMouse_ = pos;
+            const int h = HitTest(ScreenToClient(pos));
+            if (h >= 0 && h != open_) OpenMenu(h);
+        });
+        Bind(wxEVT_LEFT_DOWN, [this](wxMouseEvent& e) {
+            const int h = HitTest(e.GetPosition());
+            if (h < 0) return;
+            // the click that just closed this menu (click outside the popup) must not reopen it
+            const bool justClosed = h == closedIdx_ &&
+                std::chrono::steady_clock::now() - closedAt_ < std::chrono::milliseconds(250);
+            closedIdx_ = -1;
+            if (open_ == h) { DetachPopup(); return; }
+            if (justClosed) return;
+            OpenMenu(h);
+        });
+    }
+
+    ~MenuStrip() override { pollTimer_.Stop(); if (popup_) popup_->onClosed = nullptr; }
+
+    int AddMenu(const wxString& title, std::vector<MenuItemDef> items)
+    {
+        menus_.push_back({ title, std::move(items) });
+        Refresh();
+        return (int)menus_.size() - 1;
+    }
+
+    MenuItemDef* Item(int id)
+    {
+        for (auto& m : menus_)
+            for (auto& it : m.items)
+                if (!it.separator && it.id == id) return &it;
+        return nullptr;
+    }
+
+    void OpenMenu(int idx)
+    {
+        if (idx < 0 || idx >= (int)menus_.size()) return;
+        DetachPopup();
+        if (onOpen) onOpen(idx);
+
+        auto* p = new MenuPopup(this, t_, menus_[(size_t)idx].items);
+        popup_ = p;
+        open_ = idx;
+        p->onClosed = [this, p, idx](int chosen) { PopupClosed(p, idx, chosen); };
+        p->onSwitch = [this](int dir) {
+            const int n = (int)menus_.size();
+            if (n > 0 && open_ >= 0) { const int next = (open_ + dir + n) % n; CallAfter([this, next] { OpenMenu(next); }); }
+        };
+        p->Position(ClientToScreen(wxPoint(TitleX(idx), GetClientSize().y - 1)), wxSize(0, 0));
+        p->Popup(p->FocusTarget());
+        lastMouse_ = wxGetMousePosition();
+        pollTimer_.Start(60);
+        Refresh();
+    }
+
+private:
+    static constexpr int kPad = 14;
+
+    int TitleW(size_t i) const { return GetTextExtent(menus_[i].title).x + 2 * FromDIP(kPad); }
+
+    int TitleX(int idx) const
+    {
+        int x = FromDIP(6);
+        for (int i = 0; i < idx; ++i) x += TitleW((size_t)i);
+        return x;
+    }
+
+    int HitTest(const wxPoint& p) const
+    {
+        if (p.y < 0 || p.y >= GetClientSize().y) return -1;
+        int x = FromDIP(6);
+        for (size_t i = 0; i < menus_.size(); ++i) {
+            const int w = TitleW(i);
+            if (p.x >= x && p.x < x + w) return (int)i;
+            x += w;
+        }
+        return -1;
+    }
+
+    // Close the open menu without choosing anything (used when switching or toggling).
+    void DetachPopup()
+    {
+        if (!popup_) return;
+        MenuPopup* p = popup_;
+        popup_ = nullptr;
+        open_ = -1;
+        p->onClosed = nullptr;
+        p->CloseMenu();
+        CallAfter([p] { p->Destroy(); });
+        Refresh();
+    }
+
+    void PopupClosed(MenuPopup* p, int idx, int chosen)
+    {
+        if (p == popup_) popup_ = nullptr;
+        open_ = -1;
+        closedIdx_ = idx;
+        closedAt_ = std::chrono::steady_clock::now();
+        Refresh();
+        CallAfter([p] { p->Destroy(); });
+
+        if (chosen < 0 || idx < 0 || idx >= (int)menus_.size()) return;
+        auto& items = menus_[(size_t)idx].items;
+        if (chosen >= (int)items.size()) return;
+        MenuItemDef& it = items[(size_t)chosen];
+        if (it.check) it.checked = !it.checked;
+        const int id = it.id;
+        const bool checked = it.checked;
+        // run the command after the popup is fully gone (it may close this window)
+        CallAfter([this, id, checked] { if (onCommand) onCommand(id, checked); });
+    }
+
+    void OnPaint(wxPaintEvent&)
+    {
+        wxAutoBufferedPaintDC pdc(this);
+        pdc.SetBackground(wxBrush(t_.page));
+        pdc.Clear();
+        wxGCDC dc(pdc);
+        dc.SetFont(GetFont());
+        const wxSize s = GetClientSize();
+
+        dc.SetPen(wxPen(t_.border, 1));
+        dc.DrawLine(0, s.y - 1, s.x, s.y - 1);
+
+        int x = FromDIP(6);
+        for (size_t i = 0; i < menus_.size(); ++i) {
+            const int w = TitleW(i);
+            const bool active = (int)i == open_;
+            const bool hot = (int)i == hover_;
+            if (active || hot) {
+                dc.SetPen(*wxTRANSPARENT_PEN);
+                dc.SetBrush(wxBrush(active ? t_.track : MixColour(t_.page, t_.track, 70)));
+                dc.DrawRoundedRectangle(x + 1, 4, w - 2, s.y - 9, 6);
+            }
+            dc.SetTextForeground(active || hot ? t_.text : t_.sub);
+            const wxSize te = dc.GetTextExtent(menus_[i].title);
+            dc.DrawText(menus_[i].title, x + (w - te.x) / 2, (s.y - 1 - te.y) / 2);
+            x += w;
+        }
+    }
+
+    Theme t_;
+    std::vector<MenuDef> menus_;
+    MenuPopup* popup_ = nullptr;
+    int open_ = -1, hover_ = -1, closedIdx_ = -1;
+    std::chrono::steady_clock::time_point closedAt_{};
+    wxTimer pollTimer_;
+    wxPoint lastMouse_;
+};
+
+// ============================================================================
 // Main window
 // ============================================================================
 class MainFrame : public wxFrame {
@@ -1412,6 +1787,10 @@ public:
         SetBackgroundColour(theme_.page);
         SetForegroundColour(theme_.text);
         auto* root = new wxBoxSizer(wxVERTICAL);
+
+        // ---- menu bar (custom drawn, filled in by BuildMenu)
+        menuBar_ = new MenuStrip(this, theme_);
+        root->Add(menuBar_, 0, wxEXPAND);
 
         // ---- header: host name, addresses, key
         {
@@ -1503,7 +1882,7 @@ public:
 private:
     static constexpr int kTimerId     = 9000;
     static constexpr int kAnimTimerId = 9001;
-    enum { kIdAutostart = 9100, kIdSvcInfo, kIdToggleSvc, kIdQuitAll };
+    enum { kIdAutostart = 9100, kIdSvcInfo, kIdToggleSvc, kIdQuitAll, kIdOpenFileMenu, kIdOpenSettingsMenu };
 
     struct Entry { wxString name; std::string ip; wxString status; };
     struct Discovered {
@@ -1599,47 +1978,72 @@ private:
     }
 
     // ------------------------------------------------------------ settings menu
+    // The menus are drawn by MenuStrip (not a native wxMenuBar) so they look the same on every OS.
     void BuildMenu()
     {
-        auto* mb = new wxMenuBar;
-        auto* file = new wxMenu;
-        file->Append(wxID_CLOSE, "Close window\tCtrl+W");
-        file->Append(kIdQuitAll, "Quit and stop the background service");
-        mb->Append(file, "&File");
-
-        auto* set = new wxMenu;
-#if defined(__WXMSW__)
-        autoItem_ = set->AppendCheckItem(kIdAutostart, "Start the background service with Windows");
+#if defined(__WXOSX__)
+        const wxString closeKey = "Cmd+W";
 #else
-        autoItem_ = set->AppendCheckItem(kIdAutostart, "Start the background daemon at login");
+        const wxString closeKey = "Ctrl+W";
 #endif
-        set->AppendSeparator();
-        svcInfo_ = set->Append(kIdSvcInfo, "Background service: ...");
-        svcInfo_->Enable(false);
-        toggleItem_ = set->Append(kIdToggleSvc, "Stop background service now");
-        mb->Append(set, "&Settings");
-        SetMenuBar(mb);
+        auto item = [](int id, const wxString& label) { MenuItemDef d; d.id = id; d.label = label; return d; };
+        auto sep = [] { MenuItemDef d; d.separator = true; return d; };
+
+        MenuItemDef close = item(wxID_CLOSE, "Close window");
+        close.accel = closeKey;
+        menuBar_->AddMenu("File", { close, item(kIdQuitAll, "Quit and stop the background service") });
+
+#if defined(__WXMSW__)
+        MenuItemDef autostart = item(kIdAutostart, "Start the background service with Windows");
+#else
+        MenuItemDef autostart = item(kIdAutostart, "Start the background daemon at login");
+#endif
+        autostart.check = true;
+        MenuItemDef info = item(kIdSvcInfo, "Background service: ...");
+        info.enabled = false;
+        menuBar_->AddMenu("Settings", { autostart, sep(), info, item(kIdToggleSvc, "Stop background service now") });
+
+        menuBar_->onOpen = [this](int) { RefreshServiceMenu(); };
+        menuBar_->onCommand = [this](int id, bool checked) {
+            wxCommandEvent ev(wxEVT_MENU, id);
+            ev.SetEventObject(menuBar_);
+            ev.SetInt(checked ? 1 : 0);
+            ProcessWindowEvent(ev);
+        };
 
         Bind(wxEVT_MENU, [this](wxCommandEvent&) { Close(); }, wxID_CLOSE);
         Bind(wxEVT_MENU, [this](wxCommandEvent&) { QuitAll(); }, kIdQuitAll);
         Bind(wxEVT_MENU, &MainFrame::OnAutostart, this, kIdAutostart);
         Bind(wxEVT_MENU, [this](wxCommandEvent&) { ToggleService(); }, kIdToggleSvc);
-        Bind(wxEVT_MENU_OPEN, [this](wxMenuEvent&) { RefreshServiceMenu(); });
+        Bind(wxEVT_MENU, [this](wxCommandEvent&) { menuBar_->OpenMenu(0); }, kIdOpenFileMenu);
+        Bind(wxEVT_MENU, [this](wxCommandEvent&) { menuBar_->OpenMenu(1); }, kIdOpenSettingsMenu);
+
+        // keyboard shortcuts (a native menu bar used to provide these)
+        std::vector<wxAcceleratorEntry> keys;
+        keys.emplace_back(wxACCEL_CTRL, (int)'W', wxID_CLOSE);
+#if !defined(__WXOSX__)
+        keys.emplace_back(wxACCEL_ALT, (int)'F', kIdOpenFileMenu);
+        keys.emplace_back(wxACCEL_ALT, (int)'S', kIdOpenSettingsMenu);
+#endif
+        SetAcceleratorTable(wxAcceleratorTable((int)keys.size(), keys.data()));
     }
 
     void RefreshServiceMenu()
     {
+        if (!menuBar_) return;
         const svc::AutostartInfo a = svc::QueryAutostart();
-        autoItem_->Check(a.enabled);
-        autoItem_->Enable(a.supported && !busy_);
+        if (MenuItemDef* m = menuBar_->Item(kIdAutostart)) {
+            m->checked = a.enabled;
+            m->enabled = a.supported && !busy_;
+        }
         wxString st = connected_ ? "running" : daemonWanted_ ? "not reachable" : "stopped";
-        svcInfo_->SetItemLabel("Background service: " + st + "  (" + wxString::FromUTF8(a.kind) +
-                               (a.enabled ? ", autostart on)" : ", autostart off)"));
-        toggleItem_->SetItemLabel(daemonWanted_ ? "Stop background service now" : "Start background service now");
+        if (MenuItemDef* m = menuBar_->Item(kIdSvcInfo))
+            m->label = "Background service: " + st + "  (" + wxString::FromUTF8(a.kind) +
+                       (a.enabled ? ", autostart on)" : ", autostart off)");
+        if (MenuItemDef* m = menuBar_->Item(kIdToggleSvc))
+            m->label = daemonWanted_ ? "Stop background service now" : "Start background service now";
     }
 
-    // Turning autostart on/off may show an administrator prompt (Windows) and restarts the daemon
-    // under its new owner (systemd / the service), so it runs on a worker thread.
     void OnAutostart(wxCommandEvent& e)
     {
         if (busy_) return;
@@ -2530,9 +2934,7 @@ private:
     std::map<int, std::chrono::steady_clock::time_point> lastMove_, lastAudio_;
     std::chrono::steady_clock::time_point masterSent_;
     wxStaticText* hdrSub_ = nullptr;
-    wxMenuItem* autoItem_ = nullptr;
-    wxMenuItem* svcInfo_ = nullptr;
-    wxMenuItem* toggleItem_ = nullptr;
+    MenuStrip* menuBar_ = nullptr;
 
     std::vector<LocalAddress> local_;
     std::vector<wxRect> localMons_;
