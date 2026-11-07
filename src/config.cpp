@@ -58,7 +58,6 @@ fs::path ConfigStore::PathFor(const std::vector<std::string>& members) const
 //   audio.source 0|1               (legacy, read only: which source the old "send" meant)
 //   audio.mute 0|1                 (master)
 //   audio.volume 0..100            (master)
-//   input.enabled 0|1
 //   peer <public key> <ox> <oy> <name...>
 //   peeraudio <public key> <send 0|1> <mute 0|1> <volume 0..100> [<mic 0|1>]
 //                     send = share my (system) audio, mic = share my microphone
@@ -80,7 +79,6 @@ bool ConfigStore::Save(const SavedConfig& in, std::string* err) const
         for (const auto& m : cfg.members) out << "member " << m << "\n";
         out << "audio.mute " << (cfg.audio.mute ? 1 : 0) << "\n";
         out << "audio.volume " << cfg.audio.volume << "\n";
-        out << "input.enabled " << (cfg.inputEnabled ? 1 : 0) << "\n";
         for (const auto& p : cfg.peers)
             if (p.hasPos) out << "peer " << p.key << " " << std::llround(p.ox) << " " << std::llround(p.oy)
                 << " " << p.name << "\n";
@@ -118,7 +116,6 @@ bool ConfigStore::Load(const std::vector<std::string>& wanted, SavedConfig& out)
         else if (k == "audio.source")  { int v = 0; is >> v; cfg.audio.source = v == 1 ? 1 : 0; }
         else if (k == "audio.mute")    { int v = 0; is >> v; cfg.audio.mute = v != 0; }
         else if (k == "audio.volume")  { int v = 100; is >> v; cfg.audio.volume = std::clamp(v, 0, 100); }
-        else if (k == "input.enabled") { int v = 1; is >> v; cfg.inputEnabled = v != 0; }
         else if (k == "peer") {
             SavedPeer p;
             double x = 0, y = 0;
@@ -185,14 +182,6 @@ TrustStore::State TrustStore::Get(const std::string& key) const
 {
     auto it = entries_.find(key);
     return it == entries_.end() ? State::Unknown : it->second.state;
-}
-
-std::vector<std::pair<std::string, std::string>> TrustStore::AllowedList() const
-{
-    std::vector<std::pair<std::string, std::string>> out;
-    for (const auto& kv : entries_)
-        if (kv.second.state == State::Allowed) out.emplace_back(kv.first, kv.second.name);
-    return out;
 }
 
 bool TrustStore::Set(const std::string& key, State s, const std::string& name, std::string* err)

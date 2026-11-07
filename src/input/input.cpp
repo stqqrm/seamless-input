@@ -65,8 +65,9 @@ struct InputEngine::Impl {
         int bx = 0, by = 0;            // top-left of the peer's bounding box
         double ox = 0, oy = 0;
         bool placed = false;
-        bool allowed = false;
-        bool requested = false;
+        bool allowed = false;          // it may control this PC
+        bool accepts = false;          // it said (CTRL 1) that this PC may control it
+        bool warned = false;           // already logged that it does not allow remote control
     };
     struct Crossing { int peer = -1; int x = 0, y = 0; };
     struct Out { int peer = 0; InputEvent ev; std::string raw; bool isRaw = false; };
@@ -79,7 +80,6 @@ struct InputEngine::Impl {
     std::unique_ptr<InputBackend> be;
 
     std::mutex mu;
-    bool enabled = true;
     bool started = false;
     Mode mode = Mode::Local;
     int peerId = -1;
@@ -148,7 +148,7 @@ struct InputEngine::Impl {
         std::unique_lock<std::mutex> lk(qmu);
         for (;;) {
             qcv.wait(lk, [this] { return qstop || !q.empty(); });
-            if (qstop) break;
+            if (q.empty()) break;               // qstop and nothing left; queued lines (RELEASE/DENY) are still sent
             std::deque<Out> batch;
             batch.swap(q);
             lk.unlock();
@@ -164,8 +164,9 @@ struct InputEngine::Impl {
     // wants to leave in direction (dx, dy). Finds the monitor beyond that edge among all peers
     // (onlyPeer >= 0 restricts to one, excludePeer skips one) and optionally this PC's own
     // monitors (reported as peer -1). out.x/out.y are in the TARGET's desktop coordinates.
+    // forControl: only peers that accept control from this PC are candidates.
     bool FindCrossingWorld(int wx, int wy, int dx, int dy, int onlyPeer, int excludePeer,
-                           bool includeLocal, Crossing& out) const
+                           bool forControl, Crossing& out) const
     {
         int bestGap = INT_MAX;
         auto consider = [&](int pid, int rx, int ry, int rw, int rh, int toX, int toY) {
@@ -200,24 +201,24 @@ struct InputEngine::Impl {
 
         for (const auto& kv : peers) {
             const Peer& P = kv.second;
-            if (!P.placed || (onlyPeer >= 0 && kv.first != onlyPeer) || kv.first == excludePeer) continue;
+            if (!P.placed || (forControl && !P.accepts) || (onlyPeer >= 0 && kv.first != onlyPeer) ||
+                kv.first == excludePeer) continue;
             const int pox = (int)std::lround(P.ox), poy = (int)std::lround(P.oy);
             for (const auto& m : P.mons)
                 consider(kv.first, pox + m.x - P.bx, poy + m.y - P.by, m.w, m.h, P.bx - pox, P.by - poy);
         }
-        if (includeLocal)
-            for (const auto& m : mons) consider(-1, m.x - lbx, m.y - lby, m.w, m.h, lbx, lby);
         return bestGap != INT_MAX;
     }
 
     // The cursor of this PC is at (px, py) and wants to leave in direction (dx, dy).
     // Finds the peer monitor that lies beyond that edge. onlyPeer >= 0 restricts
-    // the search to one peer (used for "give control back").
-    bool FindCrossing(int px, int py, int dx, int dy, int onlyPeer, Crossing& out) const
+    // the search to one peer (used for "give control back"). forControl: skip peers that do
+    // not let this PC control them.
+    bool FindCrossing(int px, int py, int dx, int dy, int onlyPeer, bool forControl, Crossing& out) const
     {
         if (!inputgeom::InsideAny(mons, px, py)) return false;
         if (inputgeom::InsideAny(mons, px + dx, py + dy)) return false;   // not an outer edge
-        return FindCrossingWorld(px - lbx, py - lby, dx, dy, onlyPeer, -1, false, out);
+        return FindCrossingWorld(px - lbx, py - lby, dx, dy, onlyPeer, -1, forControl, out);
     }
 
     void Notify() { if (self->onModeChange) self->onModeChange(mode, peerId); }
@@ -226,14 +227,14 @@ struct InputEngine::Impl {
     void OnLocalMotion(int x, int y, bool buttonsDown)
     {
         std::lock_guard<std::mutex> lk(mu);
-        if (!enabled || !started || mode != Mode::Local || buttonsDown || peers.empty()) return;
+        if (!started || mode != Mode::Local || buttonsDown || peers.empty()) return;
         const auto now = Clock::now();
         if (now - lastSwitch < kCooldown) return;
 
         static const int dirs[4][2] = {{1, 0}, {-1, 0}, {0, 1}, {0, -1}};
         for (const auto& d : dirs) {
             Crossing c;
-            if (!FindCrossing(x, y, d[0], d[1], -1, c)) continue;
+            if (!FindCrossing(x, y, d[0], d[1], -1, true, c)) continue;
 
             int parkX = x, parkY = y;
             inputgeom::MonitorCenter(mons, x, y, parkX, parkY);
@@ -255,6 +256,18 @@ struct InputEngine::Impl {
             vy = c.y;
             PushRaw(c.peer, "ENTER " + std::to_string(c.x) + " " + std::to_string(c.y));
             Notify();
+            return;
+        }
+
+        // Nothing to cross to. If the cursor is pushing against the edge of a PC that does not allow
+        // remote control, say so once (otherwise nothing visible happens at all).
+        for (const auto& d : dirs) {
+            Crossing c;
+            if (!FindCrossing(x, y, d[0], d[1], -1, false, c)) continue;
+            auto it = peers.find(c.peer);
+            if (it == peers.end() || it->second.accepts || it->second.warned) continue;
+            it->second.warned = true;
+            log("The PC at this edge does not allow remote control (turn on \"Allow remote control\" for this PC there)");
             return;
         }
     }
@@ -294,9 +307,9 @@ struct InputEngine::Impl {
         const int wx = (int)std::lround(P.ox) + px - P.bx;      // the last pixel inside, in our world
         const int wy = (int)std::lround(P.oy) + py - P.by;
         Crossing c;
-        const bool found = (sx && FindCrossingWorld(wx, wy, sx, 0, -1, peerId, false, c)) ||
-                           (sy && FindCrossingWorld(wx, wy, 0, sy, -1, peerId, false, c));
-        if (!found || c.peer < 0 || c.peer == peerId) return;
+        const bool found = (sx && FindCrossingWorld(wx, wy, sx, 0, -1, peerId, true, c)) ||
+                           (sy && FindCrossingWorld(wx, wy, 0, sy, -1, peerId, true, c));
+        if (!found) return;
 
         const int from = peerId;
         PushRaw(from, "RELEASE");
@@ -381,8 +394,8 @@ struct InputEngine::Impl {
         const int sy = ny < py ? -1 : (ny > py ? 1 : 0);
 
         Crossing c;
-        const bool back = (sx && FindCrossing(px, py, sx, 0, peerId, c)) ||
-                          (sy && FindCrossing(px, py, 0, sy, peerId, c));
+        const bool back = (sx && FindCrossing(px, py, sx, 0, peerId, false, c)) ||
+                          (sy && FindCrossing(px, py, 0, sy, peerId, false, c));
         if (!back) {
             cx = px; cy = py;
             be->InjectMoveTo(cx, cy);
@@ -493,13 +506,6 @@ std::string InputEngine::BackendName() const
     return d_->be ? d_->be->Name() : std::string("none");
 }
 
-void InputEngine::SetEnabled(bool on)
-{
-    std::lock_guard<std::mutex> lk(d_->mu);
-    d_->enabled = on;
-    if (!on && d_->be) d_->StopForwardingLocked(true, -1, -1);   // being controlled is unaffected
-}
-
 void InputEngine::SetPeer(int id, const std::vector<InputRect>& mons, double ox, double oy)
 {
     std::lock_guard<std::mutex> lk(d_->mu);
@@ -528,9 +534,20 @@ void InputEngine::SetPeerAllowed(int id, bool allowed)
     auto it = d_->peers.find(id);
     if (it == d_->peers.end()) return;
     it->second.allowed = allowed;
-    it->second.requested = false;
     if (!allowed && d_->be && d_->mode == Mode::Controlled && d_->peerId == id)
         d_->StopControlledLocked(true);
+}
+
+void InputEngine::SetPeerAccepts(int id, bool accepts)
+{
+    std::lock_guard<std::mutex> lk(d_->mu);
+    auto it = d_->peers.find(id);
+    if (it == d_->peers.end()) return;
+    it->second.accepts = accepts;
+    it->second.warned = false;
+    // It withdrew its permission while we are driving it: hand the keyboard/mouse back at once.
+    if (!accepts && d_->be && d_->mode == Mode::Forwarding && d_->peerId == id)
+        d_->StopForwardingLocked(false, -1, -1);
 }
 
 void InputEngine::RemovePeer(int id)
@@ -558,32 +575,23 @@ bool InputEngine::HandleMessage(int id, const std::string& line)
 
     if (line.rfind("ENTER ", 0) == 0) {
         if (std::sscanf(s + 6, "%d %d", &a, &b) != 2) return true;
-        bool ask = false;
-        {
-            std::lock_guard<std::mutex> lk(d_->mu);
-            auto it = d_->peers.find(id);
-            const bool known = it != d_->peers.end() && it->second.placed;
-            // 'enabled' (the master switch) only governs OUR cursor leaving this PC; who may
-            // control this PC is decided per device by 'allowed'.
-            const bool ok = d_->started && known && it->second.allowed && d_->mode == Mode::Local;
-            if (!ok) {
-                if (d_->started && known && !it->second.allowed && !it->second.requested) {
-                    it->second.requested = true;
-                    ask = true;
-                }
-                d_->PushRaw(id, "DENY");
-            } else {
-                d_->cx = a;
-                d_->cy = b;
-                inputgeom::ClampToAny(d_->mons, d_->cx, d_->cy);
-                d_->mode = Mode::Controlled;
-                d_->peerId = id;
-                d_->lastSwitch = Clock::now();
-                d_->be->InjectMoveTo(d_->cx, d_->cy);
-                d_->Notify();
-            }
+        std::lock_guard<std::mutex> lk(d_->mu);
+        auto it = d_->peers.find(id);
+        // Who may control this PC is decided per device by 'allowed'; nobody is asked.
+        const bool ok = d_->started && it != d_->peers.end() && it->second.placed && it->second.allowed &&
+                        d_->mode == Mode::Local;
+        if (!ok) {
+            d_->PushRaw(id, "DENY");
+            return true;
         }
-        if (ask && onControlRequest) onControlRequest(id);
+        d_->cx = a;
+        d_->cy = b;
+        inputgeom::ClampToAny(d_->mons, d_->cx, d_->cy);
+        d_->mode = Mode::Controlled;
+        d_->peerId = id;
+        d_->lastSwitch = Clock::now();
+        d_->be->InjectMoveTo(d_->cx, d_->cy);
+        d_->Notify();
         return true;
     }
 
@@ -611,8 +619,10 @@ bool InputEngine::HandleMessage(int id, const std::string& line)
 
     if (line == "DENY") {
         std::lock_guard<std::mutex> lk(d_->mu);
+        auto it = d_->peers.find(id);
+        if (it != d_->peers.end()) { it->second.accepts = false; it->second.warned = true; }   // no retry until CTRL 1
         if (d_->mode == Mode::Forwarding && d_->peerId == id) {
-            d_->log("The other PC refused input control (it has to allow this PC first)");
+            d_->log("The other PC does not allow remote control (enable \"Allow remote control\" for this PC there)");
             d_->StopForwardingLocked(false, -1, -1);
         }
         return true;

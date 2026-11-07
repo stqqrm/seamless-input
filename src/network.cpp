@@ -27,19 +27,15 @@ using boost::system::error_code;
 namespace {
 
 struct SessionEvents {
-    // (session id, peer instance, peer public key, peer name, peer address, incoming, viaGroup)
+    // (session id, peer instance, peer public key, peer name, peer address, incoming)
     // returns false to reject the session
     std::function<bool(int, std::uint32_t, const std::string&, const std::string&,
-                       const std::string&, bool, bool)> ready;
-    // authenticated but not accepted (yet); (..., theyTrustMe)
-    std::function<void(int, std::uint32_t, const std::string&, const std::string&,
-                       const std::string&, bool, bool)> pending;
+                       const std::string&, bool)> ready;
     // key proven: returns false when another session to the same peer wins (this one is dropped)
     std::function<bool(int, std::uint32_t, const std::string&, bool)> authed;
     std::function<void(int, const std::string&)> line;
-    std::function<void(int, bool wasReady, bool wasPending)> closed;
+    std::function<void(int, bool wasReady)> closed;
     std::function<std::string()> groupSecret;               // empty: no group
-    std::function<bool(const std::string&)> trusted;        // do WE trust this key?
 };
 
 // One TCP connection, line based protocol:
@@ -49,10 +45,7 @@ struct SessionEvents {
 //                             sign("si-auth-v1|<my key>|<your key>|<your nonce>")
 //                             group proof = H(group secret, my key, your key, your nonce): shows
 //                             we know the same group password without revealing it
-//   TRUST <0|1> <signature hex>   "I (do not) trust you", signed with the key and bound to
-//                             both nonces, so it cannot be replayed into another session
-//   (a peer is ACCEPTED when its group proof matches, or when both sides sent TRUST 1;
-//    only accepted peers get:)
+//   (a peer is ACCEPTED when its group proof matches; only accepted peers get:)
 //   SCREENS ..., POS ..., and the input protocol (see input.hpp)
 class Session : public std::enable_shared_from_this<Session> {
 public:
@@ -79,18 +72,8 @@ public:
     bool Closed() const { return closed_; }
     const std::string& PeerKey() const { return peerKey_; }
     std::uint32_t PeerInstance() const { return peerInst_; }
-    bool Incoming() const { return incoming_; }
-    bool Ready() const { return ready_; }
     // The one who opened the TCP connection (identical on both ends)
     std::uint32_t Initiator(std::uint32_t myInst) const { return incoming_ ? peerInst_ : myInst; }
-
-    // our trust list or the group changed
-    void OnPolicyChanged()
-    {
-        if (!Authed()) return;
-        SendTrust();
-        Evaluate();
-    }
 
     void Send(const std::string& line)
     {
@@ -109,7 +92,7 @@ public:
         sock_.shutdown(tcp::socket::shutdown_both, ec);
         sock_.close(ec);
         auto self = shared_from_this();
-        asio::post(sock_.get_executor(), [self] { self->ev_.closed(self->id_, self->ready_, self->authed_ && !self->ready_); });
+        asio::post(sock_.get_executor(), [self] { self->ev_.closed(self->id_, self->ready_); });
     }
 
 private:
@@ -177,63 +160,22 @@ private:
                                  verifierNonce, 16);
     }
 
-    static std::string TrustMsg(const std::string& signerKey, const std::string& verifierKey,
-                                const std::string& signerNonce, const std::string& verifierNonce, bool v)
-    {
-        return "si-trust-v1|" + signerKey + "|" + verifierKey + "|" + signerNonce + "|" + verifierNonce +
-               "|" + (v ? "1" : "0");
-    }
-
-    void SendTrust()
-    {
-        const bool t = ev_.trusted(peerKey_);
-        if (t == sentTrust_ && sentOnce_) return;
-        if (!t && !sentOnce_) { sentTrust_ = false; return; }   // nothing to retract
-        sentTrust_ = t;
-        sentOnce_ = true;
-        Send(std::string("TRUST ") + (t ? "1 " : "0 ") +
-             ident_.Sign(TrustMsg(ident_.PublicHex(), peerKey_, myNonce_, peerNonce_, t)));
-    }
-
-    void HandleTrust(const std::string& rest)
-    {
-        std::istringstream is(rest);
-        int v = -1;
-        std::string sig;
-        if (!(is >> v >> sig) || (v != 0 && v != 1)) return;
-        if (!Identity::Verify(peerKey_, TrustMsg(peerKey_, ident_.PublicHex(), peerNonce_, myNonce_, v == 1), sig))
-            return;                                 // not signed by that peer for this session
-        theyTrust_ = v == 1;
-        Evaluate();
-    }
-
-    // Decide what this session may do: accepted -> normal peer; otherwise it waits.
+    // Accepted only with the same group password; anything else is closed. A parked half-open
+    // link would count as "already connected" and block the real connection once both PCs use
+    // the same password.
     void Evaluate()
     {
-        if (!authed_ || closed_) return;
-        const bool accepted = groupOk_ || (theyTrust_ && ev_.trusted(peerKey_));
-        if (accepted) {
-            if (!ready_) {
-                if (!ev_.ready(id_, peerInst_, peerKey_, peerName_, addr_, incoming_, groupOk_)) { Close(); return; }
-                ready_ = true;
-            }
-        } else if (ready_) {
-            Close();                                // trust withdrawn / group changed
-        } else if (ev_.trusted(peerKey_)) {
-            ev_.pending(id_, peerInst_, peerKey_, peerName_, addr_, incoming_, theyTrust_);
-        } else {
-            // Different password: close it. A parked half-open link would count as "already
-            // connected" and block the real connection once both PCs use the same password.
-            Close();
-        }
+        if (!authed_ || closed_ || ready_) return;
+        if (!groupOk_) { Close(); return; }
+        if (!ev_.ready(id_, peerInst_, peerKey_, peerName_, addr_, incoming_)) { Close(); return; }
+        ready_ = true;
     }
 
     void Handle(const std::string& l)
     {
         if (l == "PING") return;                    // liveness only; receiving it is what counts
         if (authed_) {
-            if (l.rfind("TRUST ", 0) == 0) { HandleTrust(l.substr(6)); return; }
-            if (ready_) ev_.line(id_, l);           // pending peers may only talk about trust
+            if (ready_) ev_.line(id_, l);
             return;
         }
 
@@ -272,7 +214,6 @@ private:
                    proof == GroupProof(secret, peerKey_, ident_.PublicHex(), myNonce_);
         authed_ = true;
         if (!ev_.authed(id_, peerInst_, peerKey_, incoming_)) { Close(); return; }
-        SendTrust();
         Evaluate();
     }
 
@@ -292,8 +233,6 @@ private:
     std::string addr_;
     bool authed_ = false;       // peer proved its key
     bool groupOk_ = false;      // peer knows our group password
-    bool theyTrust_ = false;    // peer sent a valid signed "TRUST 1"
-    bool sentTrust_ = false, sentOnce_ = false;
     bool ready_  = false;       // accepted: carries input / audio
     bool closed_ = false;
     std::chrono::steady_clock::time_point lastRx_;
@@ -326,7 +265,6 @@ struct Network::Impl {
     std::map<std::uint32_t, std::chrono::steady_clock::time_point> lastTry;
 
     std::string groupSecret;                            // derived from the group password; empty = none
-    std::set<std::string> trusted;                      // public keys WE trust
 
     int nextId = 1;
     bool serverRunning = false;
@@ -454,15 +392,11 @@ struct Network::Impl {
         const int id = nextId++;
         SessionEvents ev;
         ev.ready = [this](int i, std::uint32_t inst, const std::string& key, const std::string& name,
-                          const std::string& addr, bool inc, bool viaGroup) -> bool {
+                          const std::string& addr, bool inc) -> bool {
             if (stopping) return false;
             byInstance[inst] = i;
-            if (cb.onPeerReady) cb.onPeerReady(i, inst, key, name, addr, inc, viaGroup);
+            if (cb.onPeerReady) cb.onPeerReady(i, inst, key, name, addr, inc);
             return true;
-        };
-        ev.pending = [this](int i, std::uint32_t inst, const std::string& key, const std::string& name,
-                            const std::string& addr, bool inc, bool theyTrust) {
-            if (!stopping && cb.onPeerPending) cb.onPeerPending(i, inst, key, name, addr, inc, theyTrust);
         };
         ev.authed = [this](int i, std::uint32_t inst, const std::string& key, bool inc) {
             return OnAuthed(i, inst, key, inc);
@@ -470,17 +404,15 @@ struct Network::Impl {
         ev.line = [this](int i, const std::string& l) {
             if (!stopping && cb.onMessage) cb.onMessage(i, l);
         };
-        ev.closed = [this](int i, bool wasReady, bool wasPending) {
+        ev.closed = [this](int i, bool wasReady) {
             sessions.erase(i);
             for (auto it = byInstance.begin(); it != byInstance.end();) {
                 if (it->second == i) it = byInstance.erase(it); else ++it;
             }
             if (stopping) return;
             if (wasReady && cb.onPeerLost) cb.onPeerLost(i);
-            if (wasPending && cb.onPeerPendingLost) cb.onPeerPendingLost(i);
         };
         ev.groupSecret = [this] { return groupSecret; };
-        ev.trusted = [this](const std::string& k) { return trusted.count(k) > 0; };
         auto session = std::make_shared<Session>(std::move(s), id, incoming, instance, host, ident, std::move(ev));
         sessions[id] = session;
         session->Start();
@@ -537,14 +469,11 @@ struct Network::Impl {
     }
 
     // A seamless-input instance announced itself. We connect to it when it is in our group
-    // (the LOWER instance id connects, so each pair gets one connection) or when we trust its key
-    // (then we always connect: it may not trust us yet and would never come to us).
+    // (the LOWER instance id connects, so each pair gets one connection).
     void OnPeerBeacon(const BeaconInfo& b)
     {
         if (knownInst.insert(b.instance).second) SendBeaconTo(b.ip);   // new peer: answer directly
-        const bool trustedPeer = trusted.count(b.key) > 0;
-        if (!b.server || !(b.sameGroup || trustedPeer)) return;
-        if (!trustedPeer && instance > b.instance) return;
+        if (!b.server || !b.sameGroup || instance > b.instance) return;
         if (HasSessionFor(b.instance) || connectingInst.count(b.instance)) return;
 
         auto now = std::chrono::steady_clock::now();
@@ -552,8 +481,7 @@ struct Network::Impl {
         if (it != lastTry.end() && now - it->second < std::chrono::seconds(3)) return;
         lastTry[b.instance] = now;
 
-        Status("Found seamless-input peer at " + b.ip + (b.sameGroup ? " (same group)" : " (trusted)") +
-               " - connecting");
+        Status("Found seamless-input peer at " + b.ip + " (same group) - connecting");
         Connect(b.ip, b.instance, false);
     }
 
@@ -567,16 +495,6 @@ struct Network::Impl {
         auto copy = sessions;             // links made under the old group are re-judged by reconnecting
         for (auto& kv : copy) kv.second->Close();
         SendBeacon();
-    }
-
-    void ApplyTrust(const std::string& key, bool on, const std::string& ip)
-    {
-        if (on) trusted.insert(key); else trusted.erase(key);
-        bool found = false;
-        auto copy = sessions;
-        for (auto& kv : copy)
-            if (kv.second->Authed() && kv.second->PeerKey() == key) { kv.second->OnPolicyChanged(); found = true; }
-        if (on && !found && !ip.empty()) Connect(ip, 0, true);
     }
 
     void DoReceive()
@@ -796,11 +714,6 @@ void Network::Select(const std::string& ip, bool isLocalAddress)
 void Network::SetGroup(const std::string& password)
 {
     asio::post(d_->io, [this, password] { d_->ApplyGroup(Identity::GroupSecret(password)); });
-}
-
-void Network::SetTrust(const std::string& key, bool trusted, const std::string& ip)
-{
-    asio::post(d_->io, [this, key, trusted, ip] { d_->ApplyTrust(key, trusted, ip); });
 }
 
 void Network::Send(int id, const std::string& line)
