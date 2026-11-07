@@ -138,6 +138,10 @@ private:
             c.CmdControl((int)I(1), I(2) != 0);
         } else if (cmd == "CLIPBOARD" && t.size() >= 3) {
             c.CmdClipboard((int)I(1), I(2) != 0);
+        } else if (cmd == "CLEARCACHE") {
+            c.CmdClearCache();
+        } else if (cmd == "REGENKEYS") {
+            c.CmdRegenKeys();
         } else if (cmd == "STOP") {
             c.CmdQuit();
         }

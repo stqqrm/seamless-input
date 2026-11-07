@@ -64,6 +64,8 @@ public:
     void CmdControl(int id, bool allow);                    // may this PC control ours?
     void CmdClipboard(int id, bool share);                  // send my clipboard to this PC when the cursor moves over to it
     void CmdMonitorsHint(const std::vector<InputRect>& mons);
+    void CmdClearCache();                                   // forget remembered permissions and the monitor cache
+    void CmdRegenKeys();                                    // new identity key pair, then restart the daemon
     void CmdQuit() { if (onQuit) onQuit(); }
 
 private:
@@ -83,7 +85,7 @@ private:
 
     // network events (already on the Core thread)
     void OnPeerReady(int id, std::uint32_t inst, const std::string& key, const std::string& name,
-                     const std::string& addr, bool incoming);
+                     const std::string& addr, bool incoming, const PeerAudioKeys& audioKeys);
     void OnPeerLost(int id);
     void OnMessage(int id, const std::string& line);
     void SendControlState(int id);      // tell a peer whether it may control this PC (CTRL line)

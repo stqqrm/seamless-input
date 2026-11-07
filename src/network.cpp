@@ -5,6 +5,8 @@
 #include <array>
 #include <atomic>
 #include <cctype>
+#include <cstdio>
+#include <cstring>
 #include <chrono>
 #include <cstdint>
 #include <deque>
@@ -16,8 +18,13 @@
 #include <utility>
 #include <vector>
 
+#include "clipboard.hpp"        // Base64 helpers
 #include "identity.hpp"
 #include "localinfo.hpp"
+
+extern "C" {
+#include "monocypher/monocypher.h"
+}
 
 namespace asio = boost::asio;
 using asio::ip::tcp;
@@ -30,7 +37,7 @@ struct SessionEvents {
     // (session id, peer instance, peer public key, peer name, peer address, incoming)
     // returns false to reject the session
     std::function<bool(int, std::uint32_t, const std::string&, const std::string&,
-                       const std::string&, bool)> ready;
+                       const std::string&, bool, const PeerAudioKeys&)> ready;
     // key proven: returns false when another session to the same peer wins (this one is dropped)
     std::function<bool(int, std::uint32_t, const std::string&, bool)> authed;
     std::function<void(int, const std::string&)> line;
@@ -47,12 +54,20 @@ struct SessionEvents {
 //                             we know the same group password without revealing it
 //   (a peer is ACCEPTED when its group proof matches; only accepted peers get:)
 //   SCREENS ..., POS ..., and the input protocol (see input.hpp)
+//
+// ENCRYPTION: HELLO and AUTH are the only plain lines. As soon as a peer is accepted, both ends derive two
+// keys (one per direction) from the static shared secret of the two identity keys
+// (X25519(my secret, their public)) mixed with both public keys, both fresh nonces from HELLO and the
+// group secret. Every later line travels as
+//     E <counter> <base64( mac(16) | XChaCha20-Poly1305 ciphertext )>
+// The counter is the nonce and must arrive strictly in order (replays / reordering close the link).
+// Anything that is not a valid E line after the handshake closes the link.
 class Session : public std::enable_shared_from_this<Session> {
 public:
     Session(tcp::socket sock, int id, bool incoming, std::uint32_t myInstance,
             std::string myName, const Identity& ident, SessionEvents ev)
         : sock_(std::move(sock)), id_(id), incoming_(incoming), myInstance_(myInstance),
-          myName_(std::move(myName)), ident_(ident), ev_(std::move(ev)), buf_(4096),
+          myName_(std::move(myName)), ident_(ident), ev_(std::move(ev)), buf_(16384),
           myNonce_(Identity::RandomHex(16)), hb_(sock_.get_executor()) {}
 
     void Start()
@@ -79,7 +94,7 @@ public:
     {
         if (closed_) return;
         const bool idle = out_.empty();
-        out_.push_back(line + "\n");
+        out_.push_back((txCrypt_ ? Encrypt(line) : line) + "\n");
         if (idle) DoWrite();
     }
 
@@ -120,7 +135,7 @@ private:
         auto self = shared_from_this();
         asio::async_read_until(sock_, buf_, '\n', [self](error_code ec, std::size_t) {
             if (ec) { self->Close(); return; }
-            self->lastRx_ = std::chrono::steady_clock::now();
+            if (!self->rxCrypt_) self->lastRx_ = std::chrono::steady_clock::now();   // encrypted: only after it authenticates
             std::istream is(&self->buf_);
             std::string l;
             std::getline(is, l);
@@ -167,12 +182,84 @@ private:
     {
         if (!authed_ || closed_ || ready_) return;
         if (!groupOk_) { Close(); return; }
-        if (!ev_.ready(id_, peerInst_, peerKey_, peerName_, addr_, incoming_)) { Close(); return; }
+        if (!StartCrypto()) { Close(); return; }          // keys first: nothing may be sent in the clear from now on
+        if (!ev_.ready(id_, peerInst_, peerKey_, peerName_, addr_, incoming_, audioKeys_)) { Close(); return; }
         ready_ = true;
+    }
+
+    // ---- encryption (see the comment at the top of the class)
+    static void MakeNonce(std::uint64_t ctr, std::uint8_t n[24])
+    {
+        std::memset(n, 0, 24);
+        for (int i = 0; i < 8; ++i) n[i] = (std::uint8_t)((ctr >> (8 * i)) & 0xFF);
+    }
+
+    bool StartCrypto()
+    {
+        std::uint8_t shared[32];
+        if (!ident_.SharedSecret(peerKey_, shared)) return false;
+        const std::string group = ev_.groupSecret();
+        auto derive = [&](const char* label, const std::string& from, const std::string& to,
+                          const std::string& nFrom, const std::string& nTo, std::uint8_t out[32]) {
+            const std::string m = std::string(label) + "|" + from + "|" + to + "|" + nFrom + "|" + nTo + "|" + group;
+            crypto_blake2b_keyed(out, 32, shared, 32, reinterpret_cast<const std::uint8_t*>(m.data()), m.size());
+        };
+        derive("si-enc-v1", ident_.PublicHex(), peerKey_, myNonce_, peerNonce_, txKey_);     // me -> peer
+        derive("si-enc-v1", peerKey_, ident_.PublicHex(), peerNonce_, myNonce_, rxKey_);     // peer -> me
+        derive("si-audio-v1", ident_.PublicHex(), peerKey_, myNonce_, peerNonce_, audioKeys_.tx);
+        derive("si-audio-v1", peerKey_, ident_.PublicHex(), peerNonce_, myNonce_, audioKeys_.rx);
+        crypto_wipe(shared, sizeof shared);
+        txCtr_ = rxCtr_ = 0;
+        txCrypt_ = rxCrypt_ = true;
+        return true;
+    }
+
+    std::string Encrypt(const std::string& line)
+    {
+        std::vector<std::uint8_t> buf(line.size() + 16);
+        std::uint8_t nonce[24];
+        MakeNonce(txCtr_, nonce);
+        crypto_aead_lock(buf.data() + 16, buf.data(), txKey_, nonce, nullptr, 0,
+                         reinterpret_cast<const std::uint8_t*>(line.data()), line.size());
+        return "E " + std::to_string(txCtr_++) + " " +
+               clipboard::Base64Encode(std::string(reinterpret_cast<const char*>(buf.data()), buf.size()));
+    }
+
+    bool Decrypt(const std::string& l, std::string& plain)
+    {
+        unsigned long long ctr = 0;
+        int off = 0;
+        if (std::sscanf(l.c_str(), "E %llu %n", &ctr, &off) < 1 || off <= 0 || (std::size_t)off > l.size()) return false;
+        if (ctr != (unsigned long long)rxCtr_) return false;                  // replayed, dropped or reordered
+        std::string raw;
+        if (!clipboard::Base64Decode(l.substr((std::size_t)off), raw) || raw.size() < 16) return false;
+        std::vector<std::uint8_t> out(raw.size() - 16 + 1);
+        std::uint8_t nonce[24];
+        MakeNonce(rxCtr_, nonce);
+        const auto* in = reinterpret_cast<const std::uint8_t*>(raw.data());
+        if (crypto_aead_unlock(out.data(), in, rxKey_, nonce, nullptr, 0, in + 16, raw.size() - 16) != 0) return false;
+        ++rxCtr_;
+        plain.assign(reinterpret_cast<const char*>(out.data()), raw.size() - 16);
+        return true;
     }
 
     void Handle(const std::string& l)
     {
+        if (rxCrypt_) {
+            if (l.compare(0, 2, "E ") == 0) {
+                std::string plain;
+                if (!Decrypt(l, plain)) { Close(); return; }            // forged, damaged or replayed
+                rxSeen_ = true;
+                lastRx_ = std::chrono::steady_clock::now();
+                if (!plain.empty() && plain != "PING") ev_.line(id_, plain);
+                return;
+            }
+            // The peer's heartbeat can still arrive in the clear until its first encrypted line.
+            if (l == "PING" && !rxSeen_) { lastRx_ = std::chrono::steady_clock::now(); return; }
+            Close();                                                    // plain text after the handshake: refuse
+            return;
+        }
+
         if (l == "PING") return;                    // liveness only; receiving it is what counts
         if (authed_) {
             if (ready_) ev_.line(id_, l);
@@ -235,6 +322,10 @@ private:
     bool groupOk_ = false;      // peer knows our group password
     bool ready_  = false;       // accepted: carries input / audio
     bool closed_ = false;
+    bool txCrypt_ = false, rxCrypt_ = false, rxSeen_ = false;
+    std::uint8_t txKey_[32] = {}, rxKey_[32] = {};
+    PeerAudioKeys audioKeys_;
+    std::uint64_t txCtr_ = 0, rxCtr_ = 0;
     std::chrono::steady_clock::time_point lastRx_;
     asio::steady_timer hb_;
 };
@@ -392,10 +483,10 @@ struct Network::Impl {
         const int id = nextId++;
         SessionEvents ev;
         ev.ready = [this](int i, std::uint32_t inst, const std::string& key, const std::string& name,
-                          const std::string& addr, bool inc) -> bool {
+                          const std::string& addr, bool inc, const PeerAudioKeys& ak) -> bool {
             if (stopping) return false;
             byInstance[inst] = i;
-            if (cb.onPeerReady) cb.onPeerReady(i, inst, key, name, addr, inc);
+            if (cb.onPeerReady) cb.onPeerReady(i, inst, key, name, addr, inc, ak);
             return true;
         };
         ev.authed = [this](int i, std::uint32_t inst, const std::string& key, bool inc) {

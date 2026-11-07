@@ -1,4 +1,5 @@
 #pragma once
+#include <cstdint>
 #include <filesystem>
 #include <string>
 
@@ -18,6 +19,11 @@ public:
     std::string Fingerprint() const { return Fingerprint(pubHex_); }
 
     std::string Sign(const std::string& msg) const;               // 128 hex chars
+
+    // Secret shared with another PC: X25519(my identity secret, its identity public key), 32 bytes.
+    // Both sides compute the same value without it ever being sent. false for an invalid key.
+    // It is the SAME for every connection between these two PCs: derive per-session keys from it.
+    bool SharedSecret(const std::string& peerPubHex, std::uint8_t out[32]) const;
 
     static bool Verify(const std::string& pubHex, const std::string& msg, const std::string& sigHex);
     static bool IsValidPublicHex(const std::string& s);

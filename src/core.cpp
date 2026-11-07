@@ -111,8 +111,8 @@ bool Core::Start(std::string* err)
     NetCallbacks cb;
     cb.onStatus = [this](const std::string& s) { Post([this, s] { Log(s); }); };
     cb.onPeerReady = [this](int id, std::uint32_t inst, const std::string& key, const std::string& name,
-                            const std::string& addr, bool incoming) {
-        Post([=] { OnPeerReady(id, inst, key, name, addr, incoming); });
+                            const std::string& addr, bool incoming, const PeerAudioKeys& ak) {
+        Post([=] { OnPeerReady(id, inst, key, name, addr, incoming, ak); });
     };
     cb.onPeerLost = [this](int id) {
         if (input_) input_->RemovePeer(id);     // hand input back immediately
@@ -433,6 +433,47 @@ void Core::CmdControl(int id, bool allow)
     Changed();
 }
 
+void Core::CmdClearCache()
+{
+    // Cached / remembered data that can be rebuilt: who may control this PC (decided again on the next
+    // connection), the learned monitor layout and the clipboard bookkeeping. Kept: the identity key, the
+    // group password, layouts and per-device audio/clipboard settings.
+    std::string err;
+    if (!trust_->Clear(&err)) Log("Could not save permissions: " + err);
+    for (const auto& kv : peers_) {
+        if (input_) input_->SetPeerAllowed(kv.first, false);    // also hands control back if it is active
+        SendControlState(kv.first);                              // tell the peer: CTRL 0
+    }
+    std::error_code ec;
+    std::filesystem::remove(dir_ / "monitors.txt", ec);
+    clipSent_.clear();
+    clipIn_.clear();
+    Log("Cache cleared: remembered permissions and the monitor cache were removed (devices must be allowed again)");
+    Changed();
+}
+
+void Core::CmdRegenKeys()
+{
+    namespace fs = std::filesystem;
+    std::error_code ec;
+    const fs::path file = dir_ / "identity.key", bak = dir_ / "identity.key.bak";
+    fs::remove(bak, ec);
+    fs::rename(file, bak, ec);                                  // LoadOrCreate makes a new key when the file is gone
+    if (ec) { Log("Could not replace the key file: " + ec.message()); return; }
+
+    std::string note;
+    const Identity fresh = Identity::LoadOrCreate(dir_, &note);
+    if (!fs::exists(file, ec) || !note.empty()) {
+        fs::remove(file, ec);
+        fs::rename(bak, file, ec);                              // put the old key back: never end up without one
+        Log("Could not save the new key" + (note.empty() ? std::string() : " (" + note + ")") + ": the old key stays");
+        return;
+    }
+    fs::remove(bak, ec);                                        // the old private key must not linger on disk
+    Log("New keys generated, fingerprint " + fresh.Fingerprint() + ". Restarting the background service ...");
+    CmdQuit();                                                  // network, beacons and peers all pick up the new key on restart
+}
+
 void Core::CmdClipboard(int id, bool share)
 {
     auto it = peers_.find(id);
@@ -457,7 +498,7 @@ void Core::SendControlState(int id)
 
 // ------------------------------------------------------------------ network results
 void Core::OnPeerReady(int id, std::uint32_t inst, const std::string& key, const std::string& name,
-                       const std::string& addr, bool incoming)
+                       const std::string& addr, bool incoming, const PeerAudioKeys& audioKeys)
 {
     state::Peer& p = peers_[id];
     p.id = id;
@@ -472,6 +513,7 @@ void Core::OnPeerReady(int id, std::uint32_t inst, const std::string& key, const
 
     Log("Connection established with " + name + " (" + addr + "), key " + Identity::Fingerprint(key) + " verified");
     audio_->AddPeer(inst, addr);
+    audio_->SetPeerKeys(inst, audioKeys.tx, audioKeys.rx);      // no keys, no audio in either direction
     net_->Send(id, ScreensLine());      // tell the peer about our monitors
     OnSetChanged();                     // a new set of PCs: switch to its config
     // The layout entry appears once the peer's SCREENS line arrives.
@@ -775,12 +817,12 @@ void Core::UpdateCapture(AudioSource src, bool want, bool& capturing, const char
 
 // ------------------------------------------------------------------ clipboard sharing
 // Wire format (text only, UTF-8), one or more lines per transfer because a protocol line may not
-// exceed the 4 KiB read buffer:
-//     CLIPD <transfer id> <chunk index> <chunk count> <base64 of up to 2400 bytes>
+// exceed the read buffer (16 KiB, 4 KiB-ish after encryption overhead):
+//     CLIPD <transfer id> <chunk index> <chunk count> <base64 of up to 1800 bytes>
 // The sender is the PC whose cursor just moved over to the peer; the receiver accepts it when it
 // shares its own clipboard with that peer or when that peer may control this PC.
 namespace {
-constexpr std::size_t kClipChunk = 2400;
+constexpr std::size_t kClipChunk = 1800;
 constexpr int kClipMaxChunks = (int)(clipboard::kMaxBytes / kClipChunk) + 2;
 }
 

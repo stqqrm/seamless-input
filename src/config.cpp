@@ -203,6 +203,12 @@ bool TrustStore::Set(const std::string& key, State s, const std::string& name, s
     return Save(err);
 }
 
+bool TrustStore::Clear(std::string* err)
+{
+    entries_.clear();
+    return Save(err);
+}
+
 bool TrustStore::Save(std::string* err) const
 {
     std::error_code ec;

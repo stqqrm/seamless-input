@@ -25,6 +25,10 @@
 #include <thread>
 #include <vector>
 
+extern "C" {
+#include "monocypher/monocypher.h"
+}
+
 namespace asio = boost::asio;
 using asio::ip::udp;
 using boost::system::error_code;
@@ -32,17 +36,22 @@ using Clock = std::chrono::steady_clock;
 
 namespace {
 
-// ---- wire format: 12 byte header + 5 ms of 48 kHz stereo 16-bit PCM (960 bytes)
+// ---- wire format: 12 byte header + 5 ms of 48 kHz stereo 16-bit PCM (960 bytes) + 16 byte MAC
 //   [0..1] magic 'SA'  [2] version  [3] stream (0 microphone, 1 system audio)
 //   [4..7] sender instance  [8..11] sequence (counted per stream)
+//   The PCM is encrypted with XChaCha20-Poly1305 using the per-connection audio key; the 12 header bytes
+//   are authenticated (not hidden). Nonce = stream | sequence, so every packet of a connection is unique
+//   and a modified, forged or re-addressed packet fails the MAC and is dropped.
 constexpr int            kRate          = 48000;
 constexpr int            kChannels      = 2;
 constexpr int            kPacketFrames  = 240;
 constexpr std::size_t    kPacketSamples = kPacketFrames * kChannels;
 constexpr std::size_t    kPayloadBytes  = kPacketSamples * sizeof(std::int16_t);
 constexpr std::size_t    kHeaderBytes   = 12;
+constexpr std::size_t    kMacBytes      = 16;
+constexpr std::size_t    kPacketBytes   = kHeaderBytes + kPayloadBytes + kMacBytes;
 constexpr std::uint16_t  kMagic         = 0x5341;
-constexpr std::uint8_t   kVersion       = 2;
+constexpr std::uint8_t   kVersion       = 3;      // 3 = encrypted
 constexpr int            kStreams       = 2;    // microphone, system audio
 
 // ---- receive side jitter buffer (all in samples = frames * channels)
@@ -76,9 +85,27 @@ struct Stream {
     float level = 0;
 };
 
+void MakeNonce(int stream, std::uint32_t seq, std::uint8_t n[24])
+{
+    std::memset(n, 0, 24);
+    n[0] = (std::uint8_t)stream;
+    n[1] = (std::uint8_t)(seq);
+    n[2] = (std::uint8_t)(seq >> 8);
+    n[3] = (std::uint8_t)(seq >> 16);
+    n[4] = (std::uint8_t)(seq >> 24);
+}
+
+struct Dest {                       // one recipient of an outgoing packet
+    udp::endpoint ep;
+    std::uint8_t key[32];
+};
+
 struct Peer {
     std::string ip;
     udp::endpoint ep;
+
+    bool keyed = false;                       // false: no audio to or from this peer
+    std::uint8_t txKey[32] = {}, rxKey[32] = {};
 
     // per-device settings (guarded by Impl::mtx like everything else here)
     bool  send[kStreams] = {false, false};   // send OUR microphone / system audio to this peer
@@ -147,7 +174,7 @@ struct AudioEngine::Impl {
         std::array<std::int16_t, kPacketSamples> stage{};
         std::size_t stageCount = 0;
         std::uint32_t seq = 0;
-        std::vector<udp::endpoint> dests;   // scratch for SendPacket, only touched by this source's thread
+        std::vector<Dest> dests;            // scratch for SendPacket, only touched by this source's thread
     };
     Cap cap[kStreams];
 #if defined(__linux__)
@@ -239,7 +266,21 @@ struct AudioEngine::Impl {
     void RemovePeer(std::uint32_t inst)
     {
         std::lock_guard<std::mutex> lk(mtx);
-        peers.erase(inst);
+        auto it = peers.find(inst);
+        if (it == peers.end()) return;
+        crypto_wipe(it->second.txKey, 32);
+        crypto_wipe(it->second.rxKey, 32);
+        peers.erase(it);
+    }
+
+    void SetPeerKeys(std::uint32_t inst, const std::uint8_t* tx, const std::uint8_t* rx)
+    {
+        std::lock_guard<std::mutex> lk(mtx);
+        auto it = peers.find(inst);
+        if (it == peers.end()) return;
+        std::memcpy(it->second.txKey, tx, 32);
+        std::memcpy(it->second.rxKey, rx, 32);
+        it->second.keyed = true;
     }
 
     void SetPeerSend(std::uint32_t inst, AudioSource src, bool on)
@@ -394,26 +435,37 @@ struct AudioEngine::Impl {
 
     void SendPacket(Cap& c, const std::int16_t* samples)
     {
-        unsigned char pkt[kHeaderBytes + kPayloadBytes];
+        unsigned char pkt[kPacketBytes];
         pkt[0] = (unsigned char)(kMagic & 0xFF);
         pkt[1] = (unsigned char)(kMagic >> 8);
         pkt[2] = kVersion;
         pkt[3] = (unsigned char)c.stream;
         Put32(pkt + 4, self);
-        Put32(pkt + 8, c.seq++);
-        std::memcpy(pkt + kHeaderBytes, samples, kPayloadBytes);
+        const std::uint32_t seq = c.seq++;
+        Put32(pkt + 8, seq);
 
         auto& dests = c.dests;
         dests.clear();
         {
             std::lock_guard<std::mutex> lk(mtx);
             for (auto& kv : peers)
-                if (kv.second.send[c.stream]) dests.push_back(kv.second.ep);   // only devices we share with
+                if (kv.second.send[c.stream] && kv.second.keyed) {          // only devices we share with
+                    Dest d;
+                    d.ep = kv.second.ep;
+                    std::memcpy(d.key, kv.second.txKey, 32);
+                    dests.push_back(d);
+                }
         }
-        for (auto& ep : dests) {
+        std::uint8_t nonce[24];
+        MakeNonce(c.stream, seq, nonce);
+        for (auto& d : dests) {
+            // every peer has its own key, so the ciphertext is made per destination
+            crypto_aead_lock(pkt + kHeaderBytes, pkt + kHeaderBytes + kPayloadBytes, d.key, nonce,
+                             pkt, kHeaderBytes, reinterpret_cast<const std::uint8_t*>(samples), kPayloadBytes);
             error_code ec;
-            sendSock.send_to(asio::buffer(pkt, sizeof pkt), ep, 0, ec);   // lost packets are fine
+            sendSock.send_to(asio::buffer(pkt, sizeof pkt), d.ep, 0, ec);   // lost packets are fine
         }
+        for (auto& d : dests) crypto_wipe(d.key, 32);
     }
 
     // ------------------------------------------------------------------ receive
@@ -428,7 +480,7 @@ struct AudioEngine::Impl {
 
     void OnPacket(std::size_t n)
     {
-        if (n != kHeaderBytes + kPayloadBytes) return;
+        if (n != kPacketBytes) return;
         const unsigned char* b = rx.data();
         if (b[0] != (kMagic & 0xFF) || b[1] != (kMagic >> 8) || b[2] != kVersion) return;
         const int stream = b[3];
@@ -437,18 +489,23 @@ struct AudioEngine::Impl {
         const std::uint32_t inst = Get32(b + 4);
         const std::uint32_t sq   = Get32(b + 8);
 
+        std::lock_guard<std::mutex> lk(mtx);
+        auto it = peers.find(inst);
+        if (it == peers.end() || !it->second.keyed) return;   // only audio from connected, keyed peers
+        Peer& pe = it->second;
+
+        // Authenticate and decrypt BEFORE touching any state: a forged packet changes nothing.
         std::int16_t samples[kPacketSamples];
-        std::memcpy(samples, b + kHeaderBytes, kPayloadBytes);
+        std::uint8_t nonce[24];
+        MakeNonce(stream, sq, nonce);
+        if (crypto_aead_unlock(reinterpret_cast<std::uint8_t*>(samples), b + kHeaderBytes + kPayloadBytes,
+                               pe.rxKey, nonce, b, kHeaderBytes, b + kHeaderBytes, kPayloadBytes) != 0)
+            return;
         int peak = 0;
         for (std::size_t i = 0; i < kPacketSamples; ++i) {
             const int a = samples[i] < 0 ? -samples[i] : samples[i];
             if (a > peak) peak = a;
         }
-
-        std::lock_guard<std::mutex> lk(mtx);
-        auto it = peers.find(inst);
-        if (it == peers.end()) return;            // only audio from connected peers
-        Peer& pe = it->second;
         Stream& p = pe.in[stream];
 
         if (p.haveSeq) {
@@ -545,6 +602,7 @@ AudioEngine::~AudioEngine() { Stop(); }
 bool AudioEngine::Start(std::string* err)                 { return d_->Start(err); }
 void AudioEngine::Stop()                                  { d_->Stop(); }
 void AudioEngine::AddPeer(std::uint32_t i, const std::string& ip) { d_->AddPeer(i, ip); }
+void AudioEngine::SetPeerKeys(std::uint32_t i, const std::uint8_t tx[32], const std::uint8_t rx[32]) { d_->SetPeerKeys(i, tx, rx); }
 void AudioEngine::RemovePeer(std::uint32_t i)             { d_->RemovePeer(i); }
 bool AudioEngine::SetCapture(AudioSource s, bool on, std::string* e) { return d_->SetCapture(s, on, e); }
 void AudioEngine::SetPeerSend(std::uint32_t i, AudioSource s, bool on) { d_->SetPeerSend(i, s, on); }

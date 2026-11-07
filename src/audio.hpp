@@ -34,6 +34,10 @@ public:
     void AddPeer(std::uint32_t instance, const std::string& ip);
     void RemovePeer(std::uint32_t instance);
 
+    // Per-connection keys (see PeerAudioKeys in network.hpp). Audio is encrypted and authenticated with
+    // them; a peer without keys gets no audio and none is accepted from it.
+    void SetPeerKeys(std::uint32_t instance, const std::uint8_t tx[32], const std::uint8_t rx[32]);
+
     // Start/stop capturing one source on its default device. The two sources run
     // independently and are sent as separate streams, so a device can get the
     // microphone, the system audio, or both. Microphone: the default input device.

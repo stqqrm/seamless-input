@@ -157,6 +157,21 @@ std::string Identity::Sign(const std::string& msg) const
     return ToHex(sig, 64);
 }
 
+bool Identity::SharedSecret(const std::string& peerPubHex, std::uint8_t out[32]) const
+{
+    std::uint8_t peerEd[32], peerX[32], h[64], sk[32];
+    if (!FromHex(peerPubHex, peerEd, 32)) return false;
+    crypto_eddsa_to_x25519(peerX, peerEd);          // their Ed25519 public key as an X25519 point
+    crypto_blake2b(h, sizeof h, secret_, 32);       // Monocypher expands the seed (first 32 bytes) with BLAKE2b ...
+    crypto_eddsa_trim_scalar(sk, h);                // ... and clamps it: that scalar is also our X25519 secret
+    crypto_x25519(out, sk, peerX);
+    crypto_wipe(h, sizeof h);
+    crypto_wipe(sk, sizeof sk);
+    std::uint8_t acc = 0;
+    for (int i = 0; i < 32; ++i) acc |= out[i];
+    return acc != 0;                                // all zero = low-order point supplied by an attacker
+}
+
 bool Identity::Verify(const std::string& pubHex, const std::string& msg, const std::string& sigHex)
 {
     std::uint8_t pub[32], sig[64];

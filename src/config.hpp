@@ -82,6 +82,8 @@ public:
     State Get(const std::string& key) const;
     // Stores the decision and writes the file right away (decisions are rare).
     bool Set(const std::string& key, State s, const std::string& name, std::string* err = nullptr);
+    // Forgets every decision (nobody may control this PC afterwards) and writes the file.
+    bool Clear(std::string* err = nullptr);
 
 private:
     struct Entry { State state = State::Unknown; std::string name; };

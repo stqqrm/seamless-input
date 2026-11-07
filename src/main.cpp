@@ -1576,7 +1576,7 @@ private:
     bool closed_ = false;
 };
 
-// The strip with the menu titles (File, Settings, ...). Fires onCommand(id, checked) for a chosen item.
+// The strip with the menu titles (File, Service, ...). Fires onCommand(id, checked) for a chosen item.
 class MenuStrip : public wxControl {
 public:
     std::function<void(int)> onOpen;                    // a menu is about to open: refresh its items
@@ -1882,7 +1882,8 @@ public:
 private:
     static constexpr int kTimerId     = 9000;
     static constexpr int kAnimTimerId = 9001;
-    enum { kIdAutostart = 9100, kIdSvcInfo, kIdToggleSvc, kIdQuitAll, kIdOpenFileMenu, kIdOpenSettingsMenu };
+    enum { kIdAutostart = 9100, kIdSvcInfo, kIdToggleSvc, kIdQuitAll, kIdOpenFileMenu, kIdOpenSettingsMenu,
+           kIdClearCache, kIdRegenKeys, kIdViewKeys };
 
     struct Entry { wxString name; std::string ip; wxString status; };
     struct Discovered {
@@ -1978,7 +1979,7 @@ private:
             (int)kTcpPort, (int)kDiscoveryPort, (int)kAudioPort, svcState));
     }
 
-    // ------------------------------------------------------------ settings menu
+    // ------------------------------------------------------------ service menu
     // The menus are drawn by MenuStrip (not a native wxMenuBar) so they look the same on every OS.
     void BuildMenu()
     {
@@ -2002,7 +2003,11 @@ private:
         autostart.check = true;
         MenuItemDef info = item(kIdSvcInfo, "Background service: ...");
         info.enabled = false;
-        menuBar_->AddMenu("Settings", { autostart, sep(), info, item(kIdToggleSvc, "Stop background service now") });
+        menuBar_->AddMenu("Service", { autostart, sep(), info, item(kIdToggleSvc, "Stop background service now") });
+
+        menuBar_->AddMenu("Security", { item(kIdClearCache, "Clear cache"),
+                                        item(kIdRegenKeys, "Regenerate keys"),
+                                        item(kIdViewKeys, "View keys") });
 
         menuBar_->onOpen = [this](int) { RefreshServiceMenu(); };
         menuBar_->onCommand = [this](int id, bool checked) {
@@ -2016,6 +2021,9 @@ private:
         Bind(wxEVT_MENU, [this](wxCommandEvent&) { QuitAll(); }, kIdQuitAll);
         Bind(wxEVT_MENU, &MainFrame::OnAutostart, this, kIdAutostart);
         Bind(wxEVT_MENU, [this](wxCommandEvent&) { ToggleService(); }, kIdToggleSvc);
+        Bind(wxEVT_MENU, [this](wxCommandEvent&) { OnClearCache(); }, kIdClearCache);
+        Bind(wxEVT_MENU, [this](wxCommandEvent&) { OnRegenKeys(); }, kIdRegenKeys);
+        Bind(wxEVT_MENU, [this](wxCommandEvent&) { OnViewKeys(); }, kIdViewKeys);
         Bind(wxEVT_MENU, [this](wxCommandEvent&) { menuBar_->OpenMenu(0); }, kIdOpenFileMenu);
         Bind(wxEVT_MENU, [this](wxCommandEvent&) { menuBar_->OpenMenu(1); }, kIdOpenSettingsMenu);
 
@@ -2073,6 +2081,53 @@ private:
                        : "Autostart is off");
         else    wxMessageBox(wxString::FromUTF8(err), "Autostart", wxOK | wxICON_WARNING, this);
         retry_ = 3;     // reconnect right away
+    }
+
+    // ------------------------------------------------------------ security menu
+    void OnClearCache()
+    {
+        if (!connected_) {
+            wxMessageBox("The background service is not running.", "Clear cache", wxOK | wxICON_INFORMATION, this);
+            return;
+        }
+        const int r = wxMessageBox(
+            "Clear the cache?\n\n"
+            "This forgets which devices may control this PC (each one has to be allowed again) and the "
+            "remembered monitor layout.\n\n"
+            "Your keys, group password, layout and per-device settings are kept.",
+            "Clear cache", wxYES_NO | wxNO_DEFAULT | wxICON_QUESTION, this);
+        if (r != wxYES) return;
+        client_->Send("CLEARCACHE");
+        Log("Clearing the cache ...");
+    }
+
+    void OnRegenKeys()
+    {
+        if (!connected_) {
+            wxMessageBox("The background service is not running.", "Regenerate keys", wxOK | wxICON_INFORMATION, this);
+            return;
+        }
+        const int r = wxMessageBox(
+            "Regenerate this PC's keys?\n\n"
+            "This PC gets a new identity. Other PCs will see it as a NEW device: they have to allow it "
+            "again, and settings saved for the current set of PCs no longer apply.\n"
+            "The old key is deleted and cannot be restored. The background service restarts.",
+            "Regenerate keys", wxYES_NO | wxNO_DEFAULT | wxICON_WARNING, this);
+        if (r != wxYES) return;
+        client_->Send("REGENKEYS");
+        Log("Generating new keys; the background service restarts ...");
+    }
+
+    // Opens the folder that holds identity.key (the private key: never share it) and trust.txt.
+    void OnViewKeys()
+    {
+#if defined(__WXMSW__)
+        const wxString dir(dataDir_.wstring());
+#else
+        const wxString dir = wxString::FromUTF8(dataDir_.string().c_str());
+#endif
+        if (!wxLaunchDefaultApplication(dir))
+            wxMessageBox("Could not open the folder:\n" + dir, "View keys", wxOK | wxICON_WARNING, this);
     }
 
     void ToggleService()
