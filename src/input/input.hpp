@@ -51,6 +51,11 @@ public:
     // Callbacks: invoked on engine/backend/network threads, never re-enter the engine from them.
     std::function<void(Mode mode, int peerId)> onModeChange;
 
+    // The cursor of this PC has just moved over to peer 'peerId': it started controlling that peer
+    // (also when control hops from one peer to another), or this PC handed control back to the peer
+    // that was driving it (RETURN). Used to send the clipboard along. Same threading rules as above.
+    std::function<void(int peerId)> onCursorToPeer;
+
     void SetLocalMonitors(const std::vector<InputRect>& mons);   // before Start()
     bool Start(std::string* msg);                                // msg: error or warning
     void Stop();

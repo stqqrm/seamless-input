@@ -61,6 +61,7 @@ fs::path ConfigStore::PathFor(const std::vector<std::string>& members) const
 //   peer <public key> <ox> <oy> <name...>
 //   peeraudio <public key> <send 0|1> <mute 0|1> <volume 0..100> [<mic 0|1>]
 //                     send = share my (system) audio, mic = share my microphone
+//   peerclip <public key> <share clipboard 0|1>
 bool ConfigStore::Save(const SavedConfig& in, std::string* err) const
 {
     SavedConfig cfg = in;
@@ -85,6 +86,8 @@ bool ConfigStore::Save(const SavedConfig& in, std::string* err) const
         for (const auto& p : cfg.peers)
             out << "peeraudio " << p.key << " " << (p.send ? 1 : 0) << " " << (p.mute ? 1 : 0)
                 << " " << std::clamp(p.volume, 0, 100) << " " << (p.mic ? 1 : 0) << "\n";
+        for (const auto& p : cfg.peers)
+            if (p.hasClip) out << "peerclip " << p.key << " " << (p.clip ? 1 : 0) << "\n";
         out.flush();
         if (!out) { if (err) *err = "write failed: " + tmp.string(); return false; }
     }
@@ -138,6 +141,15 @@ bool ConfigStore::Load(const std::vector<std::string>& wanted, SavedConfig& out)
                 p.mute = mut != 0;
                 p.volume = std::clamp(vol, 0, 100);
                 if (is >> mic) { p.mic = mic != 0; p.hasMic = true; }
+            }
+        }
+        else if (k == "peerclip") {
+            std::string key;
+            int on = 0;
+            if (is >> key >> on && Identity::IsValidPublicHex(key)) {
+                SavedPeer& p = cfg.PeerRef(key);
+                p.hasClip = true;
+                p.clip = on != 0;
             }
         }
     }

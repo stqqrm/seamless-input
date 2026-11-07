@@ -30,6 +30,8 @@ constexpr int kKeyScrollLock = 70;      // emergency exit while forwarding
 constexpr int kInset         = 4;       // px inside the target monitor where the cursor lands
 constexpr int kExitBack      = 24;      // px inside our own monitor after control comes back
 constexpr int kMaxGap        = 256;     // largest gap between monitors that is still bridged
+constexpr int kEdgeBand      = 2;       // px: a cursor this close to an outer edge counts as "at the edge"
+                                        // (touchpads decelerate and may stop 1-2 px short of the edge)
 constexpr auto kCooldown     = std::chrono::milliseconds(250);
 constexpr auto kRetry        = std::chrono::milliseconds(750);
 
@@ -223,6 +225,22 @@ struct InputEngine::Impl {
 
     void Notify() { if (self->onModeChange) self->onModeChange(mode, peerId); }
 
+    void CursorTo(int id) { if (self->onCursorToPeer) self->onCursorToPeer(id); }
+
+    // Walks from (x, y) towards direction d for at most kEdgeBand pixels. If the outer edge of
+    // the desktop is reached, (ex, ey) is the last pixel inside and true is returned.
+    bool EdgeAhead(int x, int y, const int d[2], int& ex, int& ey) const
+    {
+        ex = x;
+        ey = y;
+        for (int k = 0; k <= kEdgeBand; ++k) {
+            if (!inputgeom::InsideAny(mons, ex + d[0], ey + d[1])) return true;
+            ex += d[0];
+            ey += d[1];
+        }
+        return false;
+    }
+
     // -------------------------------------------------- local -> peer (we control)
     void OnLocalMotion(int x, int y, bool buttonsDown)
     {
@@ -231,10 +249,20 @@ struct InputEngine::Impl {
         const auto now = Clock::now();
         if (now - lastSwitch < kCooldown) return;
 
+        // Some pointing devices (precision touchpads, drivers that inject motion) report a point
+        // just outside the desktop or stop a pixel or two before the edge: snap to the desktop and
+        // accept the last kEdgeBand pixels as the edge, so a slow finger works like a fast mouse.
+        inputgeom::ClampToAny(mons, x, y);
+
         static const int dirs[4][2] = {{1, 0}, {-1, 0}, {0, 1}, {0, -1}};
         for (const auto& d : dirs) {
+            int ex = x, ey = y;
+            if (!EdgeAhead(x, y, d, ex, ey)) continue;
             Crossing c;
-            if (!FindCrossing(x, y, d[0], d[1], -1, true, c)) continue;
+            if (!FindCrossing(ex, ey, d[0], d[1], -1, true, c)) continue;
+            // from here on the edge pixel is the reference point
+            x = ex;
+            y = ey;
 
             int parkX = x, parkY = y;
             inputgeom::MonitorCenter(mons, x, y, parkX, parkY);
@@ -256,14 +284,17 @@ struct InputEngine::Impl {
             vy = c.y;
             PushRaw(c.peer, "ENTER " + std::to_string(c.x) + " " + std::to_string(c.y));
             Notify();
+            CursorTo(c.peer);
             return;
         }
 
         // Nothing to cross to. If the cursor is pushing against the edge of a PC that does not allow
         // remote control, say so once (otherwise nothing visible happens at all).
         for (const auto& d : dirs) {
+            int ex = x, ey = y;
+            if (!EdgeAhead(x, y, d, ex, ey)) continue;
             Crossing c;
-            if (!FindCrossing(x, y, d[0], d[1], -1, false, c)) continue;
+            if (!FindCrossing(ex, ey, d[0], d[1], -1, false, c)) continue;
             auto it = peers.find(c.peer);
             if (it == peers.end() || it->second.accepts || it->second.warned) continue;
             it->second.warned = true;
@@ -319,6 +350,7 @@ struct InputEngine::Impl {
         vy = c.y;
         lastSwitch = Clock::now();
         Notify();
+        CursorTo(c.peer);
     }
 
     // x,y < 0 means "use the position we left from".
@@ -403,6 +435,7 @@ struct InputEngine::Impl {
         }
 
         PushRaw(peerId, "RETURN " + std::to_string(c.x) + " " + std::to_string(c.y));
+        const int controller = peerId;
         ReleaseInjectedLocked();
         int ix = px - (sx ? sx * kExitBack : 0);
         int iy = py - (sy && !sx ? sy * kExitBack : 0);
@@ -412,6 +445,7 @@ struct InputEngine::Impl {
         lastSwitch = Clock::now();
         peerId = -1;
         Notify();
+        CursorTo(controller);               // the cursor goes back to the PC that was driving us
     }
 
     void DispatchLocked(int id, char type, int a, int b)

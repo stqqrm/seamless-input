@@ -62,6 +62,7 @@ public:
     void CmdPeerAudio(int id, bool share, bool mic, bool mute, int vol);
     void CmdMaster(bool mute, int vol);
     void CmdControl(int id, bool allow);                    // may this PC control ours?
+    void CmdClipboard(int id, bool share);                  // send my clipboard to this PC when the cursor moves over to it
     void CmdMonitorsHint(const std::vector<InputRect>& mons);
     void CmdQuit() { if (onQuit) onQuit(); }
 
@@ -86,6 +87,10 @@ private:
     void OnPeerLost(int id);
     void OnMessage(int id, const std::string& line);
     void SendControlState(int id);      // tell a peer whether it may control this PC (CTRL line)
+
+    // clipboard sharing (Core thread)
+    void OnCursorToPeer(int id);                                   // the cursor moved over to peer 'id'
+    bool OnClipLine(int id, const state::Peer& p, const std::string& line);   // CLIPD chunk; true if it was one
 
     // layout + saved configs
     void BroadcastRelative(int movedId);
@@ -137,6 +142,11 @@ private:
     bool scanning_ = false;
     int clients_ = 0;
     int ticks_ = 0, scanTick_ = 0;
+
+    struct ClipIn { long long xfer = 0; int count = 0, next = 0; std::string b64; };
+    std::map<int, ClipIn> clipIn_;                // clipboard being received, per peer
+    std::map<int, std::size_t> clipSent_;         // hash of the text the peer already has (sent or received)
+    long long clipXfer_ = 0;
 
     bool masterMute_ = false;
     int masterVol_ = 100;

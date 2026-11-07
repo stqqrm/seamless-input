@@ -21,6 +21,7 @@ struct Peer {
     bool mute = false;                   // mute what it sends me
     int  vol = 100;                      // 0..100, what I hear from it
     bool allowed = false;                // may it control this PC? (saved per device, off by default)
+    bool clip = false;                   // share my clipboard with it when the cursor moves over to it
 };
 
 struct Beacon {                          // another instance seen on the LAN (UDP discovery)

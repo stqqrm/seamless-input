@@ -80,6 +80,7 @@ std::vector<std::string> SerializeSnapshot(const state::Snapshot& s)
                         b(p.allowed) + " " + std::to_string(p.mons.size());
         for (const auto& m : p.mons)
             l += " " + std::to_string(m.x) + " " + std::to_string(m.y) + " " + std::to_string(m.w) + " " + std::to_string(m.h);
+        l += std::string(" ") + b(p.clip);          // after the monitor list: older readers ignore it
         v.push_back(std::move(l));
     }
     for (const auto& d : s.disc)
@@ -118,6 +119,7 @@ bool ParseSnapshotLine(const std::vector<std::string>& t, state::Snapshot& s)
             const size_t o = 16 + (size_t)i * 4;
             p.mons.push_back({(int)I(o), (int)I(o + 1), (int)I(o + 2), (int)I(o + 3)});
         }
+        p.clip = I(16 + (size_t)(n > 0 ? n : 0) * 4) != 0;
         s.peers.push_back(std::move(p));
     } else if (k == "D" && t.size() >= 6) {
         s.disc.push_back({S(1), S(2), S(4), I(3) != 0, I(5) != 0});

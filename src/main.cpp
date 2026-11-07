@@ -1911,6 +1911,7 @@ private:
         bool mute = false;          // mute what it sends me
         int  vol = 100;             // 0..100, what I hear from it
         bool allowed = false;       // may it control this PC?
+        bool clip = false;          // send my clipboard to this device when the cursor moves over to it
     };
 
     // ------------------------------------------------------------ daemon connection
@@ -2281,7 +2282,7 @@ private:
     struct DevRow {
         CardPanel* card = nullptr;
         wxStaticText *name = nullptr, *sub = nullptr, *detail = nullptr, *pct = nullptr, *audioState = nullptr;
-        FlatCheck *share = nullptr, *mic = nullptr, *allow = nullptr;
+        FlatCheck *share = nullptr, *mic = nullptr, *allow = nullptr, *clip = nullptr;
         SpeakerButton* mute = nullptr;
         FlatSlider* vol = nullptr;
         LevelBar* level = nullptr;
@@ -2316,11 +2317,16 @@ private:
         }
         r.mic = new FlatCheck(c, theme_, "Share my microphone");
         r.mic->SetToolTip("Send this PC's microphone to this device only");
+        r.clip = new FlatCheck(c, theme_, "Share my clipboard");
+        r.clip->SetToolTip("Send this PC's clipboard text to this device when the cursor moves over to it.\n"
+                           "It is accepted there if this device may control that PC or shares its clipboard back.\n"
+                           "On Linux this needs xclip, xsel or wl-clipboard.");
         r.allow = new FlatCheck(c, theme_, "Allow remote control");
         r.allow->SetToolTip("Let this device use this PC's keyboard and mouse");
         auto* checks = new wxBoxSizer(wxVERTICAL);
         checks->Add(r.share, 0, wxBOTTOM, 8);
         checks->Add(r.mic, 0, wxBOTTOM, 8);
+        checks->Add(r.clip, 0, wxBOTTOM, 8);
         checks->Add(r.allow, 0);
 
         // audio from this device
@@ -2366,6 +2372,13 @@ private:
             if (it == peers_.end()) return;
             it->second.mic = e.IsChecked();
             SendAudio(id);
+        });
+        r.clip->Bind(wxEVT_CHECKBOX, [this, id](wxCommandEvent& e) {
+            auto it = peers_.find(id);
+            if (it == peers_.end()) return;
+            it->second.clip = e.IsChecked();
+            lastAudio_[id] = std::chrono::steady_clock::now();      // keep the click until the daemon confirms it
+            client_->Send("CLIPBOARD " + std::to_string(id) + (e.IsChecked() ? " 1" : " 0"));
         });
         r.allow->Bind(wxEVT_CHECKBOX, [this, id](wxCommandEvent& e) {
             if (peers_.find(id) == peers_.end()) return;
@@ -2419,6 +2432,7 @@ private:
 
         r.share->SetValue(p.share);
         r.mic->SetValue(p.mic);
+        r.clip->SetValue(p.clip);
         r.allow->SetValue(p.allowed);
         r.mute->SetMuted(p.mute);
         r.vol->SetValue(p.vol);
@@ -2777,10 +2791,12 @@ private:
             pi.ox = p.ox; pi.oy = p.oy;
             pi.share = p.share; pi.mic = p.mic; pi.mute = p.mute; pi.vol = p.vol;
             pi.allowed = p.allowed;
+            pi.clip = p.clip;
             auto old = peers_.find(p.id);
             if (old != peers_.end() && recent(lastAudio_, p.id)) {      // the user is touching these right now
                 pi.share = old->second.share; pi.mic = old->second.mic;
                 pi.mute = old->second.mute;   pi.vol = old->second.vol;
+                pi.clip = old->second.clip;
             }
             np[p.id] = std::move(pi);
         }

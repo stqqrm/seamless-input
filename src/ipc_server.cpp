@@ -136,6 +136,8 @@ private:
             c.CmdMaster(I(1) != 0, (int)I(2));
         } else if (cmd == "CONTROL" && t.size() >= 3) {
             c.CmdControl((int)I(1), I(2) != 0);
+        } else if (cmd == "CLIPBOARD" && t.size() >= 3) {
+            c.CmdClipboard((int)I(1), I(2) != 0);
         } else if (cmd == "STOP") {
             c.CmdQuit();
         }

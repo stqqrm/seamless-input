@@ -25,6 +25,10 @@ struct SavedPeer {
     bool hasMic = false;   // false: line from before the microphone switch existed (migrated on load)
     bool mute = false;     // mute what this device sends me
     int  volume = 100;     // 0..100 slider units (what I hear from this device)
+
+    // clipboard: send mine to this device when the cursor moves over to it
+    bool hasClip = false;  // false: the file had no "peerclip" line for this peer
+    bool clip = false;
 };
 
 struct SavedAudio {
