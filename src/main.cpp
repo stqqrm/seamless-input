@@ -1937,8 +1937,12 @@ private:
             if (err != lastConnErr_) Log("Cannot reach the background service: " + wxString::FromUTF8(err));
             lastConnErr_ = err;
             UpdateHeader();
+            // A few failures in a row: whatever sits on the daemon's port is old or stuck - offer to restart it.
+            if (daemonWanted_ && ++connFails_ >= 3 && !restartAsked_) AskRestartDaemon();
             return;
         }
+        connFails_ = 0;
+        restartAsked_ = false;
         lastConnErr_.clear();
         log_->Clear();                                  // the daemon replays its log history on attach
         connected_ = true;
@@ -1946,6 +1950,40 @@ private:
         SendMonitorsHint();
         client_->Send("SCAN");
         UpdateHeader();
+    }
+
+    void AskRestartDaemon()
+    {
+        restartAsked_ = true;                       // ask once; asks again only after a restart attempt failed
+        busy_ = true;                               // pauses the automatic retries while the question is open
+        const int r = wxMessageBox(
+            "The background service does not respond.\n\n"
+            "It may be an older version that is still running, or a stuck process. Restart it?",
+            "Background service", wxYES_NO | wxYES_DEFAULT | wxICON_QUESTION, this);
+        if (r != wxYES) { busy_ = false; return; }
+
+        Log("Restarting the background service ...");
+        auto alive = alive_;
+        const auto dir = dataDir_;
+        std::thread([this, alive, dir] {
+            std::string err;
+            ipc::RequestStop(dir);                  // politely first: works when it still answers
+            svc::WaitGone(dir, 1500);
+            svc::KillDaemons();                     // then force: an old or hung daemon never answers
+            svc::WaitGone(dir, 2000);
+            const bool ok = svc::EnsureDaemon(dir, &err);
+            wxTheApp->CallAfter([this, alive, ok, err] { if (*alive) RestartDaemonDone(ok, err); });
+        }).detach();
+    }
+
+    void RestartDaemonDone(bool ok, const std::string& err)
+    {
+        busy_ = false;
+        connFails_ = 0;
+        retry_ = 3;                                 // reconnect right away
+        if (ok) { Log("Background service restarted"); return; }
+        restartAsked_ = false;                      // may ask again after the next failures
+        Log("Could not restart the background service: " + wxString::FromUTF8(err));
     }
 
     void OnDisconnected()
@@ -3001,6 +3039,8 @@ private:
     state::Stats stats_;
     bool connected_ = false, connecting_ = false, daemonWanted_ = true, busy_ = false, groupInit_ = false;
     int retry_ = 0;
+    int connFails_ = 0;             // consecutive failed attempts to reach the daemon
+    bool restartAsked_ = false;     // the restart question was shown (until success or a failed restart)
     std::string lastConnErr_;
     std::map<int, std::chrono::steady_clock::time_point> lastMove_, lastAudio_;
     std::chrono::steady_clock::time_point masterSent_;
