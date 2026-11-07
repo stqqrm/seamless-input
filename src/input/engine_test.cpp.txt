@@ -36,15 +36,24 @@ int main() {
     std::string m; CHECK(a.Start(&m)); CHECK(b.Start(&m));
     Fake &fa = *g_fake[0], &fb = *g_fake[1];
     a.SetPeer(1, bm, 1920, 0);  b.SetPeer(1, am, -1920, 0);
-    int bReq = 0; b.onControlRequest = [&](int){ bReq++; };
 
-    // 1. B has not allowed A: A touches its right edge -> ENTER -> DENY -> A gets control back
+    // 1. B does not allow A and A has not been told otherwise: touching the edge must do NOTHING
+    //    (no grab, no cursor parked in the middle of the screen, nothing sent).
     fa.sink.onLocalMotion(1919, 500, false); settle();
-    CHECK(fa.begun == 1); CHECK(fa.ended == 1); CHECK(bReq == 1);
-    std::this_thread::sleep_for(std::chrono::milliseconds(300));   // cooldown
+    CHECK(fa.begun == 0); CHECK(fa.ended == 0);
 
-    // 2. allow, then cross for real
+    // 1b. stale permission (A believes it may, B refuses): ENTER -> DENY -> A gets its input back once,
+    //     and A does not try again until B says CTRL 1.
+    a.SetPeerAccepts(1, true);
+    fa.sink.onLocalMotion(1919, 500, false); settle();
+    CHECK(fa.begun == 1); CHECK(fa.ended == 1);
+    std::this_thread::sleep_for(std::chrono::milliseconds(300));   // cooldown
+    fa.sink.onLocalMotion(1919, 500, false); settle();
+    CHECK(fa.begun == 1);
+
+    // 2. allow (B tells A with CTRL 1), then cross for real
     b.SetPeerAllowed(1, true);
+    a.SetPeerAccepts(1, true);
     fa.sink.onLocalMotion(1000, 500, false);       // middle of the screen: nothing
     CHECK(fa.begun == 1);
     fa.sink.onLocalMotion(1919, 500, false); settle();

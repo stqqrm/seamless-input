@@ -39,7 +39,6 @@ struct SavedConfig {
     std::string label;                  // e.g. "desktop + laptop", display only
     long long rev = 0;                  // unix ms of the last change
     SavedAudio audio;
-    bool inputEnabled = true;           // "Share keyboard & mouse"
     std::vector<SavedPeer> peers;       // layout of the other PCs
 
     const SavedPeer* FindPeer(const std::string& key) const;
@@ -59,8 +58,6 @@ public:
     bool Load(const std::vector<std::string>& members, SavedConfig& out) const;
     bool Save(const SavedConfig& cfg, std::string* err = nullptr) const;
 
-    const std::filesystem::path& Dir() const { return dir_; }
-
 private:
     std::filesystem::path PathFor(const std::vector<std::string>& members) const;
     std::filesystem::path dir_;
@@ -79,8 +76,6 @@ public:
 
     void Load();
     State Get(const std::string& key) const;
-    // (key, name) of every Allowed entry
-    std::vector<std::pair<std::string, std::string>> AllowedList() const;
     // Stores the decision and writes the file right away (decisions are rare).
     bool Set(const std::string& key, State s, const std::string& name, std::string* err = nullptr);
 

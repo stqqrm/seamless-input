@@ -14,6 +14,7 @@
 #include <wx/display.h>
 #include <wx/listctrl.h>
 #include <wx/notebook.h>
+#include <wx/popupwin.h>
 #include <wx/stdpaths.h>
 #include <wx/timer.h>
 
@@ -30,6 +31,7 @@
 #include <memory>
 #include <set>
 #include <sstream>
+#include <thread>
 #include <tuple>
 #include <utility>
 #include <vector>
@@ -38,8 +40,12 @@
 #include "config.hpp"
 #include "identity.hpp"
 #include "input/input.hpp"
+#include "ipc.hpp"
 #include "localinfo.hpp"
 #include "network.hpp"
+#include "paths.hpp"
+#include "service.hpp"
+#include "state.hpp"
 
 // ============================================================================
 // Canvas: every PC is a group of monitor rectangles drawn at real pixel
@@ -122,6 +128,21 @@ public:
         Refresh();
         return {ox, oy};
     }
+
+    // The daemon owns positions: the canvas just shows them (no collision handling here).
+    void AddPeerAt(int id, const wxString& name, const wxString& addr, const std::vector<wxRect>& mons,
+                   double ox, double oy)
+    {
+        RemovePeer(id);
+        Group g = MakeGroup(id, name, addr, mons);
+        g.ox = ox;
+        g.oy = oy;
+        peers_.push_back(g);
+        Refresh();
+    }
+    bool HasPeer(int id) const { for (const auto& g : peers_) if (g.id == id) return true; return false; }
+    bool IsDragging(int id) const { return dragId_ == id; }
+    std::vector<int> PeerIds() const { std::vector<int> v; for (const auto& g : peers_) v.push_back(g.id); return v; }
 
     bool PeerPos(int id, double& ox, double& oy) const
     {
@@ -1296,7 +1317,6 @@ public:
         });
     }
 
-    void SetSelection(int i) { sel_ = i; Refresh(); }
 
 private:
     static constexpr int kPad = 20;
@@ -1357,71 +1377,434 @@ private:
 };
 
 // ============================================================================
+// Custom menu bar. The native wxMenuBar is drawn by the OS (different look on Windows, GTK and
+// macOS, and it stays light in dark mode), so the menu strip and its drop-down menus are drawn
+// here with the same theme as the rest of the window.
+// ============================================================================
+struct MenuItemDef {
+    int id = 0;
+    wxString label;
+    wxString accel;                 // shortcut text shown on the right (display only)
+    bool separator = false;
+    bool check = false, checked = false;
+    bool enabled = true;
+};
+
+struct MenuDef {
+    wxString title;
+    std::vector<MenuItemDef> items;
+};
+
+// The drop-down list. A transient popup: it closes itself when you click anywhere else.
+class MenuPopup : public wxPopupTransientWindow {
+public:
+    std::function<void(int)> onClosed;                      // chosen item index, or -1
+    std::function<void(int)> onSwitch;                      // Left / Right arrow: -1 or +1
+
+    MenuPopup(wxWindow* parent, const Theme& t, std::vector<MenuItemDef> items)
+        : wxPopupTransientWindow(parent, wxBORDER_NONE), t_(t), items_(std::move(items))
+    {
+        SetBackgroundStyle(wxBG_STYLE_PAINT);
+        SetFont(parent->GetFont());
+
+        pad_   = FromDIP(4);
+        side_  = FromDIP(12);
+        checkW_ = FromDIP(26);
+        const int gap  = FromDIP(28);
+        const int rowH = std::max(FromDIP(28), GetCharHeight() + FromDIP(12));
+        const int sepH = FromDIP(9);
+
+        int textW = 0, y = 1 + pad_;
+        for (const auto& it : items_) {
+            Row r;
+            r.y = y;
+            r.h = it.separator ? sepH : rowH;
+            rows_.push_back(r);
+            y += r.h;
+            if (!it.separator) {
+                int w = GetTextExtent(it.label).x;
+                if (!it.accel.empty()) w += gap + GetTextExtent(it.accel).x;
+                textW = std::max(textW, w);
+            }
+        }
+        const int width = std::max(FromDIP(210), 2 + 2 * pad_ + checkW_ + textW + side_);
+        const int height = y + pad_ + 1;
+        SetClientSize(width, height);
+
+        // A child panel covers the popup, draws the menu and takes the keyboard focus: a bare popup
+        // window gets no key events on GTK.
+        body_ = new wxPanel(this, wxID_ANY, wxPoint(0, 0), wxSize(width, height), wxBORDER_NONE | wxWANTS_CHARS);
+        body_->SetBackgroundStyle(wxBG_STYLE_PAINT);
+        body_->SetFont(GetFont());
+        body_->Bind(wxEVT_PAINT, &MenuPopup::OnPaint, this);
+        body_->Bind(wxEVT_MOTION, &MenuPopup::OnMotion, this);
+        body_->Bind(wxEVT_LEAVE_WINDOW, [this](wxMouseEvent&) { SetHover(-1); });
+        body_->Bind(wxEVT_LEFT_UP, [this](wxMouseEvent& e) {
+            const int i = HitTest(e.GetPosition());
+            if (i >= 0) Choose(i);
+        });
+        // keys reach the popup itself (wx forwards them from the focused child)
+        Bind(wxEVT_KEY_DOWN, &MenuPopup::OnKey, this);
+        body_->Bind(wxEVT_KEY_DOWN, &MenuPopup::OnKey, this);
+    }
+
+    wxWindow* FocusTarget() { return body_; }
+
+    void CloseMenu() { DismissAndNotify(); }
+
+    void OnDismiss() override
+    {
+        if (closed_) return;
+        closed_ = true;
+        if (onClosed) onClosed(chosen_);
+    }
+
+private:
+    struct Row { int y = 0, h = 0; };
+
+    bool Selectable(int i) const
+    {
+        return i >= 0 && i < (int)items_.size() && !items_[(size_t)i].separator && items_[(size_t)i].enabled;
+    }
+
+    int HitTest(const wxPoint& p) const
+    {
+        if (p.x < 0 || p.x >= body_->GetClientSize().x) return -1;
+        for (size_t i = 0; i < rows_.size(); ++i)
+            if (p.y >= rows_[i].y && p.y < rows_[i].y + rows_[i].h) return Selectable((int)i) ? (int)i : -1;
+        return -1;
+    }
+
+    void SetHover(int i)
+    {
+        if (i == hover_) return;
+        hover_ = i;
+        body_->Refresh();
+    }
+
+    void Choose(int i)
+    {
+        if (!Selectable(i)) return;
+        chosen_ = i;
+        DismissAndNotify();
+    }
+
+    void Step(int dir)
+    {
+        const int n = (int)items_.size();
+        if (n == 0) return;
+        int i = hover_;
+        for (int k = 0; k < n; ++k) {
+            i = i < 0 ? (dir > 0 ? 0 : n - 1) : (i + dir + n) % n;
+            if (Selectable(i)) { SetHover(i); return; }
+        }
+    }
+
+    void OnMotion(wxMouseEvent& e)
+    {
+        SetHover(HitTest(e.GetPosition()));
+    }
+
+    void OnKey(wxKeyEvent& e)
+    {
+        switch (e.GetKeyCode()) {
+            case WXK_ESCAPE: DismissAndNotify(); break;
+            case WXK_DOWN:   Step(+1); break;
+            case WXK_UP:     Step(-1); break;
+            case WXK_LEFT:   if (onSwitch) onSwitch(-1); break;
+            case WXK_RIGHT:  if (onSwitch) onSwitch(+1); break;
+            case WXK_RETURN:
+            case WXK_NUMPAD_ENTER:
+            case WXK_SPACE:  Choose(hover_); break;
+            default:         e.Skip(); break;
+        }
+    }
+
+    void OnPaint(wxPaintEvent&)
+    {
+        wxAutoBufferedPaintDC pdc(body_);
+        pdc.SetBackground(wxBrush(t_.card));
+        pdc.Clear();
+        wxGCDC dc(pdc);
+        const wxSize s = body_->GetClientSize();
+        dc.SetPen(wxPen(t_.border, 1));
+        dc.SetBrush(*wxTRANSPARENT_BRUSH);
+        dc.DrawRectangle(0, 0, s.x, s.y);
+        dc.SetFont(GetFont());
+
+        for (size_t i = 0; i < items_.size(); ++i) {
+            const MenuItemDef& it = items_[i];
+            const Row& r = rows_[i];
+            if (it.separator) {
+                dc.SetPen(wxPen(t_.border, 1));
+                dc.DrawLine(pad_ + side_, r.y + r.h / 2, s.x - pad_ - side_, r.y + r.h / 2);
+                continue;
+            }
+            if ((int)i == hover_) {
+                dc.SetPen(*wxTRANSPARENT_PEN);
+                dc.SetBrush(wxBrush(t_.track));
+                dc.DrawRoundedRectangle(1 + pad_, r.y, s.x - 2 * (1 + pad_), r.h, 5);
+            }
+            const wxColour ink = it.enabled ? t_.text : t_.sub;
+            const wxSize te = dc.GetTextExtent(it.label);
+            const int ty = r.y + (r.h - te.y) / 2;
+
+            if (it.check && it.checked) {
+                const int cx = 1 + pad_ + FromDIP(10), cy = r.y + r.h / 2;
+                const wxPoint pts[3] = { wxPoint(cx, cy), wxPoint(cx + FromDIP(4), cy + FromDIP(4)),
+                                         wxPoint(cx + FromDIP(11), cy - FromDIP(4)) };
+                dc.SetPen(wxPen(it.enabled ? t_.accent : t_.sub, 2));
+                dc.DrawLines(3, pts);
+            }
+
+            dc.SetTextForeground(ink);
+            dc.DrawText(it.label, 1 + pad_ + checkW_, ty);
+            if (!it.accel.empty()) {
+                dc.SetTextForeground(t_.sub);
+                const wxSize ae = dc.GetTextExtent(it.accel);
+                dc.DrawText(it.accel, s.x - 1 - pad_ - side_ - ae.x, r.y + (r.h - ae.y) / 2);
+            }
+        }
+    }
+
+    Theme t_;
+    std::vector<MenuItemDef> items_;
+    std::vector<Row> rows_;
+    wxPanel* body_ = nullptr;
+    int pad_ = 4, side_ = 12, checkW_ = 26;
+    int hover_ = -1, chosen_ = -1;
+    bool closed_ = false;
+};
+
+// The strip with the menu titles (File, Settings, ...). Fires onCommand(id, checked) for a chosen item.
+class MenuStrip : public wxControl {
+public:
+    std::function<void(int)> onOpen;                    // a menu is about to open: refresh its items
+    std::function<void(int, bool)> onCommand;           // item id, new checked state (check items)
+
+    MenuStrip(wxWindow* parent, const Theme& t)
+        : wxControl(parent, wxID_ANY, wxDefaultPosition, wxSize(-1, 34), wxBORDER_NONE), t_(t)
+    {
+        SetBackgroundStyle(wxBG_STYLE_PAINT);
+        SetMinSize(wxSize(-1, 34));
+        Bind(wxEVT_PAINT, &MenuStrip::OnPaint, this);
+        Bind(wxEVT_MOTION, [this](wxMouseEvent& e) {
+            const int h = HitTest(e.GetPosition());
+            if (h != hover_) { hover_ = h; SetCursor(h >= 0 ? wxCursor(wxCURSOR_HAND) : wxNullCursor); Refresh(); }
+        });
+        Bind(wxEVT_LEAVE_WINDOW, [this](wxMouseEvent&) { hover_ = -1; Refresh(); });
+        // While a menu is open the popup holds the mouse grab, so the strip gets no mouse events.
+        // Poll the pointer instead: hovering another title slides over to that menu.
+        pollTimer_.SetOwner(this);
+        Bind(wxEVT_TIMER, [this](wxTimerEvent&) {
+            if (open_ < 0) { pollTimer_.Stop(); return; }
+            const wxPoint pos = wxGetMousePosition();
+            if (pos == lastMouse_) return;      // only a real pointer move counts (keyboard switching must stick)
+            lastMouse_ = pos;
+            const int h = HitTest(ScreenToClient(pos));
+            if (h >= 0 && h != open_) OpenMenu(h);
+        });
+        Bind(wxEVT_LEFT_DOWN, [this](wxMouseEvent& e) {
+            const int h = HitTest(e.GetPosition());
+            if (h < 0) return;
+            // the click that just closed this menu (click outside the popup) must not reopen it
+            const bool justClosed = h == closedIdx_ &&
+                std::chrono::steady_clock::now() - closedAt_ < std::chrono::milliseconds(250);
+            closedIdx_ = -1;
+            if (open_ == h) { DetachPopup(); return; }
+            if (justClosed) return;
+            OpenMenu(h);
+        });
+    }
+
+    ~MenuStrip() override { pollTimer_.Stop(); if (popup_) popup_->onClosed = nullptr; }
+
+    int AddMenu(const wxString& title, std::vector<MenuItemDef> items)
+    {
+        menus_.push_back({ title, std::move(items) });
+        Refresh();
+        return (int)menus_.size() - 1;
+    }
+
+    MenuItemDef* Item(int id)
+    {
+        for (auto& m : menus_)
+            for (auto& it : m.items)
+                if (!it.separator && it.id == id) return &it;
+        return nullptr;
+    }
+
+    void OpenMenu(int idx)
+    {
+        if (idx < 0 || idx >= (int)menus_.size()) return;
+        DetachPopup();
+        if (onOpen) onOpen(idx);
+
+        auto* p = new MenuPopup(this, t_, menus_[(size_t)idx].items);
+        popup_ = p;
+        open_ = idx;
+        p->onClosed = [this, p, idx](int chosen) { PopupClosed(p, idx, chosen); };
+        p->onSwitch = [this](int dir) {
+            const int n = (int)menus_.size();
+            if (n > 0 && open_ >= 0) { const int next = (open_ + dir + n) % n; CallAfter([this, next] { OpenMenu(next); }); }
+        };
+        p->Position(ClientToScreen(wxPoint(TitleX(idx), GetClientSize().y - 1)), wxSize(0, 0));
+        p->Popup(p->FocusTarget());
+        lastMouse_ = wxGetMousePosition();
+        pollTimer_.Start(60);
+        Refresh();
+    }
+
+private:
+    static constexpr int kPad = 14;
+
+    int TitleW(size_t i) const { return GetTextExtent(menus_[i].title).x + 2 * FromDIP(kPad); }
+
+    int TitleX(int idx) const
+    {
+        int x = FromDIP(6);
+        for (int i = 0; i < idx; ++i) x += TitleW((size_t)i);
+        return x;
+    }
+
+    int HitTest(const wxPoint& p) const
+    {
+        if (p.y < 0 || p.y >= GetClientSize().y) return -1;
+        int x = FromDIP(6);
+        for (size_t i = 0; i < menus_.size(); ++i) {
+            const int w = TitleW(i);
+            if (p.x >= x && p.x < x + w) return (int)i;
+            x += w;
+        }
+        return -1;
+    }
+
+    // Close the open menu without choosing anything (used when switching or toggling).
+    void DetachPopup()
+    {
+        if (!popup_) return;
+        MenuPopup* p = popup_;
+        popup_ = nullptr;
+        open_ = -1;
+        p->onClosed = nullptr;
+        p->CloseMenu();
+        CallAfter([p] { p->Destroy(); });
+        Refresh();
+    }
+
+    void PopupClosed(MenuPopup* p, int idx, int chosen)
+    {
+        if (p == popup_) popup_ = nullptr;
+        open_ = -1;
+        closedIdx_ = idx;
+        closedAt_ = std::chrono::steady_clock::now();
+        Refresh();
+        CallAfter([p] { p->Destroy(); });
+
+        if (chosen < 0 || idx < 0 || idx >= (int)menus_.size()) return;
+        auto& items = menus_[(size_t)idx].items;
+        if (chosen >= (int)items.size()) return;
+        MenuItemDef& it = items[(size_t)chosen];
+        if (it.check) it.checked = !it.checked;
+        const int id = it.id;
+        const bool checked = it.checked;
+        // run the command after the popup is fully gone (it may close this window)
+        CallAfter([this, id, checked] { if (onCommand) onCommand(id, checked); });
+    }
+
+    void OnPaint(wxPaintEvent&)
+    {
+        wxAutoBufferedPaintDC pdc(this);
+        pdc.SetBackground(wxBrush(t_.page));
+        pdc.Clear();
+        wxGCDC dc(pdc);
+        dc.SetFont(GetFont());
+        const wxSize s = GetClientSize();
+
+        dc.SetPen(wxPen(t_.border, 1));
+        dc.DrawLine(0, s.y - 1, s.x, s.y - 1);
+
+        int x = FromDIP(6);
+        for (size_t i = 0; i < menus_.size(); ++i) {
+            const int w = TitleW(i);
+            const bool active = (int)i == open_;
+            const bool hot = (int)i == hover_;
+            if (active || hot) {
+                dc.SetPen(*wxTRANSPARENT_PEN);
+                dc.SetBrush(wxBrush(active ? t_.track : MixColour(t_.page, t_.track, 70)));
+                dc.DrawRoundedRectangle(x + 1, 4, w - 2, s.y - 9, 6);
+            }
+            dc.SetTextForeground(active || hot ? t_.text : t_.sub);
+            const wxSize te = dc.GetTextExtent(menus_[i].title);
+            dc.DrawText(menus_[i].title, x + (w - te.x) / 2, (s.y - 1 - te.y) / 2);
+            x += w;
+        }
+    }
+
+    Theme t_;
+    std::vector<MenuDef> menus_;
+    MenuPopup* popup_ = nullptr;
+    int open_ = -1, hover_ = -1, closedIdx_ = -1;
+    std::chrono::steady_clock::time_point closedAt_{};
+    wxTimer pollTimer_;
+    wxPoint lastMouse_;
+};
+
+// ============================================================================
 // Main window
 // ============================================================================
 class MainFrame : public wxFrame {
 public:
     MainFrame()
         : wxFrame(nullptr, wxID_ANY, "seamless-input", wxDefaultPosition, wxSize(1100, 860)),
-          host_(wxGetHostName())
+          host_(wxString::FromUTF8(paths::HostName())),
+          alive_(std::make_shared<bool>(true))
     {
         SetTitle("seamless-input - " + host_);
         local_ = GetLocalAddresses();
-        localMons_ = GetLocalMonitors();
+        localMons_ = GetLocalMonitors();      // until the daemon reports the monitors it uses itself
+        dataDir_ = paths::DataDir();
 
-        // ---- this PC's identity (key pair) and the saved configs live in the user data dir
-        {
-#if defined(__WXMSW__)
-            // %APPDATA%\seamless-input
-            const wxString base = wxStandardPaths::Get().GetUserDataDir();
-#else
-            // $XDG_DATA_HOME/seamless-input, normally ~/.local/share/seamless-input
-            wxString xdg;
-            if (!wxGetEnv("XDG_DATA_HOME", &xdg) || xdg.empty()) xdg = wxGetHomeDir() + "/.local/share";
-            const wxString base = xdg + "/seamless-input";
-#endif
-            const std::filesystem::path dir = std::filesystem::u8path(std::string(base.utf8_str()));
-            ident_ = std::make_unique<Identity>(Identity::LoadOrCreate(dir, &identNote_));
-            store_ = std::make_unique<ConfigStore>(dir / "configs");
-            trust_ = std::make_unique<TrustStore>(dir / "trust.txt");
-            trust_->Load();
-            netTrust_ = std::make_unique<TrustStore>(dir / "network-trust.txt");
-            netTrust_->Load();
-            groupFile_ = dir / "group.txt";
-            {
-                std::ifstream gi(groupFile_);
-                std::string line;
-                if (gi && std::getline(gi, line)) {
-                    if (!line.empty() && line.back() == '\r') line.pop_back();
-                    groupPwd_ = line;
-                }
-            }
-            dataDir_ = wxString::FromUTF8(dir.u8string());
-        }
+        // The window holds no engine: the daemon (seamless-input-daemon) does the network, keyboard,
+        // mouse and audio work and keeps running when this window is closed. We mirror its state.
+        ipc::Client::Handlers h;
+        auto alive = alive_;
+        auto post = [alive](std::function<void(MainFrame*)> fn, MainFrame* self) {
+            wxTheApp->CallAfter([alive, fn, self] { if (*alive) fn(self); });
+        };
+        h.onSnapshot = [post, this](const state::Snapshot& s) {
+            post([s](MainFrame* f) { f->ApplySnapshot(s); }, this);
+        };
+        h.onLog = [post, this](const std::string& l) {
+            post([l](MainFrame* f) { f->LogRaw(wxString::FromUTF8(l)); }, this);
+        };
+        h.onStats = [post, this](const state::Stats& st) {
+            post([st](MainFrame* f) { f->stats_ = st; f->UpdateAudioStats(); }, this);
+        };
+        h.onDisconnected = [post, this]() { post([](MainFrame* f) { f->OnDisconnected(); }, this); };
+        client_ = std::make_shared<ipc::Client>(std::move(h));
 
         SetBackgroundColour(theme_.page);
         SetForegroundColour(theme_.text);
         auto* root = new wxBoxSizer(wxVERTICAL);
 
+        // ---- menu bar (custom drawn, filled in by BuildMenu)
+        menuBar_ = new MenuStrip(this, theme_);
+        root->Add(menuBar_, 0, wxEXPAND);
+
         // ---- header: host name, addresses, key
         {
-            wxString ips;
-            for (const auto& a : local_) ips += (ips.empty() ? "" : ", ") + wxString::FromUTF8(a.ip);
             auto* title = new wxStaticText(this, wxID_ANY, host_);
             wxFont tf = title->GetFont();
             tf.SetWeight(wxFONTWEIGHT_BOLD);
             tf.SetPointSize(tf.GetPointSize() + 5);
             title->SetFont(tf);
             title->SetForegroundColour(theme_.text);
-            auto* sub = new wxStaticText(this, wxID_ANY,
-                wxString::Format("IP %s   |   Key %s   |   TCP %d   UDP %d (discovery)   UDP %d (audio)",
-                                 ips.empty() ? wxString("-") : ips,
-                                 wxString::FromUTF8(ident_->Fingerprint()),
-                                 (int)kTcpPort, (int)kDiscoveryPort, (int)kAudioPort));
-            sub->SetForegroundColour(theme_.sub);
+            hdrSub_ = new wxStaticText(this, wxID_ANY, "");
+            hdrSub_->SetForegroundColour(theme_.sub);
             auto* hs = new wxBoxSizer(wxVERTICAL);
             hs->Add(title, 0, wxBOTTOM, 2);
-            hs->Add(sub, 0);
+            hs->Add(hdrSub_, 0);
             root->Add(hs, 0, wxEXPAND | wxLEFT | wxRIGHT | wxTOP, 14);
         }
 
@@ -1444,6 +1827,9 @@ public:
         root->Add(pages_, 3, wxEXPAND | wxLEFT | wxRIGHT | wxBOTTOM, 10);
         SetSizer(root);
 
+        BuildMenu();
+        UpdateHeader();
+
         // ---- events
         goBtn_->Bind(wxEVT_BUTTON, [this](wxCommandEvent&) { Activate(target_->GetValue().ToStdString()); });
         target_->Bind(wxEVT_TEXT_ENTER, [this](wxCommandEvent&) { Activate(target_->GetValue().ToStdString()); });
@@ -1451,11 +1837,10 @@ public:
         groupBtn_->Bind(wxEVT_BUTTON, [this](wxCommandEvent&) { ApplyGroupPassword(); });
         groupCtl_->Bind(wxEVT_TEXT_ENTER, [this](wxCommandEvent&) { ApplyGroupPassword(); });
 
-        masterMute_->onToggle = [this](bool m) { audio_->SetMuted(m); MarkCfgDirty(); };
+        masterMute_->onToggle = [this](bool) { SendMaster(); };
         volSlider_->Bind(wxEVT_SLIDER, [this](wxCommandEvent&) {
-            audio_->SetVolume(volSlider_->GetValue() / 100.0f);
             masterPct_->SetLabelText(wxString::Format("%d%%", volSlider_->GetValue()));
-            MarkCfgDirty();
+            SendMaster();
         });
 
         Bind(wxEVT_CLOSE_WINDOW, &MainFrame::OnClose, this);
@@ -1467,92 +1852,13 @@ public:
         animTimer_.SetOwner(this, kAnimTimerId);
         Bind(wxEVT_TIMER, [this](wxTimerEvent&) { ++animStep_; UpdateSearchLabel(); }, kAnimTimerId);
 
-        statTimer_.SetOwner(this, kStatTimerId);
-        Bind(wxEVT_TIMER, [this](wxTimerEvent&) { UpdateAudioStats(); }, kStatTimerId);
-        statTimer_.Start(250);
-
-        canvas_->onPeerMoved = [this](int id, double x, double y) { SendPos(id, x, y); BroadcastRelative(id); };
-
-        // ---- network (callbacks arrive on the asio thread -> marshal to GUI)
-        NetCallbacks cb;
-        cb.onStatus = [this](const std::string& s) {
-            CallAfter([this, s] { Log(wxString::FromUTF8(s)); });
+        canvas_->onPeerMoved = [this](int id, double x, double y) {
+            lastMove_[id] = std::chrono::steady_clock::now();     // ignore stale echoes of our own drag
+            client_->Send("MOVE " + std::to_string(id) + " " + std::to_string(std::llround(x)) + " " + std::to_string(std::llround(y)));
         };
-        cb.onPeerReady = [this](int id, std::uint32_t inst, const std::string& key,
-                                const std::string& name, const std::string& addr, bool incoming,
-                                bool viaGroup) {
-            CallAfter([this, id, inst, key, name, addr, incoming, viaGroup] {
-                OnPeerReady(id, inst, key, wxString::FromUTF8(name), addr, incoming, viaGroup);
-            });
-        };
-        cb.onPeerPending = [this](int id, std::uint32_t inst, const std::string& key,
-                                  const std::string& name, const std::string& addr, bool incoming,
-                                  bool theyTrust) {
-            CallAfter([this, id, inst, key, name, addr, incoming, theyTrust] {
-                OnPeerPending(id, inst, key, wxString::FromUTF8(name), addr, incoming, theyTrust);
-            });
-        };
-        cb.onPeerPendingLost = [this](int id) {
-            CallAfter([this, id] { if (pend_.erase(id)) RebuildClients(); });
-        };
-        cb.onPeerLost = [this](int id) {
-            if (input_) input_->RemovePeer(id);     // hand input back immediately
-            CallAfter([this, id] { OnPeerLost(id); });
-        };
-        cb.onMessage = [this](int id, const std::string& line) {
-            // Keyboard/mouse traffic is injected right here on the network thread:
-            // going through the GUI event loop would add visible lag.
-            if (input_ && input_->HandleMessage(id, line)) return;
-            CallAfter([this, id, line] { OnMessage(id, line); });
-        };
-        cb.onBeacon = [this](const BeaconInfo& b) {
-            CallAfter([this, b] { OnBeacon(b); });
-        };
-        cb.onScanHost = [this](const std::string& ip, bool server) {
-            CallAfter([this, ip, server] { OnScanHost(ip, server); });
-        };
-        cb.onHostName = [this](const std::string& ip, const std::string& name) {
-            CallAfter([this, ip, name] { OnHostName(ip, wxString::FromUTF8(name)); });
-        };
-        cb.onScanDone = [this]() { CallAfter([this] { OnScanDone(); }); };
-        net_ = std::make_unique<Network>(host_.ToStdString(), *ident_, std::move(cb));
-
-        audio_ = std::make_unique<AudioEngine>(net_->Instance());
-        {
-            std::string err;
-            if (audio_->Start(&err)) Log("Audio ready (UDP " + wxString::Format("%d", (int)kAudioPort) + ")");
-            else                     Log("Audio problem: " + wxString::FromUTF8(err));
-        }
-
-        input_ = std::make_unique<InputEngine>(
-            [this](int id, const std::string& line) { net_->Send(id, line); },
-            [this](const std::string& msg) { CallAfter([this, msg] { Log("Input: " + wxString::FromUTF8(msg)); }); });
-        {
-            std::vector<InputRect> rects;
-            for (const auto& m : localMons_) rects.push_back({m.x, m.y, m.width, m.height});
-            input_->SetLocalMonitors(rects);
-        }
-        input_->onModeChange = [this](InputEngine::Mode m, int id) {
-            CallAfter([this, m, id] { inputMode_ = m; inputPeer_ = id; RebuildDevices(); });
-        };
-        input_->onControlRequest = [this](int id) { CallAfter([this, id] { OnControlRequest(id); }); };
-        {
-            std::string msg;
-            if (input_->Start(&msg)) Log("Keyboard/mouse sharing ready: " + wxString::FromUTF8(input_->BackendName()));
-            else                     Log("Keyboard/mouse sharing unavailable: " + wxString::FromUTF8(msg));
-            if (!msg.empty() && input_->BackendName() != "none") Log("Input: " + wxString::FromUTF8(msg));
-        }
 
         RebuildList();
-        Log("This PC's key: " + wxString::FromUTF8(ident_->Fingerprint()) + "   (data: " + dataDir_ + ")");
-        if (!identNote_.empty()) Log("Identity: " + wxString::FromUTF8(identNote_));
-        Log(groupPwd_.empty()
-            ? "Ready. No password set - PCs without a password connect automatically."
-            : "Ready. PCs with the same group password connect automatically.");
-        net_->SetGroup(groupPwd_);
         UpdateGroupLabel();
-        net_->Start();
-        StartScan();
         listDirty_ = true;      // force the first real layout of the client / other-host list
         RebuildClients();
         Layout();
@@ -1565,29 +1871,26 @@ public:
             if (cliScroll_) { cliSizer_->Layout(); cliScroll_->FitInside(); }
         });
         if (theme_.dark) { DarkTitleBar(this); DarkenTree(this); }
+
+        // Starting the window starts the background service if it is not running yet.
+        LogRaw(wxDateTime::Now().FormatTime() + "  Connecting to the background service...");
+        StartConnect();
     }
+
+    ~MainFrame() override { *alive_ = false; }
 
 private:
     static constexpr int kTimerId     = 9000;
     static constexpr int kAnimTimerId = 9001;
-    static constexpr int kStatTimerId = 9002;
+    enum { kIdAutostart = 9100, kIdSvcInfo, kIdToggleSvc, kIdQuitAll, kIdOpenFileMenu, kIdOpenSettingsMenu };
 
-    struct Entry { wxString name; std::string ip; wxString status; bool local; };
+    struct Entry { wxString name; std::string ip; wxString status; };
     struct Discovered {
         std::string host;
         bool server;
         std::chrono::steady_clock::time_point seen;
         std::string key;            // announced public key (proven only by the handshake)
         bool sameGroup = false;
-    };
-    // connected to us but neither in our group nor mutually trusted (yet)
-    struct PendInfo {
-        std::uint32_t inst = 0;
-        std::string key;
-        wxString name;
-        std::string addr;
-        bool incoming = false;
-        bool theyTrust = false;
     };
     struct Scanned {
         wxString name;
@@ -1601,13 +1904,196 @@ private:
         std::string addr;
         std::vector<wxRect> mons;
         bool incoming = false;
-        bool viaGroup = false;      // accepted because of the group password (else: mutual trust)
         bool placed = false;
+        double ox = 0, oy = 0;
         bool share = false;         // send my audio (system audio) to this device
         bool mic = false;           // send my microphone to this device
         bool mute = false;          // mute what it sends me
         int  vol = 100;             // 0..100, what I hear from it
+        bool allowed = false;       // may it control this PC?
     };
+
+    // ------------------------------------------------------------ daemon connection
+    void StartConnect()
+    {
+        if (connecting_) return;
+        connecting_ = true;
+        auto client = client_;
+        auto alive = alive_;
+        const auto dir = dataDir_;
+        std::thread([this, client, alive, dir] {
+            std::string err;
+            const bool ok = svc::EnsureDaemon(dir, &err) && client->Connect(dir, false, &err);
+            wxTheApp->CallAfter([this, alive, ok, err] { if (*alive) FinishConnect(ok, err); });
+        }).detach();
+    }
+
+    void FinishConnect(bool ok, const std::string& err)
+    {
+        connecting_ = false;
+        if (!ok) {
+            if (err != lastConnErr_) Log("Cannot reach the background service: " + wxString::FromUTF8(err));
+            lastConnErr_ = err;
+            UpdateHeader();
+            return;
+        }
+        lastConnErr_.clear();
+        log_->Clear();                                  // the daemon replays its log history on attach
+        connected_ = true;
+        client_->Send("ATTACH");
+        SendMonitorsHint();
+        client_->Send("SCAN");
+        UpdateHeader();
+    }
+
+    void OnDisconnected()
+    {
+        connected_ = false;
+        Log(daemonWanted_ ? "Lost the connection to the background service - reconnecting"
+                          : "Background service stopped");
+        retry_ = 0;
+        UpdateHeader();
+    }
+
+    void SendMonitorsHint()
+    {
+        std::string l = "MONITORS " + std::to_string(GetLocalMonitors().size());
+        for (const auto& m : GetLocalMonitors())
+            l += " " + std::to_string(m.x) + " " + std::to_string(m.y) + " " + std::to_string(m.width) + " " + std::to_string(m.height);
+        client_->Send(l);
+    }
+
+    void UpdateHeader()
+    {
+        wxString ips;
+        for (const auto& a : local_) ips += (ips.empty() ? "" : ", ") + wxString::FromUTF8(a.ip);
+        wxString svcState = connected_ ? "connected"
+                          : !daemonWanted_ ? "stopped"
+                          : connecting_ ? "starting..." : "not connected";
+        hdrSub_->SetLabelText(wxString::Format(
+            "IP %s   |   Key %s   |   TCP %d   UDP %d (discovery)   UDP %d (audio)   |   Background service: %s",
+            ips.empty() ? wxString("-") : ips,
+            snap_.pubKey.empty() ? wxString("-") : wxString::FromUTF8(Identity::Fingerprint(snap_.pubKey)),
+            (int)kTcpPort, (int)kDiscoveryPort, (int)kAudioPort, svcState));
+    }
+
+    // ------------------------------------------------------------ settings menu
+    // The menus are drawn by MenuStrip (not a native wxMenuBar) so they look the same on every OS.
+    void BuildMenu()
+    {
+#if defined(__WXOSX__)
+        const wxString closeKey = "Cmd+W";
+#else
+        const wxString closeKey = "Ctrl+W";
+#endif
+        auto item = [](int id, const wxString& label) { MenuItemDef d; d.id = id; d.label = label; return d; };
+        auto sep = [] { MenuItemDef d; d.separator = true; return d; };
+
+        MenuItemDef close = item(wxID_CLOSE, "Close window");
+        close.accel = closeKey;
+        menuBar_->AddMenu("File", { close, item(kIdQuitAll, "Quit and stop the background service") });
+
+#if defined(__WXMSW__)
+        MenuItemDef autostart = item(kIdAutostart, "Start the background service with Windows");
+#else
+        MenuItemDef autostart = item(kIdAutostart, "Start the background daemon at login");
+#endif
+        autostart.check = true;
+        MenuItemDef info = item(kIdSvcInfo, "Background service: ...");
+        info.enabled = false;
+        menuBar_->AddMenu("Settings", { autostart, sep(), info, item(kIdToggleSvc, "Stop background service now") });
+
+        menuBar_->onOpen = [this](int) { RefreshServiceMenu(); };
+        menuBar_->onCommand = [this](int id, bool checked) {
+            wxCommandEvent ev(wxEVT_MENU, id);
+            ev.SetEventObject(menuBar_);
+            ev.SetInt(checked ? 1 : 0);
+            ProcessWindowEvent(ev);
+        };
+
+        Bind(wxEVT_MENU, [this](wxCommandEvent&) { Close(); }, wxID_CLOSE);
+        Bind(wxEVT_MENU, [this](wxCommandEvent&) { QuitAll(); }, kIdQuitAll);
+        Bind(wxEVT_MENU, &MainFrame::OnAutostart, this, kIdAutostart);
+        Bind(wxEVT_MENU, [this](wxCommandEvent&) { ToggleService(); }, kIdToggleSvc);
+        Bind(wxEVT_MENU, [this](wxCommandEvent&) { menuBar_->OpenMenu(0); }, kIdOpenFileMenu);
+        Bind(wxEVT_MENU, [this](wxCommandEvent&) { menuBar_->OpenMenu(1); }, kIdOpenSettingsMenu);
+
+        // keyboard shortcuts (a native menu bar used to provide these)
+        std::vector<wxAcceleratorEntry> keys;
+        keys.emplace_back(wxACCEL_CTRL, (int)'W', wxID_CLOSE);
+#if !defined(__WXOSX__)
+        keys.emplace_back(wxACCEL_ALT, (int)'F', kIdOpenFileMenu);
+        keys.emplace_back(wxACCEL_ALT, (int)'S', kIdOpenSettingsMenu);
+#endif
+        SetAcceleratorTable(wxAcceleratorTable((int)keys.size(), keys.data()));
+    }
+
+    void RefreshServiceMenu()
+    {
+        if (!menuBar_) return;
+        const svc::AutostartInfo a = svc::QueryAutostart();
+        if (MenuItemDef* m = menuBar_->Item(kIdAutostart)) {
+            m->checked = a.enabled;
+            m->enabled = a.supported && !busy_;
+        }
+        wxString st = connected_ ? "running" : daemonWanted_ ? "not reachable" : "stopped";
+        if (MenuItemDef* m = menuBar_->Item(kIdSvcInfo))
+            m->label = "Background service: " + st + "  (" + wxString::FromUTF8(a.kind) +
+                       (a.enabled ? ", autostart on)" : ", autostart off)");
+        if (MenuItemDef* m = menuBar_->Item(kIdToggleSvc))
+            m->label = daemonWanted_ ? "Stop background service now" : "Start background service now";
+    }
+
+    void OnAutostart(wxCommandEvent& e)
+    {
+        if (busy_) return;
+        busy_ = true;
+        const bool on = e.IsChecked();
+        daemonWanted_ = true;
+        Log(on ? "Enabling autostart of the background service..." : "Disabling autostart of the background service...");
+        auto alive = alive_;
+        const auto dir = dataDir_;
+        std::thread([this, alive, dir, on] {
+            std::string err, err2;
+            bool ok = on ? svc::EnableAutostart(&err) : svc::DisableAutostart(&err);
+            if (ok) {
+                // hand the daemon over to its new owner, or keep one running for this window
+                if (ipc::Ping(dir)) { ipc::RequestStop(dir); svc::WaitGone(dir, 5000); }
+                svc::EnsureDaemon(dir, &err2);
+            }
+            wxTheApp->CallAfter([this, alive, ok, on, err] { if (*alive) AutostartDone(ok, on, err); });
+        }).detach();
+    }
+
+    void AutostartDone(bool ok, bool on, const std::string& err)
+    {
+        busy_ = false;
+        if (ok) Log(on ? "Autostart is on: the background service starts by itself"
+                       : "Autostart is off");
+        else    wxMessageBox(wxString::FromUTF8(err), "Autostart", wxOK | wxICON_WARNING, this);
+        retry_ = 3;     // reconnect right away
+    }
+
+    void ToggleService()
+    {
+        if (daemonWanted_) {
+            daemonWanted_ = false;
+            ipc::RequestStop(dataDir_);
+            Log("Stopping the background service (it starts again with the next window, or at login if autostart is on)");
+        } else {
+            daemonWanted_ = true;
+            retry_ = 3;
+            Log("Starting the background service...");
+        }
+        UpdateHeader();
+    }
+
+    void QuitAll()
+    {
+        daemonWanted_ = false;
+        ipc::RequestStop(dataDir_);
+        Close();
+    }
 
     // ---------------------------------------------------------------- pages
     // Network tab: clients + other hosts on the left; group, manual connect and activity log on the right.
@@ -1867,51 +2353,37 @@ private:
         r.sub->SetForegroundColour(theme_.sub);
         r.detail->SetForegroundColour(theme_.sub);
 
-        // events (looked up by connection id: the card may outlive a rebuild of the map)
+        // events (looked up by connection id: the card may outlive a rebuild of the map).
+        // The change is applied here at once and sent to the daemon, which does the real work.
         r.share->Bind(wxEVT_CHECKBOX, [this, id](wxCommandEvent& e) {
             auto it = peers_.find(id);
             if (it == peers_.end()) return;
             it->second.share = e.IsChecked();
-            audio_->SetPeerSend(it->second.inst, AudioSource::System, it->second.share);
-            Log((it->second.share ? "Sharing audio with " : "Stopped sharing audio with ") + it->second.name);
-            RefreshCapture();
-            RecordPeerAudio(it->second);
-            RefreshDeviceRows();
+            SendAudio(id);
         });
         r.mic->Bind(wxEVT_CHECKBOX, [this, id](wxCommandEvent& e) {
             auto it = peers_.find(id);
             if (it == peers_.end()) return;
             it->second.mic = e.IsChecked();
-            audio_->SetPeerSend(it->second.inst, AudioSource::Microphone, it->second.mic);
-            Log((it->second.mic ? "Sharing microphone with " : "Stopped sharing microphone with ") + it->second.name);
-            RefreshCapture();
-            RecordPeerAudio(it->second);
-            RefreshDeviceRows();
+            SendAudio(id);
         });
         r.allow->Bind(wxEVT_CHECKBOX, [this, id](wxCommandEvent& e) {
-            auto it = peers_.find(id);
-            if (it == peers_.end()) return;
-            const bool on = e.IsChecked();
-            SetTrust(it->second, on ? TrustStore::State::Allowed : TrustStore::State::Denied);
-            input_->SetPeerAllowed(id, on);
-            Log((on ? "Allowed " : "Blocked ") + it->second.name + (on ? " to control this PC" : " from controlling this PC"));
-            RefreshDeviceRows();
+            if (peers_.find(id) == peers_.end()) return;
+            client_->Send("CONTROL " + std::to_string(id) + (e.IsChecked() ? " 1" : " 0"));
         });
         r.mute->onToggle = [this, id](bool m) {
             auto it = peers_.find(id);
             if (it == peers_.end()) return;
             it->second.mute = m;
-            audio_->SetPeerMuted(it->second.inst, m);
-            RecordPeerAudio(it->second);
+            SendAudio(id);
         };
         r.vol->Bind(wxEVT_SLIDER, [this, id](wxCommandEvent& e) {
             auto it = peers_.find(id);
             if (it == peers_.end()) return;
             it->second.vol = e.GetInt();
-            audio_->SetPeerVolume(it->second.inst, it->second.vol / 100.0f);
             auto rit = devRows_.find(id);
             if (rit != devRows_.end()) rit->second.pct->SetLabelText(wxString::Format("%d%%", it->second.vol));
-            RecordPeerAudio(it->second);
+            SendAudio(id);
         });
 
         devSizer_->Add(r.card, 0, wxEXPAND | wxBOTTOM, 10);
@@ -1936,20 +2408,18 @@ private:
         SetText(r.name, p.name);
         SetText(r.sub, wxString::FromUTF8(p.addr) + dot + ScreensText(p.mons));
 
-        const auto ts = trust_->Get(p.key);
         wxString in;
         wxColour accent = theme_.ok;
-        if (inputMode_ == InputEngine::Mode::Forwarding && inputPeer_ == id)  { in = "you are controlling it now"; accent = theme_.accent; }
-        else if (inputMode_ == InputEngine::Mode::Controlled && inputPeer_ == id) { in = "it is controlling this PC now"; accent = theme_.warn; }
-        else if (ts == TrustStore::State::Allowed) in = "may control this PC";
-        else if (ts == TrustStore::State::Denied)  in = "blocked from controlling this PC";
-        else                                       in = "asks before controlling this PC";
+        if (inputMode_ == 1 && inputPeer_ == id)  { in = "you are controlling it now"; accent = theme_.accent; }
+        else if (inputMode_ == 2 && inputPeer_ == id) { in = "it is controlling this PC now"; accent = theme_.warn; }
+        else if (p.allowed) in = "may control this PC";
+        else                in = "cannot control this PC";
         SetText(r.detail, "Key " + wxString::FromUTF8(Identity::Fingerprint(p.key)) + dot + in);
         r.card->SetAccent(accent);
 
         r.share->SetValue(p.share);
         r.mic->SetValue(p.mic);
-        r.allow->SetValue(ts == TrustStore::State::Allowed);
+        r.allow->SetValue(p.allowed);
         r.mute->SetMuted(p.mute);
         r.vol->SetValue(p.vol);
         SetText(r.pct, wxString::Format("%d%%", p.vol));
@@ -1973,36 +2443,20 @@ private:
     void ApplyGroupPassword()
     {
         groupPwd_ = std::string(groupCtl_->GetValue().utf8_str());
-        std::error_code ec;
-        if (groupPwd_.empty()) {
-            std::filesystem::remove(groupFile_, ec);
-        } else {
-            std::filesystem::create_directories(groupFile_.parent_path(), ec);
-            {
-                std::ofstream out(groupFile_, std::ios::trunc);
-                out << groupPwd_ << "\n";
-            }
-            // owner-only: the password lets other PCs join this group
-            std::filesystem::permissions(groupFile_, std::filesystem::perms::owner_read | std::filesystem::perms::owner_write,
-                                         std::filesystem::perm_options::replace, ec);
-        }
-        net_->SetGroup(groupPwd_);
+        client_->Send("GROUP " + ipc::Enc(groupPwd_));
         UpdateGroupLabel();
-        Log(groupPwd_.empty() ? "Password removed - reconnecting"
-                              : "Password set - reconnecting");
     }
 
     // ------------------------------------------------------------ clients (Network tab)
     struct CliView {
         std::string key, ip;
         wxString name;
-        bool connected = false, viaGroup = false;
-        bool pending = false, theyTrust = false;
+        bool connected = false;
         bool sameGroup = false, seen = false;
     };
 
     // One entry per PC (by public key) that runs seamless-input: seen on the LAN, connected,
-    // waiting for trust, or trusted earlier.
+    // or connected.
     std::vector<CliView> ClientViews() const
     {
         std::map<std::string, CliView> m;
@@ -2015,18 +2469,10 @@ private:
             v.sameGroup = kv.second.sameGroup;
             v.seen = true;
         }
-        for (const auto& kv : pend_) {
-            CliView& v = at(kv.second.key);
-            v.pending = true;
-            v.theyTrust = kv.second.theyTrust;
-            v.ip = kv.second.addr;
-            if (v.name.empty()) v.name = kv.second.name;
-        }
         for (const auto& kv : peers_) {
             if (kv.second.key.empty()) continue;
             CliView& v = at(kv.second.key);
             v.connected = true;
-            v.viaGroup = kv.second.viaGroup;
             v.ip = kv.second.addr;
             v.name = kv.second.name;
         }
@@ -2250,258 +2696,29 @@ private:
         SetText(clientsCount_, wxString::Format("%d found, %d connected", (int)views.size(), conn));
     }
 
-    // ---------------------------------------------------------------- actions
+    // ---------------------------------------------------------------- actions (all go to the daemon)
     void Activate(const std::string& ip)
     {
         if (ip.empty()) return;
-        bool isLocal = ip.rfind("127.", 0) == 0;
-        for (const auto& a : local_) isLocal = isLocal || a.ip == ip;
-
-        selectedIp_ = ip;
-        if (isLocal) Log("Selected this machine (" + wxString::FromUTF8(ip) + ")");
-        else         Log("Selected " + wxString::FromUTF8(ip) + " - trying to connect");
-        net_->Select(ip, isLocal);
+        client_->Send("SELECT " + ipc::Enc(ip));
     }
 
-    // With 3+ PCs every PC keeps the whole layout in its own frame. When the user drags PC X
-    // here, the other PCs must learn where X now is relative to THEM (and X where they are),
-    // otherwise PC2 and PC3 would disagree about their own neighbourhood.
-    void BroadcastRelative(int movedId)
+    void StartScan() { client_->Send("SCAN"); }
+
+    void SendMaster()
     {
-        auto mit = peers_.find(movedId);
-        double mx = 0, my = 0;
-        if (mit == peers_.end() || mit->second.key.empty() || !canvas_->PeerPos(movedId, mx, my)) return;
-        for (const auto& kv : peers_) {
-            if (kv.first == movedId || !kv.second.placed || kv.second.key.empty()) continue;
-            double qx = 0, qy = 0;
-            if (!canvas_->PeerPos(kv.first, qx, qy)) continue;
-            net_->Send(kv.first, "PEERPOS " + mit->second.key + " " +
-                       std::to_string(std::llround(mx - qx)) + " " + std::to_string(std::llround(my - qy)));
-            net_->Send(movedId, "PEERPOS " + kv.second.key + " " +
-                       std::to_string(std::llround(qx - mx)) + " " + std::to_string(std::llround(qy - my)));
-        }
+        masterSent_ = std::chrono::steady_clock::now();
+        client_->Send(wxString::Format("MASTER %d %d", masterMute_->IsMuted() ? 1 : 0, volSlider_->GetValue()).ToStdString());
     }
 
-    void SendPos(int id, double x, double y)
-    {
-        input_->SetPeerOffset(id, x, y);
-        net_->Send(id, "POS " + std::to_string(std::lround(x)) + " " + std::to_string(std::lround(y)));
-        RecordPeerPos(id, x, y);
-    }
-
-    // ------------------------------------------------------------ saved configs
-    // The config that belongs to the exact set of connected PCs (by public key) is
-    // kept in cfg_. Every change goes into cfg_ right away and is written to disk
-    // shortly afterwards; when the set changes the matching config is loaded.
-    void UpdateCfgFromUi()
-    {
-        cfg_.audio.mute   = masterMute_->IsMuted();
-        cfg_.audio.volume = volSlider_->GetValue();
-        cfg_.inputEnabled = true;     // legacy field: permissions live in trust.txt, per device
-        for (const auto& kv : peers_) RecordPeerAudio(kv.second, true);
-    }
-
-    void TouchCfg()
-    {
-        cfgDirty_ = true;
-        dirtyAt_ = std::chrono::steady_clock::now();
-    }
-
-    void MarkCfgDirty()
-    {
-        if (!haveCfg_ || loading_) return;
-        UpdateCfgFromUi();
-        TouchCfg();
-    }
-
-    // 'force': also while loading / for the initial fill of a new config (caller handles saving)
-    void RecordPeerAudio(const PeerInfo& p, bool force = false)
-    {
-        if (!haveCfg_ || p.key.empty() || (loading_ && !force)) return;
-        SavedPeer& sp = cfg_.PeerRef(p.key);
-        sp.hasAudio = true;
-        sp.send = p.share;
-        sp.mic = p.mic;
-        sp.hasMic = true;
-        sp.mute = p.mute;
-        sp.volume = p.vol;
-        if (!force) TouchCfg();
-    }
-
-    void RecordPeerPos(int id, double x, double y)
-    {
-        if (!haveCfg_) return;
-        auto it = peers_.find(id);
-        if (it == peers_.end() || it->second.key.empty()) return;
-        SavedPeer& sp = cfg_.PeerRef(it->second.key);
-        const std::string name = std::string(it->second.name.utf8_str());
-        const bool changed = std::llround(sp.ox) != std::llround(x) || std::llround(sp.oy) != std::llround(y) ||
-                             sp.name != name;
-        sp.ox = x;
-        sp.oy = y;
-        sp.name = name;
-        sp.hasPos = true;
-        if (changed && !loading_) TouchCfg();
-    }
-
-    void FlushConfig()
-    {
-        if (!haveCfg_ || !cfgDirty_) return;
-        cfgDirty_ = false;
-        cfg_.rev = NowMs();
-        std::string err;
-        if (!store_->Save(cfg_, &err)) Log("Could not save config: " + wxString::FromUTF8(err));
-    }
-
-    // Puts the saved position of peer 'id' on the canvas (pushed off any overlap) and, when this
-    // side accepted the connection, tells the peer. Without a saved position the current one is kept.
-    void ApplyStoredLayout(int id)
+    void SendAudio(int id)
     {
         auto it = peers_.find(id);
-        if (it == peers_.end() || !it->second.placed) return;
-        PeerInfo& p = it->second;
-        double x = 0, y = 0;
-        const SavedPeer* sp = haveCfg_ ? cfg_.FindPeer(p.key) : nullptr;
-        if (sp && sp->hasPos) {
-            const auto pos = canvas_->PlacePeer(id, sp->ox, sp->oy);
-            x = pos.first;
-            y = pos.second;
-        } else if (!canvas_->PeerPos(id, x, y)) {
-            return;
-        }
-        if (p.incoming) SendPos(id, x, y);            // the accepting side is authoritative
-        else { input_->SetPeerOffset(id, x, y); RecordPeerPos(id, x, y); }
-    }
-
-    void PushPeerAudio(const PeerInfo& p)
-    {
-        audio_->SetPeerSend(p.inst, AudioSource::System, p.share);
-        audio_->SetPeerSend(p.inst, AudioSource::Microphone, p.mic);
-        audio_->SetPeerMuted(p.inst, p.mute);
-        audio_->SetPeerVolume(p.inst, p.vol / 100.0f);
-    }
-
-    // Audio / input settings of the config go into the widgets and the engines.
-    void ApplyConfigSettings()
-    {
-        const SavedAudio& a = cfg_.audio;
-
-        masterMute_->SetMuted(a.mute);
-        audio_->SetMuted(a.mute);
-        volSlider_->SetValue(a.volume);
-        masterPct_->SetLabelText(wxString::Format("%d%%", a.volume));
-        audio_->SetVolume(a.volume / 100.0f);
-
-        for (auto& kv : peers_) {
-            PeerInfo& p = kv.second;
-            const SavedPeer* sp = cfg_.FindPeer(p.key);
-            if (sp && sp->hasAudio) { p.share = sp->send; p.mic = sp->mic; p.mute = sp->mute; p.vol = sp->volume; }
-            else {                                                      // old file: one switch and one source for all
-                p.share = a.send && a.source == 1;
-                p.mic   = a.send && a.source != 1;
-                p.mute = false; p.vol = 100;
-            }
-            PushPeerAudio(p);
-        }
-        RefreshCapture();
-        if (sysCapturing_ || micCapturing_) Log("Audio sharing switched on by the saved config");
-        RefreshDeviceRows();
-
-    }
-
-    // Called whenever a PC joins or leaves: save the old config, load (or start) the one
-    // for the new set of PCs.
-    void OnSetChanged()
-    {
-        FlushConfig();
-
-        std::vector<std::string> members{ident_->PublicHex()};
-        wxString names = host_;
-        for (const auto& kv : peers_) {
-            members.push_back(kv.second.key);
-            names += " + " + kv.second.name;
-        }
-        members = ConfigStore::Normalize(members);
-
-        if (members.size() < 2) { haveCfg_ = false; return; }          // alone: nothing to save
-        if (haveCfg_ && cfg_.members == members) return;
-
-        loading_ = true;
-        SavedConfig loaded;
-        const wxString id = wxString::FromUTF8(ConfigStore::SetId(members));
-        if (store_->Load(members, loaded)) {
-            cfg_ = std::move(loaded);
-            haveCfg_ = true;
-            Log("Loaded saved config " + id + " for " + names);
-            ApplyConfigSettings();
-        } else {
-            cfg_ = SavedConfig{};                    // new combination: start from the current settings
-            cfg_.members = members;
-            haveCfg_ = true;
-            UpdateCfgFromUi();
-            TouchCfg();
-            Log("New combination of PCs (" + names + ") - created config " + id);
-        }
-        cfg_.label = std::string(names.utf8_str());
-
-        for (const auto& kv : peers_) ApplyStoredLayout(kv.first);   // peers that already sent SCREENS
-        loading_ = false;
-    }
-
-    std::string ScreensLine() const
-    {
-        std::string s = "SCREENS " + std::to_string(localMons_.size());
-        for (const auto& m : localMons_)
-            s += " " + std::to_string(m.x) + " " + std::to_string(m.y) + " " +
-                 std::to_string(m.width) + " " + std::to_string(m.height);
-        return s;
-    }
-
-    // Each source is captured (on its default device) while at least one device has the
-    // matching box ticked: "Share my audio" = system audio, "Share my microphone" = mic.
-    void RefreshCapture()
-    {
-        bool anySys = false, anyMic = false;
-        for (const auto& kv : peers_) { anySys = anySys || kv.second.share; anyMic = anyMic || kv.second.mic; }
-
-        UpdateCapture(AudioSource::System,     anySys, sysCapturing_, "system audio");
-        UpdateCapture(AudioSource::Microphone, anyMic, micCapturing_, "microphone");
-    }
-
-    void UpdateCapture(AudioSource src, bool want, bool& capturing, const char* what)
-    {
-        if (want == capturing) return;
-        std::string err;
-        if (!audio_->SetCapture(src, want, &err)) {
-            Log(wxString("Capturing ") + what + " failed: " + wxString::FromUTF8(err));
-            for (auto& kv : peers_) {
-                bool& flag = src == AudioSource::System ? kv.second.share : kv.second.mic;
-                flag = false;
-                audio_->SetPeerSend(kv.second.inst, src, false);
-                RecordPeerAudio(kv.second);
-            }
-            capturing = false;
-            RefreshDeviceRows();
-            return;
-        }
-        capturing = want;
-        Log(wxString(want ? "Capturing " : "Stopped capturing ") + what);
-    }
-
-    // ------------------------------------------------------------------- scan
-    void StartScan()
-    {
-        if (scanning_) return;
-        std::vector<std::pair<std::string, int>> nets;
-        for (const auto& a : local_) nets.emplace_back(a.ip, a.prefix);
-        if (nets.empty()) { Log("No network interface to scan"); return; }
-        scanning_ = true;
-        scanBtn_->Enable(false);
-        scanBtn_->SetLabel("Scanning...");
-        animStep_ = 0;
-        UpdateSearchLabel();
-        animTimer_.Start(300);
-        net_->Scan(nets);
+        if (it == peers_.end()) return;
+        const PeerInfo& p = it->second;
+        lastAudio_[id] = std::chrono::steady_clock::now();
+        client_->Send("AUDIO " + std::to_string(id) + " " + (p.share ? "1" : "0") + " " + (p.mic ? "1" : "0") + " " +
+                      (p.mute ? "1" : "0") + " " + std::to_string(p.vol));
     }
 
     void UpdateSearchLabel()
@@ -2511,166 +2728,99 @@ private:
         searchLbl_->SetLabel(wxString::Format("searching %s   (%d found)", dots, (int)scan_.size()));
     }
 
-    void OnScanDone()
+    // ------------------------------------------------------- state from the daemon
+    void ApplySnapshot(const state::Snapshot& s)
     {
-        scanning_ = false;
-        animTimer_.Stop();
-        searchLbl_->SetLabel(wxString::Format("Scan complete: %d host(s) found", (int)scan_.size()));
-        scanBtn_->SetLabel("Scan LAN");
-        scanBtn_->Enable(true);
-    }
+        const auto lines = ipc::SerializeSnapshot(s);
+        if (lines == snapLines_) return;                // nothing visible changed
+        snapLines_ = lines;
+        const bool keyChanged = snap_.pubKey != s.pubKey;
+        snap_ = s;
+        if (keyChanged) UpdateHeader();
 
-    void OnScanHost(const std::string& ip, bool server)
-    {
-        auto& s = scan_[ip];
-        s.server = server;
-        s.seen = std::chrono::steady_clock::now();
-        RebuildList();
-    }
+        using clock = std::chrono::steady_clock;
+        const auto now = clock::now();
+        auto recent = [&](const std::map<int, clock::time_point>& m, int id) {
+            auto it = m.find(id);
+            return it != m.end() && now - it->second < std::chrono::milliseconds(400);
+        };
 
-    void OnHostName(const std::string& ip, const wxString& name)
-    {
-        auto it = scan_.find(ip);
-        if (it == scan_.end()) return;
-        it->second.name = name;
-        RebuildList();
-    }
+        // this PC's monitors, as the daemon sees them (it is who tells the peers)
+        std::vector<wxRect> lm;
+        for (const auto& r : s.mons) lm.emplace_back(r.x, r.y, r.w, r.h);
+        if (lm != localMons_) { localMons_ = lm; canvas_->SetLocal(host_, localMons_); }
 
-    // ------------------------------------------------------- network results
-    void OnPeerPending(int id, std::uint32_t inst, const std::string& key, const wxString& name,
-                       const std::string& addr, bool incoming, bool theyTrust)
-    {
-        PendInfo& pi = pend_[id];
-        const bool isNew = pi.key.empty();
-        const bool trustChanged = !isNew && pi.theyTrust != theyTrust;
-        pi.inst = inst; pi.key = key; pi.name = name; pi.addr = addr; pi.incoming = incoming; pi.theyTrust = theyTrust;
-        if (isNew)
-            Log(name + " (" + wxString::FromUTF8(addr) + "), key " + wxString::FromUTF8(Identity::Fingerprint(key)) +
-                " verified - different password, not connected");
-        if (trustChanged) Log(name + (theyTrust ? " trusts this PC" : " no longer trusts this PC"));
-        RebuildClients();
-    }
+        if (groupPwd_ != s.group) {
+            groupPwd_ = s.group;
+            UpdateGroupLabel();
+            if (!groupCtl_->HasFocus()) groupCtl_->ChangeValue(wxString::FromUTF8(groupPwd_));
+        } else if (!groupInit_) {
+            groupCtl_->ChangeValue(wxString::FromUTF8(groupPwd_));
+        }
+        groupInit_ = true;
 
-    void OnPeerReady(int id, std::uint32_t inst, const std::string& key, const wxString& name,
-                     const std::string& addr, bool incoming, bool viaGroup)
-    {
-        pend_.erase(id);
-        PeerInfo& p = peers_[id];
-        p.viaGroup = viaGroup;
-        p.inst = inst;
-        p.key = key;
-        p.name = name;
-        p.addr = addr;
-        p.incoming = incoming;
-        p.placed = false;
+        inputMode_ = s.inputMode;
+        inputPeer_ = s.inputPeer;
 
-        Log("Connection established with " + name + " (" + wxString::FromUTF8(addr) + "), key " +
-            wxString::FromUTF8(Identity::Fingerprint(key)) + " verified");
-        audio_->AddPeer(inst, addr);
-        net_->Send(id, ScreensLine());      // tell the peer about our monitors
+        if (now - masterSent_ > std::chrono::milliseconds(400)) {
+            masterMute_->SetMuted(s.masterMute);
+            volSlider_->SetValue(s.masterVol);
+            masterPct_->SetLabelText(wxString::Format("%d%%", s.masterVol));
+        }
+
+        std::map<int, PeerInfo> np;
+        for (const auto& p : s.peers) {
+            PeerInfo pi;
+            pi.inst = p.inst; pi.key = p.key; pi.name = wxString::FromUTF8(p.name); pi.addr = p.addr;
+            for (const auto& r : p.mons) pi.mons.emplace_back(r.x, r.y, r.w, r.h);
+            pi.incoming = p.incoming; pi.placed = p.placed;
+            pi.ox = p.ox; pi.oy = p.oy;
+            pi.share = p.share; pi.mic = p.mic; pi.mute = p.mute; pi.vol = p.vol;
+            pi.allowed = p.allowed;
+            auto old = peers_.find(p.id);
+            if (old != peers_.end() && recent(lastAudio_, p.id)) {      // the user is touching these right now
+                pi.share = old->second.share; pi.mic = old->second.mic;
+                pi.mute = old->second.mute;   pi.vol = old->second.vol;
+            }
+            np[p.id] = std::move(pi);
+        }
+        peers_.swap(np);
+
+        disc_.clear();
+        for (const auto& d : s.disc) disc_[d.ip] = {d.host, d.server, now, d.key, d.sameGroup};
+        scan_.clear();
+        for (const auto& c : s.scan) scan_[c.ip] = {wxString::FromUTF8(c.name), c.server, now};
+
+        // the layout canvas follows the daemon (which owns positions and collision handling)
+        for (const auto& kv : peers_) {
+            const PeerInfo& p = kv.second;
+            if (!p.placed) continue;
+            if (!canvas_->HasPeer(kv.first)) canvas_->AddPeerAt(kv.first, p.name, wxString::FromUTF8(p.addr), p.mons, p.ox, p.oy);
+            else if (!canvas_->IsDragging(kv.first) && !recent(lastMove_, kv.first)) canvas_->SetPeerPos(kv.first, p.ox, p.oy);
+        }
+        for (int id : canvas_->PeerIds()) {
+            auto it = peers_.find(id);
+            if (it == peers_.end() || !it->second.placed) canvas_->RemovePeer(id);
+        }
+
+        if (s.scanning != scanning_) {
+            scanning_ = s.scanning;
+            if (scanning_) {
+                scanBtn_->Enable(false);
+                scanBtn_->SetLabel("Scanning...");
+                animStep_ = 0;
+                UpdateSearchLabel();
+                animTimer_.Start(300);
+            } else {
+                animTimer_.Stop();
+                searchLbl_->SetLabel(wxString::Format("Scan complete: %d host(s) found", (int)scan_.size()));
+                scanBtn_->SetLabel("Scan LAN");
+                scanBtn_->Enable(true);
+            }
+        }
+
         RebuildList();
         RebuildDevices();
-        OnSetChanged();                     // a new set of PCs: switch to its config
-        // The virtual window appears once the peer's SCREENS line arrives.
-    }
-
-    void OnPeerLost(int id)
-    {
-        pend_.erase(id);
-        auto it = peers_.find(id);
-        if (it != peers_.end()) {
-            Log("Disconnected from " + it->second.name);
-            audio_->RemovePeer(it->second.inst);
-            peers_.erase(it);
-        }
-        canvas_->RemovePeer(id);            // virtual window disappears with the connection
-        RebuildList();
-        RebuildDevices();
-        OnSetChanged();
-    }
-
-    void OnMessage(int id, const std::string& line)
-    {
-        auto it = peers_.find(id);
-        if (it == peers_.end()) return;
-        PeerInfo& p = it->second;
-
-        if (line.rfind("SCREENS ", 0) == 0) {
-            if (p.placed) return;
-            std::istringstream is(line.substr(8));
-            int n = 0;
-            is >> n;
-            std::vector<wxRect> mons;
-            for (int i = 0; i < n && i < 16; ++i) {
-                int x, y, w, h;
-                if (!(is >> x >> y >> w >> h)) break;
-                if (w > 0 && h > 0) mons.emplace_back(x, y, w, h);
-            }
-            if (mons.empty()) mons.emplace_back(0, 0, 1920, 1080);
-            p.mons = mons;
-            p.placed = true;
-
-            // The side that accepted the connection decides the initial layout and sends it;
-            // the connecting side only places a provisional window until that POS arrives.
-            auto pos = canvas_->AddPeer(id, p.name, wxString::FromUTF8(p.addr), mons, p.incoming);
-            {
-                std::vector<InputRect> rects;
-                for (const auto& m : mons) rects.push_back({m.x, m.y, m.width, m.height});
-                input_->SetPeer(id, rects, pos.first, pos.second);
-                input_->SetPeerAllowed(id, trust_->Get(p.key) == TrustStore::State::Allowed);
-            }
-            ApplyStoredLayout(id);              // saved position for this set of PCs (or the default one)
-            RebuildDevices();
-            return;
-        }
-
-        {   // PEERPOS <key> <x> <y>: where the PC with that key is, relative to THIS PC
-            char key[80] = {};
-            int rx = 0, ry = 0;
-            if (p.placed && std::sscanf(line.c_str(), "PEERPOS %64s %d %d", key, &rx, &ry) == 3) {
-                for (auto& kv : peers_) {
-                    if (kv.first == id || !kv.second.placed || kv.second.key != key) continue;
-                    canvas_->SetPeerPos(kv.first, rx, ry);
-                    input_->SetPeerOffset(kv.first, rx, ry);
-                    RecordPeerPos(kv.first, rx, ry);
-                }
-                return;
-            }
-        }
-
-        int x, y;
-        if (p.placed && std::sscanf(line.c_str(), "POS %d %d", &x, &y) == 2)
-        {
-            canvas_->SetPeerPos(id, -x, -y);   // mirrored: their view of us is the opposite offset
-            input_->SetPeerOffset(id, -x, -y);
-            RecordPeerPos(id, -x, -y);
-        }
-    }
-
-    void OnBeacon(const BeaconInfo& b)
-    {
-        auto it = disc_.find(b.ip);
-        bool changed = it == disc_.end() || it->second.host != b.host || it->second.server != b.server ||
-                       it->second.key != b.key || it->second.sameGroup != b.sameGroup;
-        disc_[b.ip] = {b.host, b.server, std::chrono::steady_clock::now(), b.key, b.sameGroup};
-        if (changed) RebuildList();
-    }
-
-    void OnTimer(wxTimerEvent&)
-    {
-        auto now = std::chrono::steady_clock::now();
-        bool removed = false;
-        for (auto it = disc_.begin(); it != disc_.end();) {
-            if (now - it->second.seen > std::chrono::seconds(7)) { it = disc_.erase(it); removed = true; }
-            else ++it;
-        }
-        for (auto it = scan_.begin(); it != scan_.end();) {
-            if (now - it->second.seen > std::chrono::seconds(400)) { it = scan_.erase(it); removed = true; }
-            else ++it;
-        }
-        if (removed) RebuildList();
-        if (cfgDirty_ && now - dirtyAt_ > std::chrono::milliseconds(600)) FlushConfig();
-        if (++tick_ % 120 == 0) StartScan();   // periodic rescan
     }
 
     // -------------------------------------------------------------------- GUI
@@ -2680,7 +2830,6 @@ private:
         auto isClient = [this](const std::string& ip) {
             if (disc_.count(ip)) return true;
             for (auto& kv : peers_) if (kv.second.addr == ip) return true;
-            for (auto& kv : pend_)  if (kv.second.addr == ip) return true;
             return false;
         };
 
@@ -2696,18 +2845,14 @@ private:
             if (isClient(kv.first)) continue;
             const auto& s = kv.second;
             remote[key(kv.first)] = {s.name.empty() ? wxString("(unknown)") : s.name, kv.first,
-                                     s.server ? "Server running" : "Online", false};
+                                     s.server ? "Server running" : "Online"};
         }
 
         entries_.clear();
         for (auto& kv : remote) entries_.push_back(kv.second);
 
         RebuildOthers();
-        {
-            int others = 0;
-            for (const auto& e : entries_) others += e.local ? 0 : 1;
-            othDivider_->Set(wxString::Format("Other hosts  (IP addresses)  -  %d", others));
-        }
+        othDivider_->Set(wxString::Format("Other hosts  (IP addresses)  -  %d", (int)entries_.size()));
         RebuildClients();
     }
 
@@ -2730,37 +2875,8 @@ private:
         devScroll_->Refresh();
     }
 
-    void SetTrust(const PeerInfo& p, TrustStore::State st)
-    {
-        std::string err;
-        if (!trust_->Set(p.key, st, std::string(p.name.utf8_str()), &err))
-            Log("Could not save permissions: " + wxString::FromUTF8(err));
-    }
-
-    // A peer reached its screen edge towards us: nothing happens until the user agrees.
-    void OnControlRequest(int id)
-    {
-        auto it = peers_.find(id);
-        if (it == peers_.end() || trust_->Get(it->second.key) == TrustStore::State::Denied) return;
-        const PeerInfo& p = it->second;
-        wxMessageDialog dlg(this,
-            p.name + " (" + wxString::FromUTF8(p.addr) + ") wants to control the keyboard and mouse of THIS PC.\n\n"
-            "Anything it types or clicks will happen here. Only allow PCs you own.\n\nAllow it?",
-            "Input control request", wxYES_NO | wxNO_DEFAULT | wxICON_QUESTION);
-        if (dlg.ShowModal() == wxID_YES) {
-            SetTrust(p, TrustStore::State::Allowed);
-            input_->SetPeerAllowed(id, true);
-            Log("Allowed " + p.name + " to control this PC - move the cursor to its edge again");
-        } else {
-            SetTrust(p, TrustStore::State::Denied);
-            Log("Blocked input control from " + p.name);
-        }
-        RebuildDevices();
-    }
-
     void UpdateAudioStats()
     {
-        const auto stats = audio_->Stats();
         for (auto& kv : devRows_) {
             auto pit = peers_.find(kv.first);
             if (pit == peers_.end()) continue;
@@ -2769,49 +2885,65 @@ private:
             bool recv = false;
             double kbps = 0;
             float level = 0;
-            for (const auto& st : stats)
-                if (st.instance == pit->second.inst && st.receiving) { recv = true; kbps = st.kbps; level = st.level; }
+            for (const auto& st : stats_.peers)
+                if (st.inst == pit->second.inst && st.receiving) { recv = true; kbps = st.kbps; level = st.level; }
 
             r.level->SetLevel(recv ? std::sqrt(level) : 0.0f);
             wxString txt = recv ? wxString::Format("Receiving %.0f kbps", kbps) : wxString("No incoming audio");
-            const bool sendSys = pit->second.share && sysCapturing_;
-            const bool sendMic = pit->second.mic && micCapturing_;
+            const bool sendSys = pit->second.share && snap_.sysCapturing;
+            const bool sendMic = pit->second.mic && snap_.micCapturing;
             if (sendSys || sendMic)
                 txt += wxString::FromUTF8("  \xC2\xB7  Sending my ") + (sendSys && sendMic ? "audio + microphone" : sendSys ? "audio" : "microphone");
             SetText(r.audioState, txt);
         }
     }
 
-    void Log(const wxString& msg)
+    void Log(const wxString& msg) { LogRaw(wxDateTime::Now().FormatTime() + "  " + msg); }
+    void LogRaw(const wxString& line) { log_->AppendText(line + "\n"); }
+
+    void OnTimer(wxTimerEvent&)
     {
-        log_->AppendText(wxDateTime::Now().FormatTime() + "  " + msg + "\n");
+        // The window needs its daemon: bring it back if it went away (unless the user stopped it).
+        if (!connected_ && !connecting_ && daemonWanted_ && !busy_ && ++retry_ >= 3) {
+            retry_ = 0;
+            UpdateHeader();
+            StartConnect();
+        }
     }
 
+    // Closing the window does NOT stop sharing: the daemon keeps running in the background.
     void OnClose(wxCloseEvent&)
     {
-        FlushConfig();
         timer_.Stop();
         animTimer_.Stop();
-        statTimer_.Stop();
-        input_->Stop();   // return the keyboard/mouse before anything else shuts down
-        audio_->Stop();
-        net_->Stop();   // joins the asio thread: no more callbacks after this
+        *alive_ = false;
+        client_->Close();
         Destroy();
     }
 
     wxString host_;
+    std::shared_ptr<bool> alive_;
+    std::shared_ptr<ipc::Client> client_;
+    std::filesystem::path dataDir_;
+    state::Snapshot snap_;
+    std::vector<std::string> snapLines_;
+    state::Stats stats_;
+    bool connected_ = false, connecting_ = false, daemonWanted_ = true, busy_ = false, groupInit_ = false;
+    int retry_ = 0;
+    std::string lastConnErr_;
+    std::map<int, std::chrono::steady_clock::time_point> lastMove_, lastAudio_;
+    std::chrono::steady_clock::time_point masterSent_;
+    wxStaticText* hdrSub_ = nullptr;
+    MenuStrip* menuBar_ = nullptr;
+
     std::vector<LocalAddress> local_;
     std::vector<wxRect> localMons_;
     std::vector<Entry> entries_;
     std::map<std::string, Discovered> disc_;
-    std::map<int, PendInfo> pend_;
     std::map<std::string, CliRow> cliRows_;
     std::map<std::string, Scanned> scan_;
     std::map<int, PeerInfo> peers_;
-    std::string selectedIp_;
-    bool rebuilding_ = false;
     bool scanning_ = false;
-    int tick_ = 0;
     int animStep_ = 0;
 
     Canvas* canvas_ = nullptr;
@@ -2828,9 +2960,7 @@ private:
     wxBoxSizer* cliSizer_ = nullptr;
     wxStaticText* cliEmpty_ = nullptr;
     wxStaticText* clientsCount_ = nullptr;
-    std::filesystem::path groupFile_;
     std::string groupPwd_;
-    std::unique_ptr<TrustStore> netTrust_;       // keys we trust for network pairing (network-trust.txt)
     wxScrolledWindow* devScroll_ = nullptr;
     wxBoxSizer* devSizer_ = nullptr;
     wxStaticText* emptyLbl_ = nullptr;
@@ -2846,23 +2976,7 @@ private:
     FlatSlider* volSlider_ = nullptr;
     wxTimer timer_;
     wxTimer animTimer_;
-    wxTimer statTimer_;
-    std::unique_ptr<Network> net_;
-    std::unique_ptr<AudioEngine> audio_;
-    std::unique_ptr<InputEngine> input_;
-    std::unique_ptr<TrustStore> trust_;           // peers (by public key) that may / may not control this PC; persisted
-    std::unique_ptr<Identity> ident_;             // this PC's key pair
-    std::unique_ptr<ConfigStore> store_;
-    std::string identNote_;
-    wxString dataDir_;
-    SavedConfig cfg_;                             // config of the currently connected set of PCs
-    bool haveCfg_ = false;                        // false while no other PC is connected
-    bool cfgDirty_ = false;
-    bool loading_ = false;
-    std::chrono::steady_clock::time_point dirtyAt_;
-    bool sysCapturing_ = false;   // system audio capture running
-    bool micCapturing_ = false;   // microphone capture running
-    InputEngine::Mode inputMode_ = InputEngine::Mode::Local;
+    int inputMode_ = 0;           // 0 local, 1 forwarding (I control a peer), 2 controlled
     int inputPeer_ = -1;
 };
 

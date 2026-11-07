@@ -29,10 +29,13 @@
 //   RELEASE        controller -> peer   stop controlling (also sent when control hops to a third PC)
 //   TAKE           peer -> controller   the peer's user moved their own mouse: control is theirs again
 //   DENY           peer -> controller   refused / revoked
+//   CTRL 0|1       peer -> controller   "you may (not) control me" (sent whenever that changes; handled by
+//                                       Core, which calls SetPeerAccepts). The controller never takes over
+//                                       local input for a peer that has not said 1, so a PC that does not
+//                                       allow remote control never makes the cursor jump or the input freeze.
 //
 // SECURITY: injecting input is remote control of the PC. A peer may only control
-// this PC after SetPeerAllowed(id, true); until then ENTER is answered with DENY
-// and onControlRequest fires once so the UI can ask the user.
+// this PC after SetPeerAllowed(id, true); until then ENTER is answered with DENY.
 class InputEngine {
 public:
     enum class Mode { Local, Forwarding, Controlled };
@@ -47,22 +50,18 @@ public:
 
     // Callbacks: invoked on engine/backend/network threads, never re-enter the engine from them.
     std::function<void(Mode mode, int peerId)> onModeChange;
-    std::function<void(int peerId)> onControlRequest;
 
     void SetLocalMonitors(const std::vector<InputRect>& mons);   // before Start()
     bool Start(std::string* msg);                                // msg: error or warning
     void Stop();
     std::string BackendName() const;
 
-    // Master switch for OUTGOING control: off = this PC's keyboard/mouse never leaves it
-    // (and a running forward stops). Incoming control is governed per peer by SetPeerAllowed.
-    void SetEnabled(bool on);
-
     // Layout: (ox, oy) is the peer's top-left corner relative to this PC's top-left
     // corner in canvas "world" pixels (exactly what Canvas keeps).
     void SetPeer(int id, const std::vector<InputRect>& mons, double ox, double oy);
     void SetPeerOffset(int id, double ox, double oy);
-    void SetPeerAllowed(int id, bool allowed);
+    void SetPeerAllowed(int id, bool allowed);     // may this peer control THIS PC?
+    void SetPeerAccepts(int id, bool accepts);     // does this peer let THIS PC control it? (its CTRL line)
     void RemovePeer(int id);
 
     // Returns true if the line belonged to the input protocol. Call from the network thread.

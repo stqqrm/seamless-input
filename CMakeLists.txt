@@ -44,8 +44,11 @@ if(NOT EXISTS "${MINIAUDIO_DIR}/miniaudio.h")
 endif()
 
 # --------------------------------------------------
-# FetchContent configuration
+# Dependencies: downloaded by default; -DSI_SYSTEM_DEPS=ON uses the system's Boost headers and
+# wxWidgets instead (faster dev builds: apt install libwxgtk3.2-dev libboost-dev)
 # --------------------------------------------------
+
+option(SI_SYSTEM_DEPS "Use system Boost/wxWidgets instead of downloading them" OFF)
 
 include(FetchContent)
 
@@ -54,62 +57,74 @@ set(FETCHCONTENT_BASE_DIR
     CACHE PATH "" FORCE
 )
 
-# --------------------------------------------------
-# Boost (Asio only)
-# --------------------------------------------------
-
-set(BOOST_VERSION_TAG 1.86.0)
-
-set(BOOST_INCLUDE_LIBRARIES asio CACHE STRING "" FORCE)
-set(BOOST_ENABLE_MPI OFF CACHE BOOL "" FORCE)
-set(BOOST_ENABLE_PYTHON OFF CACHE BOOL "" FORCE)
-
-FetchContent_Declare(
-    Boost
-    URL https://github.com/boostorg/boost/releases/download/boost-${BOOST_VERSION_TAG}/boost-${BOOST_VERSION_TAG}-cmake.tar.xz
-    DOWNLOAD_EXTRACT_TIMESTAMP TRUE
-)
-
-# --------------------------------------------------
-# wxWidgets configuration
-# --------------------------------------------------
-
-set(wxBUILD_SHARED OFF CACHE BOOL "" FORCE)
-set(wxBUILD_MONOLITHIC ON CACHE BOOL "" FORCE)
-set(wxBUILD_SAMPLES OFF CACHE BOOL "" FORCE)
-set(wxBUILD_TESTS OFF CACHE BOOL "" FORCE)
-set(wxBUILD_DEMOS OFF CACHE BOOL "" FORCE)
-
-FetchContent_Declare(
-    wxWidgets
-    GIT_REPOSITORY https://github.com/wxWidgets/wxWidgets.git
-    GIT_TAG v3.2.8
-    GIT_SHALLOW TRUE
-)
-
-FetchContent_MakeAvailable(Boost wxWidgets)
-
-# --------------------------------------------------
-# Resolve targets
-# --------------------------------------------------
-
-if(NOT TARGET Boost::asio)
-    message(FATAL_ERROR "Boost::asio target was not created.")
-endif()
-
-if(TARGET wx::mono)
-    set(WX_TARGET wx::mono)
-elseif(TARGET wxmono)
-    set(WX_TARGET wxmono)
-elseif(TARGET wxcore AND TARGET wxbase)
-    set(WX_TARGET wxcore wxbase)
+if(SI_SYSTEM_DEPS)
+    find_package(Boost REQUIRED)
+    add_library(Boost::asio INTERFACE IMPORTED)
+    target_link_libraries(Boost::asio INTERFACE Boost::headers)
+    find_package(wxWidgets REQUIRED COMPONENTS core base)
+    add_library(wx_system INTERFACE)
+    target_include_directories(wx_system INTERFACE ${wxWidgets_INCLUDE_DIRS})
+    target_compile_definitions(wx_system INTERFACE ${wxWidgets_DEFINITIONS})
+    target_link_libraries(wx_system INTERFACE ${wxWidgets_LIBRARIES})
+    set(WX_TARGET wx_system)
 else()
-    message(FATAL_ERROR
-        "No wxWidgets target was created (looked for wx::mono, wxmono, wxcore+wxbase)."
+# --------------------------------------------------
+    # Boost (Asio only)
+    # --------------------------------------------------
+    
+    set(BOOST_VERSION_TAG 1.86.0)
+    
+    set(BOOST_INCLUDE_LIBRARIES asio CACHE STRING "" FORCE)
+    set(BOOST_ENABLE_MPI OFF CACHE BOOL "" FORCE)
+    set(BOOST_ENABLE_PYTHON OFF CACHE BOOL "" FORCE)
+    
+    FetchContent_Declare(
+        Boost
+        URL https://github.com/boostorg/boost/releases/download/boost-${BOOST_VERSION_TAG}/boost-${BOOST_VERSION_TAG}-cmake.tar.xz
+        DOWNLOAD_EXTRACT_TIMESTAMP TRUE
     )
+    
+    # --------------------------------------------------
+    # wxWidgets configuration
+    # --------------------------------------------------
+    
+    set(wxBUILD_SHARED OFF CACHE BOOL "" FORCE)
+    set(wxBUILD_MONOLITHIC ON CACHE BOOL "" FORCE)
+    set(wxBUILD_SAMPLES OFF CACHE BOOL "" FORCE)
+    set(wxBUILD_TESTS OFF CACHE BOOL "" FORCE)
+    set(wxBUILD_DEMOS OFF CACHE BOOL "" FORCE)
+    
+    FetchContent_Declare(
+        wxWidgets
+        GIT_REPOSITORY https://github.com/wxWidgets/wxWidgets.git
+        GIT_TAG v3.2.8
+        GIT_SHALLOW TRUE
+    )
+    
+    FetchContent_MakeAvailable(Boost wxWidgets)
+    
+    # --------------------------------------------------
+    # Resolve targets
+    # --------------------------------------------------
+    
+    if(NOT TARGET Boost::asio)
+        message(FATAL_ERROR "Boost::asio target was not created.")
+    endif()
+    
+    if(TARGET wx::mono)
+        set(WX_TARGET wx::mono)
+    elseif(TARGET wxmono)
+        set(WX_TARGET wxmono)
+    elseif(TARGET wxcore AND TARGET wxbase)
+        set(WX_TARGET wxcore wxbase)
+    else()
+        message(FATAL_ERROR
+            "No wxWidgets target was created (looked for wx::mono, wxmono, wxcore+wxbase)."
+        )
+    endif()
+    
+    message(STATUS "Using wxWidgets target(s): ${WX_TARGET}")
 endif()
-
-message(STATUS "Using wxWidgets target(s): ${WX_TARGET}")
 
 find_package(Threads REQUIRED)
 
@@ -145,35 +160,28 @@ set_source_files_properties("${CMAKE_CURRENT_SOURCE_DIR}/src/monocypher/monocyph
 )
 
 # --------------------------------------------------
-# Application target
+# Targets
+#   si_core                  engine: network, input, audio, identity, Core, IPC, service management
+#   seamless-input-daemon    headless background process (no wxWidgets)
+#   seamless-input           the window; talks to the daemon over local IPC
 # --------------------------------------------------
 
-add_executable(${PROJECT_NAME}
-    ${PROJECT_SOURCES}
-    ${PROJECT_HEADERS}
-)
+set(GUI_MAIN    "${CMAKE_CURRENT_SOURCE_DIR}/src/main.cpp")
+set(DAEMON_MAIN "${CMAKE_CURRENT_SOURCE_DIR}/src/daemon_main.cpp")
+set(CORE_SOURCES ${PROJECT_SOURCES})
+list(REMOVE_ITEM CORE_SOURCES "${GUI_MAIN}" "${DAEMON_MAIN}")
 
-target_include_directories(${PROJECT_NAME}
-    PRIVATE
-        "${CMAKE_CURRENT_SOURCE_DIR}/src"
-)
+add_library(si_core STATIC ${CORE_SOURCES} ${PROJECT_HEADERS})
 
+target_include_directories(si_core PUBLIC "${CMAKE_CURRENT_SOURCE_DIR}/src")
 # SYSTEM: keeps miniaudio.h's own warnings out of our build output
-target_include_directories(${PROJECT_NAME} SYSTEM
-    PRIVATE
-        "${MINIAUDIO_DIR}"
-)
-
-target_link_libraries(${PROJECT_NAME}
-    PRIVATE
-        ${WX_TARGET}
-        Boost::asio
-        Threads::Threads
-)
+target_include_directories(si_core SYSTEM PUBLIC "${MINIAUDIO_DIR}")
+target_compile_definitions(si_core PUBLIC SI_VERSION="${PROJECT_VERSION}")
+target_link_libraries(si_core PUBLIC Boost::asio Threads::Threads)
 
 # miniaudio loads audio backends at runtime (dlopen) on Linux/BSD
 if(UNIX AND NOT APPLE)
-    target_link_libraries(${PROJECT_NAME} PRIVATE ${CMAKE_DL_LIBS} m)
+    target_link_libraries(si_core PUBLIC ${CMAKE_DL_LIBS} m)
 endif()
 
 # --------------------------------------------------
@@ -186,41 +194,59 @@ endif()
 if(UNIX AND NOT APPLE)
     find_package(X11)
     if(TARGET X11::X11 AND TARGET X11::Xi AND TARGET X11::Xtst)
-        target_link_libraries(${PROJECT_NAME} PRIVATE X11::X11 X11::Xi X11::Xtst)
-        target_compile_definitions(${PROJECT_NAME} PRIVATE SI_HAVE_X11=1)
+        target_link_libraries(si_core PUBLIC X11::X11 X11::Xi X11::Xtst)
+        target_compile_definitions(si_core PUBLIC SI_HAVE_X11=1)
         set(INPUT_X11_STATUS "yes")
+        # optional: lets the daemon read the monitor layout without a window
+        if(TARGET X11::Xrandr)
+            target_link_libraries(si_core PUBLIC X11::Xrandr)
+            target_compile_definitions(si_core PUBLIC SI_HAVE_XRANDR=1)
+        else()
+            message(STATUS "libXrandr not found: the daemon will use the whole X screen as one monitor")
+        endif()
     else()
         message(WARNING "libX11/libXi/libXtst development files not found: building WITHOUT the X11 input backend (install libxtst-dev and libxi-dev)")
         set(INPUT_X11_STATUS "no")
     endif()
 endif()
 
-# --------------------------------------------------
-# Windows configuration
-# --------------------------------------------------
+if(WIN32)
+    target_compile_definitions(si_core PUBLIC _WIN32_WINNT=0x0A00)
+    target_link_libraries(si_core PUBLIC ws2_32 mswsock iphlpapi dwmapi uxtheme advapi32 wtsapi32 userenv shell32 ole32 uuid)
+endif()
+
+# --- daemon (console subsystem: run it in a terminal to see its log; always started hidden otherwise)
+add_executable(seamless-input-daemon "${DAEMON_MAIN}")
+target_link_libraries(seamless-input-daemon PRIVATE si_core)
+
+# --- GUI
+add_executable(${PROJECT_NAME} "${GUI_MAIN}")
+target_link_libraries(${PROJECT_NAME} PRIVATE si_core ${WX_TARGET})
+add_dependencies(${PROJECT_NAME} seamless-input-daemon)   # the GUI starts the daemon: build both
 
 if(WIN32)
-    set_target_properties(${PROJECT_NAME} PROPERTIES
-        WIN32_EXECUTABLE TRUE
-    )
-    target_compile_definitions(${PROJECT_NAME} PRIVATE _WIN32_WINNT=0x0A00)
-    target_link_libraries(${PROJECT_NAME} PRIVATE ws2_32 mswsock iphlpapi dwmapi uxtheme)
+    set_target_properties(${PROJECT_NAME} PROPERTIES WIN32_EXECUTABLE TRUE)
 endif()
 
 # DPI awareness: without it Windows reports scaled (virtualized) monitor sizes
 if(MSVC)
     target_sources(${PROJECT_NAME} PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/app.manifest")
+    target_sources(seamless-input-daemon PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/app.manifest")
 endif()
+
+install(TARGETS ${PROJECT_NAME} seamless-input-daemon RUNTIME DESTINATION bin)
 
 # --------------------------------------------------
 # Compiler warnings
 # --------------------------------------------------
 
-if(MSVC)
-    target_compile_options(${PROJECT_NAME} PRIVATE /W4)
-else()
-    target_compile_options(${PROJECT_NAME} PRIVATE -Wall -Wextra -Wpedantic)
-endif()
+foreach(_t si_core seamless-input-daemon ${PROJECT_NAME})
+    if(MSVC)
+        target_compile_options(${_t} PRIVATE /W4)
+    else()
+        target_compile_options(${_t} PRIVATE -Wall -Wextra -Wpedantic)
+    endif()
+endforeach()
 
 # --------------------------------------------------
 # Status information
