@@ -2823,14 +2823,16 @@ private:
         auto* p = new wxPanel(parent);
         p->SetBackgroundColour(theme_.page);
         auto* root = new wxBoxSizer(wxHORIZONTAL);
-        auto* col = new wxBoxSizer(wxVERTICAL);
+        wxStaticText* groupDesc = nullptr;
+        wxStaticText* clipDesc = nullptr;
 
         // --- group
         auto* groupCard = new CardPanel(p, theme_, false);
         {
             auto* gv = new wxBoxSizer(wxVERTICAL);
             gv->Add(MakeHeader(groupCard, "Group password"), 0, wxBOTTOM, 2);
-            gv->Add(MakeLabel(groupCard, "PCs with the same password connect automatically. Leave empty for no password.", true), 0, wxBOTTOM, 8);
+            groupDesc = MakeLabel(groupCard, "PCs with the same password connect automatically. Leave empty for no password.", true);
+            gv->Add(groupDesc, 0, wxBOTTOM, 8);
             auto* gr = new wxBoxSizer(wxHORIZONTAL);
             auto* groupBox = new InputBox(groupCard, theme_, wxTE_PASSWORD | wxTE_PROCESS_ENTER,
                                           wxString::FromUTF8(groupPwd_), "password");
@@ -2846,14 +2848,15 @@ private:
             groupCard->SetSizer(go);
             ApplyBackground(groupCard, theme_.card);
         }
-        col->Add(groupCard, 0, wxEXPAND | wxBOTTOM, 8);
+        
 
         // --- clipboard transfer limit
         auto* clipCard = new CardPanel(p, theme_, false);
         {
             auto* cv = new wxBoxSizer(wxVERTICAL);
             cv->Add(MakeHeader(clipCard, "Clipboard bandwidth"), 0, wxBOTTOM, 2);
-            cv->Add(MakeLabel(clipCard, "Largest text or set of files that is copied to another PC. Bigger clipboards are neither sent nor accepted.", true), 0, wxBOTTOM, 8);
+            clipDesc = MakeLabel(clipCard, "Largest text or set of files that is copied to another PC. Bigger clipboards are neither sent nor accepted.", true);
+            cv->Add(clipDesc, 0, wxBOTTOM, 8);
             auto* cr = new wxBoxSizer(wxHORIZONTAL);
             auto* clipBox = new InputBox(clipCard, theme_, wxTE_PROCESS_ENTER, "1", "size");
             clipLimitCtl_ = clipBox->ctl;
@@ -2871,10 +2874,34 @@ private:
             clipCard->SetSizer(co);
             ApplyBackground(clipCard, theme_.card);
         }
-        col->Add(clipCard, 0, wxEXPAND | wxBOTTOM, 8);
+        
 
-        root->Add(col, 1, wxEXPAND | wxALL, 10);
-        root->AddStretchSpacer(1);
+        // The two cards sit side by side with equal width. Their description texts wrap to the card
+        // width, otherwise the long line would force one card wider than the other.
+        auto wrapTo = [](wxPanel* card, wxStaticText* lbl) {
+            // Wrap() rewrites the label with hard line breaks, so always start again from the original text.
+            const wxString orig = lbl->GetLabel();
+            lbl->Wrap(240);
+            auto lastW = std::make_shared<int>(-1);
+            card->Bind(wxEVT_SIZE, [card, lbl, orig, lastW](wxSizeEvent& e) {
+                const int w = std::max(160, e.GetSize().x - 28);
+                if (w != *lastW) {
+                    *lastW = w;
+                    lbl->SetLabel(orig);
+                    lbl->Wrap(w);
+                    lbl->InvalidateBestSize();
+                    card->Layout();
+                }
+                e.Skip();
+            });
+        };
+        wrapTo(groupCard, groupDesc);
+        wrapTo(clipCard, clipDesc);
+
+        auto* row = new wxBoxSizer(wxHORIZONTAL);
+        row->Add(groupCard, 1, wxEXPAND | wxRIGHT, 8);         // equal width and equal height
+        row->Add(clipCard, 1, wxEXPAND);
+        root->Add(row, 1, wxALIGN_TOP | wxALL, 10);
         p->SetSizer(root);
         return p;
     }
