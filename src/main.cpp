@@ -2829,7 +2829,7 @@ private:
         auto* groupCard = new CardPanel(p, theme_, false);
         {
             auto* gv = new wxBoxSizer(wxVERTICAL);
-            gv->Add(MakeHeader(groupCard, "Group"), 0, wxBOTTOM, 2);
+            gv->Add(MakeHeader(groupCard, "Group password"), 0, wxBOTTOM, 2);
             gv->Add(MakeLabel(groupCard, "PCs with the same password connect automatically. Leave empty for no password.", true), 0, wxBOTTOM, 8);
             auto* gr = new wxBoxSizer(wxHORIZONTAL);
             auto* groupBox = new InputBox(groupCard, theme_, wxTE_PASSWORD | wxTE_PROCESS_ENTER,
@@ -2852,7 +2852,7 @@ private:
         auto* clipCard = new CardPanel(p, theme_, false);
         {
             auto* cv = new wxBoxSizer(wxVERTICAL);
-            cv->Add(MakeHeader(clipCard, "Clipboard"), 0, wxBOTTOM, 2);
+            cv->Add(MakeHeader(clipCard, "Clipboard bandwidth"), 0, wxBOTTOM, 2);
             cv->Add(MakeLabel(clipCard, "Largest text or set of files that is copied to another PC. Bigger clipboards are neither sent nor accepted.", true), 0, wxBOTTOM, 8);
             auto* cr = new wxBoxSizer(wxHORIZONTAL);
             auto* clipBox = new InputBox(clipCard, theme_, wxTE_PROCESS_ENTER, "1", "size");
