@@ -1681,6 +1681,7 @@ struct MenuItemDef {
     bool separator = false;
     bool check = false, checked = false;
     bool enabled = true;
+    int dot = 0;                    // status dot left of the label: 0 none, 1 green (on), 2 red (off)
 };
 
 struct MenuDef {
@@ -1842,6 +1843,11 @@ private:
             const wxSize te = dc.GetTextExtent(it.label);
             const int ty = r.y + (r.h - te.y) / 2;
 
+            if (it.dot) {
+                dc.SetPen(*wxTRANSPARENT_PEN);
+                dc.SetBrush(wxBrush(it.dot == 1 ? t_.ok : t_.bad));
+                dc.DrawCircle(1 + pad_ + FromDIP(12), r.y + r.h / 2, FromDIP(5));
+            }
             if (it.check && it.checked) {
                 const int cx = 1 + pad_ + FromDIP(10), cy = r.y + r.h / 2;
                 const wxPoint pts[3] = { wxPoint(cx, cy), wxPoint(cx + FromDIP(4), cy + FromDIP(4)),
@@ -2465,15 +2471,11 @@ private:
         close.accel = closeKey;
         menuBar_->AddMenu("File", { close, item(kIdQuitAll, "Quit and stop the background service") });
 
-#if defined(__WXMSW__)
-        MenuItemDef autostart = item(kIdAutostart, "Start the background service with Windows");
-#else
-        MenuItemDef autostart = item(kIdAutostart, "Start the background daemon at login");
-#endif
-        autostart.check = true;
+        MenuItemDef autostart = item(kIdAutostart, "Autostart");     // label and dot are set in RefreshServiceMenu
+        MenuItemDef startStop = item(kIdToggleSvc, "Background service");
         MenuItemDef info = item(kIdSvcInfo, "Background service: ...");
         info.enabled = false;
-        menuBar_->AddMenu("Service", { autostart, sep(), info, item(kIdToggleSvc, "Stop background service now") });
+        menuBar_->AddMenu("Service", { autostart, startStop, sep(), info });
 
         menuBar_->AddMenu("Security", { item(kIdClearCache, "Clear cache"),
                                         item(kIdRegenKeys, "Regenerate keys"),
@@ -2618,27 +2620,47 @@ private:
         if (save) SaveThemeChoice(nt.name);
     }
 
+    // Service menu. Left: a dot with the name of the setting = its CURRENT state (green on / red off).
+    // Right (dim): what a click does. The items are never greyed out: the open list is a snapshot and
+    // cannot change by itself, so a greyed item would stay greyed until the menu is opened again.
+    // While a change is being applied the hint says "Working..." and clicks are ignored.
+    //   Autostart : the daemon starts by itself at boot / login.
+    //   Service   : the daemon is running right now.
     void RefreshServiceMenu()
     {
         if (!menuBar_) return;
         const svc::AutostartInfo a = svc::QueryAutostart();
+        autostartOn_ = a.enabled;
+#if defined(__WXMSW__)
+        const wxString autoName = "Autostart with Windows";
+#else
+        const wxString autoName = "Autostart at login";
+#endif
         if (MenuItemDef* m = menuBar_->Item(kIdAutostart)) {
-            m->checked = a.enabled;
-            m->enabled = a.supported && !busy_;
+            m->dot = a.supported ? (a.enabled ? 1 : 2) : 0;
+            m->label = a.supported ? autoName : autoName + " (not supported here)";
+            m->accel = !a.supported ? wxString() : busy_ ? wxString("Working...") : wxString(a.enabled ? "Disable" : "Enable");
+            m->enabled = a.supported;
         }
-        wxString st = connected_ ? "running" : daemonWanted_ ? "not reachable" : "stopped";
-        if (MenuItemDef* m = menuBar_->Item(kIdSvcInfo))
-            m->label = "Background service: " + st + "  (" + wxString::FromUTF8(a.kind) +
-                       (a.enabled ? ", autostart on)" : ", autostart off)");
-        if (MenuItemDef* m = menuBar_->Item(kIdToggleSvc))
-            m->label = daemonWanted_ ? "Stop background service now" : "Start background service now";
+        const bool running = connected_ && daemonWanted_;
+        if (MenuItemDef* m = menuBar_->Item(kIdToggleSvc)) {
+            m->dot = running ? 1 : 2;
+            m->label = "Background service";
+            m->accel = busy_ ? wxString("Working...") : running ? wxString("Stop") : wxString("Start");
+            m->enabled = true;
+        }
+        if (MenuItemDef* m = menuBar_->Item(kIdSvcInfo)) {
+            const wxString st = running ? "running" : (daemonWanted_ && !connected_) ? "not reachable" : "stopped";
+            m->label = "Background service: " + st + (a.kind.empty() ? wxString() : "  (" + wxString::FromUTF8(a.kind) + ")");
+        }
     }
 
     void OnAutostart(wxCommandEvent& e)
     {
-        if (busy_) return;
+        if (busy_) { Log("Still applying the last autostart change, please wait..."); return; }
         busy_ = true;
-        const bool on = e.IsChecked();
+        (void)e;
+        const bool on = !autostartOn_;                  // the item is an action, not a check box
         daemonWanted_ = true;
         Log(on ? "Enabling autostart of the background service..." : "Disabling autostart of the background service...");
         auto alive = alive_;
@@ -2713,7 +2735,8 @@ private:
 
     void ToggleService()
     {
-        if (daemonWanted_) {
+        if (busy_) { Log("Still applying the last autostart change, please wait..."); return; }
+        if (connected_ && daemonWanted_) {
             daemonWanted_ = false;
             ipc::RequestStop(dataDir_);
             Log("Stopping the background service (it starts again with the next window, or at login if autostart is on)");
@@ -3749,6 +3772,7 @@ private:
     std::vector<std::string> snapLines_;
     state::Stats stats_;
     bool connected_ = false, connecting_ = false, daemonWanted_ = true, busy_ = false, groupInit_ = false;
+    bool autostartOn_ = false;      // last known state of the autostart setting (Service menu)
     int retry_ = 0;
     int connFails_ = 0;             // consecutive failed attempts to reach the daemon
     bool restartAsked_ = false;     // the restart question was shown (until success or a failed restart)

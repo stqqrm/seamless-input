@@ -229,6 +229,8 @@ ClipShare::Prep ClipShare::Prepare(std::vector<Item>& items, std::uint64_t& tota
         items.push_back(std::move(it));
         return Prep::Ready;
     }
+    const std::string why = clipboard::LastNote();          // why the file list could not be used
+    info = "nothing to send" + (why.empty() ? std::string() : " (" + why + ")");
     return Prep::Nothing;
 }
 
@@ -585,7 +587,8 @@ void ClipShare::OnFinish(int peer, std::uint64_t xfer)
         Log("Clipboard received from " + from + " (" + what + ", " + FormatBytes(got) + ")");
         CleanupOldIncoming(keep);
     } else {
-        Log("Could not put the received clipboard on this PC's clipboard (Linux: install xclip or wl-clipboard)");
+        const std::string why = clipboard::LastNote();
+        Log("Could not put the received clipboard on this PC's clipboard" + (why.empty() ? std::string(" (Linux: install xclip or wl-clipboard)") : ": " + why));
     }
 }
 

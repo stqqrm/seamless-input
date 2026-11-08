@@ -5,6 +5,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <mutex>
 #include <sstream>
 #if defined(__linux__)
 #include <csignal>
@@ -78,6 +79,14 @@ bool Base64Decode(const std::string& in, std::string& out)
     }
     return true;
 }
+
+namespace {
+std::mutex g_noteMx;
+std::string g_note;
+void SetNote(const std::string& n) { std::lock_guard<std::mutex> lk(g_noteMx); g_note = n; }
+} // namespace
+
+std::string LastNote() { std::lock_guard<std::mutex> lk(g_noteMx); return g_note; }
 
 #if defined(_WIN32)
 // ------------------------------------------------------------------ Windows
@@ -196,9 +205,10 @@ bool SetText(const std::string& text)
 bool GetFiles(std::vector<std::filesystem::path>& files)
 {
     files.clear();
-    if (!IsClipboardFormatAvailable(CF_HDROP)) return false;
+    SetNote("");
+    if (!IsClipboardFormatAvailable(CF_HDROP)) { SetNote("no files on the clipboard"); return false; }
     HWND owner = Owner();
-    if (!owner || !OpenRetry(owner)) return false;
+    if (!owner || !OpenRetry(owner)) { SetNote("the Windows clipboard is in use by another program"); return false; }
     if (HANDLE h = GetClipboardData(CF_HDROP)) {
         // DROPFILES header followed by a double-NUL terminated list (parsed by hand: no shell32 needed)
         const SIZE_T total = GlobalSize(h);
@@ -235,11 +245,13 @@ bool GetFiles(std::vector<std::filesystem::path>& files)
         }
     }
     CloseClipboard();
+    if (files.empty()) SetNote("the file list on the clipboard could not be read");
     return !files.empty();
 }
 
 bool SetFiles(const std::vector<std::filesystem::path>& files)
 {
+    SetNote("");
     if (files.empty()) return false;
     std::wstring list;                       // path\0path\0...\0\0
     for (const auto& f : files) {
@@ -264,10 +276,14 @@ bool SetFiles(const std::vector<std::filesystem::path>& files)
         if (auto* e = static_cast<DWORD*>(GlobalLock(effect))) { *e = 1; GlobalUnlock(effect); }
     }
     HWND owner = Owner();
-    if (!owner || !OpenRetry(owner)) { GlobalFree(mem); if (effect) GlobalFree(effect); return false; }
+    if (!owner || !OpenRetry(owner)) {
+        GlobalFree(mem); if (effect) GlobalFree(effect);
+        SetNote("the Windows clipboard is in use by another program");
+        return false;
+    }
     EmptyClipboard();
     const bool ok = SetClipboardData(CF_HDROP, mem) != nullptr;
-    if (!ok) GlobalFree(mem);
+    if (!ok) { GlobalFree(mem); SetNote("Windows refused the file list (error " + std::to_string(GetLastError()) + ")"); }
     if (effect) {
         if (!(ok && SetClipboardData(RegisterClipboardFormatW(L"Preferred DropEffect"), effect))) GlobalFree(effect);
     }
@@ -398,17 +414,20 @@ std::string UriToPath(std::string u)
     return PercentDecode(u);
 }
 
+// Which format the file manager pastes. Only the desktops below read plain text/uri-list; every other
+// file manager (Nautilus, Nemo, Caja, Thunar, ...) wants x-special/gnome-copied-files. A daemon started
+// without desktop variables (systemd user unit, autostart) therefore gets the GNOME format too.
 bool GnomeStyleDesktop()
 {
-    const char* d = std::getenv("XDG_CURRENT_DESKTOP");
-    if (!d || !*d) d = std::getenv("XDG_SESSION_DESKTOP");     // a daemon started outside the desktop session
-    if (!d || !*d) d = std::getenv("DESKTOP_SESSION");         // may only have some of these
-    if (!d) return false;
-    std::string s(d);
+    std::string s;
+    for (const char* name : {"XDG_CURRENT_DESKTOP", "XDG_SESSION_DESKTOP", "DESKTOP_SESSION"}) {
+        const char* d = std::getenv(name);
+        if (d && *d) { s += d; s += ':'; }
+    }
     std::transform(s.begin(), s.end(), s.begin(), [](unsigned char c) { return (char)std::toupper(c); });
-    for (const char* k : {"GNOME", "UNITY", "BUDGIE", "CINNAMON", "MATE", "XFCE", "PANTHEON", "COSMIC"})
-        if (s.find(k) != std::string::npos) return true;
-    return false;
+    for (const char* k : {"KDE", "PLASMA", "LXQT", "RAZOR"})
+        if (s.find(k) != std::string::npos) return false;
+    return true;
 }
 
 } // namespace
@@ -434,16 +453,18 @@ bool SetText(const std::string& text)
 bool GetFiles(std::vector<std::filesystem::path>& files)
 {
     files.clear();
+    SetNote("");
     const Tools& t = Pick();
-    if (!t.files) return false;
+    if (t.name.empty()) { SetNote("no clipboard tool found (install xclip or wl-clipboard)"); return false; }
+    if (!t.files) { SetNote(t.name + " cannot read files (install xclip or wl-clipboard)"); return false; }
     std::string types;
-    if (!RunRead(t.list, 64 * 1024, types)) return false;
+    if (!RunRead(t.list, 64 * 1024, types)) { SetNote("could not list the clipboard formats with " + t.name + " (empty clipboard, or the desktop blocks background clipboard access)"); return false; }
     const bool gnome = types.find("x-special/gnome-copied-files") != std::string::npos;
     const bool uri = types.find("text/uri-list") != std::string::npos;
-    if (!gnome && !uri) return false;
+    if (!gnome && !uri) { SetNote("no files on the clipboard"); return false; }
 
     std::string data;
-    if (!RunRead(gnome ? t.readGnome : t.readUri, 4 * 1024 * 1024, data)) return false;
+    if (!RunRead(gnome ? t.readGnome : t.readUri, 4 * 1024 * 1024, data)) { SetNote("could not read the file list with " + t.name); return false; }
     std::istringstream is(data);
     std::string line;
     while (std::getline(is, line)) {
@@ -451,13 +472,16 @@ bool GetFiles(std::vector<std::filesystem::path>& files)
         const std::string p = UriToPath(line);
         if (!p.empty()) files.emplace_back(p);
     }
+    if (files.empty()) SetNote("the clipboard file list has no local files");
     return !files.empty();
 }
 
 bool SetFiles(const std::vector<std::filesystem::path>& files)
 {
+    SetNote("");
     const Tools& t = Pick();
-    if (!t.files || files.empty()) return false;
+    if (t.name.empty()) { SetNote("no clipboard tool found (install xclip or wl-clipboard)"); return false; }
+    if (!t.files || files.empty()) { SetNote(t.name + " cannot write files (install xclip or wl-clipboard)"); return false; }
     const bool gnome = GnomeStyleDesktop();
     std::string data;
     if (gnome) data = "copy";
@@ -465,7 +489,9 @@ bool SetFiles(const std::vector<std::filesystem::path>& files)
         const std::string uri = "file://" + PercentEncodePath(f.string());
         data += gnome ? "\n" + uri : uri + "\r\n";
     }
-    return RunWrite(gnome ? t.writeGnome : t.writeUri, data);
+    const bool ok = RunWrite(gnome ? t.writeGnome : t.writeUri, data);
+    if (!ok) SetNote(t.name + " failed to take the file list (" + (gnome ? "x-special/gnome-copied-files" : "text/uri-list") + ")");
+    return ok;
 }
 
 #else
@@ -473,8 +499,8 @@ std::string Backend() { return {}; }
 bool FilesSupported() { return false; }
 bool GetText(std::string& out, std::size_t) { out.clear(); return false; }
 bool SetText(const std::string&) { return false; }
-bool GetFiles(std::vector<std::filesystem::path>& f) { f.clear(); return false; }
-bool SetFiles(const std::vector<std::filesystem::path>&) { return false; }
+bool GetFiles(std::vector<std::filesystem::path>& f) { f.clear(); SetNote("files are not supported on this platform"); return false; }
+bool SetFiles(const std::vector<std::filesystem::path>&) { SetNote("files are not supported on this platform"); return false; }
 #endif
 
 } // namespace clipboard

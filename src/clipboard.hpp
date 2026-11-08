@@ -34,6 +34,9 @@ bool SetText(const std::string& utf8);
 bool GetFiles(std::vector<std::filesystem::path>& files);
 bool SetFiles(const std::vector<std::filesystem::path>& files);
 
+// Why the last GetFiles / SetFiles call did not work ("" when it did). For the activity log.
+std::string LastNote();
+
 std::string Base64Encode(const std::string& in);
 bool Base64Decode(const std::string& in, std::string& out);
 
