@@ -31,7 +31,17 @@ std::string Lower(std::string s)
     return s;
 }
 
-std::string TextSig(const std::string& t) { return "T|" + std::to_string(std::hash<std::string>{}(t)); }
+// Same value on every OS (std::hash is not), because the receiver recomputes it for text.
+std::string Fnv(const std::string& s)
+{
+    std::uint64_t h = 1469598103934665603ull;
+    for (unsigned char c : s) { h ^= c; h *= 1099511628211ull; }
+    char b[24];
+    std::snprintf(b, sizeof b, "%016llx", (unsigned long long)h);
+    return b;
+}
+
+std::string TextSig(const std::string& t) { return "T|" + Fnv(t); }
 
 // true when 'p' is inside (or is) 'dir'
 bool Inside(const fs::path& p, const fs::path& dir)
@@ -209,11 +219,12 @@ ClipShare::Prep ClipShare::Prepare(std::vector<Item>& items, std::uint64_t& tota
         }
         if (items.empty()) {
             if (dirs && !own) info = "only folders are on the clipboard (only files are shared)";
+            else if (own && !dirs) info = "these files came from another PC and are not sent back";
             return Prep::Nothing;
         }
         if (dirs) info = std::to_string(dirs) + " folder(s) skipped (only files are shared)";
         total = sum;
-        sig = sg.str();
+        sig = "F|" + Fnv(sg.str());
         return sum > limit ? Prep::TooBig : Prep::Ready;
     }
 
@@ -241,7 +252,10 @@ void ClipShare::SendTo(int peer, const std::string& peerName)
         std::lock_guard<std::mutex> lk(mtx_);
         auto it = out_.find(peer);
         if (it != out_.end()) {
-            if (!it->second->done) return;              // still sending the previous clipboard
+            if (!it->second->done) {                    // still sending the previous clipboard
+                Log("Clipboard not sent to " + peerName + " yet: the previous clipboard is still being sent");
+                return;
+            }
             finished = it->second;
             out_.erase(it);
         }
@@ -254,12 +268,6 @@ void ClipShare::SendTo(int peer, const std::string& peerName)
     const Prep prep = Prepare(items, total, sig, info);
     if (prep == Prep::Nothing) { if (!info.empty()) Log("Clipboard: " + info); return; }
 
-    {
-        std::lock_guard<std::mutex> lk(mtx_);
-        auto s = sentSig_.find(peer);
-        if (s != sentSig_.end() && s->second == sig) return;    // the peer already has exactly this
-        sentSig_[peer] = sig;
-    }
     if (prep == Prep::TooBig) {
         Log("Clipboard not sent to " + peerName + ": " + FormatBytes(total) + " is more than the limit of " +
             FormatBytes(limit_.load()) + " (Network tab)");
@@ -309,11 +317,12 @@ void ClipShare::RunOut(std::shared_ptr<Out> o)
         Log("Clipboard not sent to " + o->peerName + ": " + why);
     };
 
-    Send(o->peer, "CLIPO " + x + " " + std::to_string(o->items.size()) + " " + std::to_string(o->total));
+    Send(o->peer, "CLIPO " + x + " " + std::to_string(o->items.size()) + " " + std::to_string(o->total) + " " + o->sig);
     {
         std::unique_lock<std::mutex> lk(o->m);
         o->cv.wait_for(lk, std::chrono::seconds(10), [&] { return o->state != 0 || o->cancel.load(); });
         if (o->state == 0) { lk.unlock(); fail("no answer", true); return; }
+        if (o->state == 3) { o->ok = true; return; }          // the other PC's clipboard already holds exactly this
         if (o->state == 2) { const std::string why = o->reason.empty() ? "refused" : o->reason; lk.unlock(); Log("Clipboard not sent to " + o->peerName + ": " + why); return; }
     }
 
@@ -384,7 +393,11 @@ bool ClipShare::HandleLine(int peer, const std::string& peerName, bool mayWrite,
     is >> cmd >> xfer;
     if (!is) return true;                               // malformed: swallowed
 
-    if (cmd == "CLIPO") { OnOffer(peer, peerName, mayWrite, xfer, is); return true; }
+    if (cmd == "CLIPO") {
+        ForgetSent(peer);                               // its clipboard changed since our last send: offer ours again next time
+        OnOffer(peer, peerName, mayWrite, xfer, is);
+        return true;
+    }
     if (cmd == "CLIPI") { OnItem(peer, xfer, is); return true; }
     if (cmd == "CLIPD") { OnData(peer, xfer, is); return true; }
     if (cmd == "CLIPE") { OnEnd(peer, xfer, is); return true; }
@@ -400,11 +413,20 @@ bool ClipShare::HandleLine(int peer, const std::string& peerName, bool mayWrite,
     if (cmd == "CLIPX") {
         auto it = in_.find(peer);
         if (it != in_.end() && it->second->xfer == xfer) AbortIn(peer, false);   // the sender gave up
+        if (o && o->done) {
+            // The transfer had finished, but the other PC could not put it on its clipboard. It must not be
+            // remembered as "delivered", otherwise the same files would never be offered again.
+            { std::lock_guard<std::mutex> lk(mtx_); auto s = sentSig_.find(peer); if (s != sentSig_.end() && s->second == o->sig) sentSig_.erase(s); }
+            Log("Clipboard sent to " + o->peerName + " arrived, but that PC could not put it on its clipboard - it is sent again at the next crossing");
+            return true;
+        }
     }
     if (!o) return true;
 
     if (cmd == "CLIPA") {
         { std::lock_guard<std::mutex> lk(o->m); if (o->state == 0) o->state = 1; }
+    } else if (cmd == "CLIPS") {
+        { std::lock_guard<std::mutex> lk(o->m); if (o->state == 0) o->state = 3; }
     } else if (cmd == "CLIPN") {
         std::string why, arg;
         is >> why;
@@ -430,6 +452,31 @@ bool ClipShare::HandleLine(int peer, const std::string& peerName, bool mayWrite,
     return true;
 }
 
+bool ClipShare::AlreadyHas(int peer, const std::string& sig)
+{
+    if (sig.size() < 3) return false;
+    if (sig[0] == 'T') {                                // text: compare with what is on the clipboard right now
+        std::string cur;
+        return h_.getText(cur, (std::size_t)clipboard::kMaxTextBytes) && !cur.empty() && TextSig(cur) == sig;
+    }
+    // files: the same set we received last time, and our clipboard still points to exactly those files
+    const auto g = got_.find(peer);
+    if (g == got_.end() || g->second.sig != sig || g->second.files.empty()) return false;
+    std::vector<fs::path> cur;
+    if (!h_.getFiles(cur) || cur.size() != g->second.files.size()) return false;
+    for (const auto& want : g->second.files) {
+        std::error_code ec;
+        if (!fs::exists(want, ec) || ec) return false;      // deleted meanwhile: it has to be sent again
+        bool found = false;
+        for (const auto& c : cur) {
+            std::error_code ec2;
+            if (fs::equivalent(want, c, ec2) && !ec2) { found = true; break; }
+        }
+        if (!found) return false;
+    }
+    return true;
+}
+
 void ClipShare::AbortIn(int peer, bool notify, const std::string& why)
 {
     auto it = in_.find(peer);
@@ -448,9 +495,16 @@ void ClipShare::OnOffer(int peer, const std::string& peerName, bool mayWrite, st
     std::uint32_t nItems = 0;
     std::uint64_t total = 0;
     is >> nItems >> total;
+    const bool parsed = static_cast<bool>(is);
+    std::string sig;
+    if (parsed) is >> sig;                              // older versions send no signature: that is fine
     AbortIn(peer, false);                               // a new offer replaces an unfinished one
     const std::string x = std::to_string(xfer);
-    if (!is || nItems == 0 || nItems > kMaxItems) { Send(peer, "CLIPN " + x + " ERROR"); return; }
+    if (!parsed || nItems == 0 || nItems > kMaxItems) {
+        Send(peer, "CLIPN " + x + " ERROR");
+        Log("Clipboard from " + peerName + " refused: malformed offer");
+        return;
+    }
     if (!mayWrite) {
         Send(peer, "CLIPN " + x + " DENIED");
         Log("Clipboard from " + peerName + " refused: turn on \"Share my clipboard\" for that PC here (or allow it to control this PC)");
@@ -462,6 +516,7 @@ void ClipShare::OnOffer(int peer, const std::string& peerName, bool mayWrite, st
         Log("Clipboard from " + peerName + " refused: " + FormatBytes(total) + " is more than the limit of " + FormatBytes(limit));
         return;
     }
+    if (!sig.empty() && AlreadyHas(peer, sig)) { Send(peer, "CLIPS " + x); return; }
     std::error_code ec;
     fs::create_directories(incoming_, ec);
     const auto sp = fs::space(incoming_, ec);
@@ -475,6 +530,7 @@ void ClipShare::OnOffer(int peer, const std::string& peerName, bool mayWrite, st
     in->total = total;
     in->nItems = nItems;
     in->peerName = peerName;
+    in->sig = sig;
     in->dir = incoming_ / ("t" + x);
     in_[peer] = std::move(in);
     Send(peer, "CLIPA " + x);
@@ -573,10 +629,10 @@ void ClipShare::OnFinish(int peer, std::uint64_t xfer)
     if (!in.files.empty()) {
         ok = h_.setFiles(in.files);
         what = std::to_string(in.files.size()) + (in.files.size() == 1 ? " file" : " files");
+        if (ok) got_[peer] = Got{in.sig, in.files};
     } else if (in.anyText) {
         ok = h_.setText(in.text);
         what = "text";
-        if (ok) { std::lock_guard<std::mutex> lk(mtx_); sentSig_[peer] = TextSig(in.text); }   // do not echo it back
     }
     const std::uint64_t got = in.got;
     const std::string from = in.peerName;
@@ -589,6 +645,7 @@ void ClipShare::OnFinish(int peer, std::uint64_t xfer)
     } else {
         const std::string why = clipboard::LastNote();
         Log("Could not put the received clipboard on this PC's clipboard" + (why.empty() ? std::string(" (Linux: install xclip or wl-clipboard)") : ": " + why));
+        Send(peer, "CLIPX " + std::to_string(xfer));        // so the sender offers it again
     }
 }
 

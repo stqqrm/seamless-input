@@ -7,8 +7,9 @@
 // puts them on its clipboard as "copied", so a normal paste in the file manager copies them.
 //
 // Wire protocol (inner lines; the Session encrypts every line):
-//   CLIPO <xfer> <items> <total bytes>           offer                       sender -> receiver
+//   CLIPO <xfer> <items> <total bytes> <sig>     offer                       sender -> receiver
 //   CLIPA <xfer>                                 accepted                    receiver -> sender
+//   CLIPS <xfer>                                 "my clipboard already holds exactly this" (nothing to send)
 //   CLIPN <xfer> LIMIT <bytes>|DENIED|DISK|ERROR refused                     receiver -> sender
 //   CLIPI <xfer> <idx> <T|F> <size> <b64 name>   next item (text or file)    sender -> receiver
 //   CLIPD <xfer> <idx> <seq> <b64 data>          up to 32 KiB of the item    sender -> receiver
@@ -37,6 +38,9 @@
 
 class ClipShare {
 public:
+    // Bump when the clipboard wire protocol changes. Shown in the startup log so an old daemon that is
+    // still running (it keeps running after an update) can be told apart from the new one.
+    static constexpr int kProtocol = 3;
     static constexpr std::uint64_t kDefaultLimit = 1ull << 30;     // 1 GiB
     static constexpr std::uint64_t kMinLimit     = 1ull << 10;     // 1 KiB
     static constexpr std::uint64_t kMaxLimit     = 1ull << 40;     // 1 TiB
@@ -89,7 +93,7 @@ private:
         bool ok = false;                 // everything was sent
         std::mutex m;
         std::condition_variable cv;
-        int state = 0;                   // 0 waiting for the answer, 1 accepted, 2 refused / aborted
+        int state = 0;                   // 0 waiting for the answer, 1 accepted, 2 refused / aborted, 3 receiver already has it
         std::string reason;
         std::int64_t acked = -1;
         std::atomic<bool> cancel{false};
@@ -111,7 +115,9 @@ private:
         std::set<std::string> used;
         std::uint64_t got = 0;
         std::string peerName;
+        std::string sig;                 // the sender's signature of this clipboard (see AlreadyHas)
     };
+    struct Got { std::string sig; std::vector<std::filesystem::path> files; };   // the files we last put on the clipboard
     enum class Prep { Nothing, Ready, TooBig };
 
     Prep Prepare(std::vector<Item>& items, std::uint64_t& total, std::string& sig, std::string& info);
@@ -124,6 +130,9 @@ private:
     void OnFinish(int peer, std::uint64_t xfer);
     void AbortIn(int peer, bool notify, const std::string& why = std::string());
     void CleanupOldIncoming(const std::filesystem::path& keep);
+    // The RECEIVER decides whether a transfer is needed: it looks at its own clipboard. (A sender that
+    // remembers "already sent" is wrong as soon as the other PC's clipboard changed in the meantime.)
+    bool AlreadyHas(int peer, const std::string& sig);
 
     void Send(int peer, const std::string& line) { if (h_.send) h_.send(peer, line); }
     void Log(const std::string& s) { if (h_.log) h_.log(s); }
@@ -137,4 +146,5 @@ private:
     std::map<int, std::shared_ptr<Out>> out_;
     std::map<int, std::string> sentSig_;
     std::map<int, std::unique_ptr<In>> in_;            // Core thread only
+    std::map<int, Got> got_;                           // Core thread only
 };

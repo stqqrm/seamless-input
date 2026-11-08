@@ -37,6 +37,7 @@ struct Scanned {                         // a host found by the subnet scan
 
 struct Snapshot {
     std::string host, pubKey, dataDir, identNote, backend, monsSource;
+    std::string version;                // of the daemon (empty: an older daemon that does not report it)
     bool inputCanInject = true;          // false: this PC cannot be controlled (see inputNote)
     std::string inputNote;               // why keyboard/mouse sharing is limited or unavailable ("" = fine)
     std::string group;                   // group password ("" = none)

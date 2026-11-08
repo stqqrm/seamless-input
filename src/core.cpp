@@ -1,4 +1,5 @@
 #include "core.hpp"
+#include "version.hpp"
 
 #include <algorithm>
 #include <cmath>
@@ -192,12 +193,14 @@ bool Core::Start(std::string* err)
 
     Post([this] {
         Log("This PC's key: " + Identity::Fingerprint(ident_->PublicHex()) + "   (data: " + dir_.string() + ")");
+        Log("seamless-input " + appver::Full());
         if (!identNote_.empty()) Log("Identity: " + identNote_);
         Log("Monitors (" + monsSource_ + "): " + std::to_string(mons_.size()));
         const std::string cb = clipboard::Backend();
         Log(cb.empty() ? "Clipboard sharing unavailable (on Linux install xclip, xsel or wl-clipboard)"
                        : "Clipboard sharing ready: " + cb + (clipboard::FilesSupported() ? " (text and files)" : " (text only)") +
-                         ", limit " + ClipShare::FormatBytes(clip_ ? clip_->Limit() : ClipShare::kDefaultLimit));
+                         ", limit " + ClipShare::FormatBytes(clip_ ? clip_->Limit() : ClipShare::kDefaultLimit) +
+                         ", protocol " + std::to_string(ClipShare::kProtocol));
         Log(groupPwd_.empty()
             ? "Ready. No password set - PCs without a password connect automatically."
             : "Ready. PCs with the same group password connect automatically.");
@@ -274,6 +277,7 @@ state::Snapshot Core::GetSnapshot() const
     s.identNote = identNote_;
     s.backend = input_ ? input_->BackendName() : "none";
     s.monsSource = monsSource_;
+    s.version = appver::Full();
     s.group = groupPwd_;
     s.clipLimit = clip_ ? clip_->Limit() : ClipShare::kDefaultLimit;
     s.inputCanInject = canInject_;

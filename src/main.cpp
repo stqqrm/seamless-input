@@ -47,6 +47,7 @@
 #include "paths.hpp"
 #include "service.hpp"
 #include "state.hpp"
+#include "version.hpp"
 
 // ============================================================================
 // Canvas: every PC is a group of monitor rectangles drawn at real pixel
@@ -2191,7 +2192,7 @@ public:
           host_(wxString::FromUTF8(paths::HostName())),
           alive_(std::make_shared<bool>(true))
     {
-        SetTitle("seamless-input - " + host_);
+        UpdateTitle();
         local_ = GetLocalAddresses();
         localMons_ = GetLocalMonitors();      // until the daemon reports the monitors it uses itself
         dataDir_ = paths::DataDir();
@@ -2368,6 +2369,19 @@ private:
         }).detach();
     }
 
+    // Window title: this window's version, and a warning when the background service is a different one.
+    void UpdateTitle()
+    {
+        wxString t = "seamless-input " + wxString::FromUTF8(appver::Full()) + " - " + host_;
+        if (connected_ && daemonWanted_) {
+            if (snap_.version.empty())
+                t += "  |  background service is an OLDER version - restart it (Service menu > Stop, then Start)";
+            else if (snap_.version != appver::Full())
+                t += "  |  background service: " + wxString::FromUTF8(snap_.version) + " - restart it";
+        }
+        SetTitle(t);
+    }
+
     void FinishConnect(bool ok, const std::string& err)
     {
         connecting_ = false;
@@ -2385,6 +2399,7 @@ private:
         log_->Clear();                                  // the daemon replays its log history on attach
         connected_ = true;
         client_->Send("ATTACH");
+        UpdateTitle();
         SendMonitorsHint();
         client_->Send("SCAN");
         UpdateHeader();
@@ -2431,6 +2446,7 @@ private:
                           : "Background service stopped");
         retry_ = 0;
         ShowOffline();
+        UpdateTitle();
         UpdateHeader();
     }
 
@@ -2446,6 +2462,7 @@ private:
         off.inputMode = 0;
         off.inputPeer = -1;
         off.sysCapturing = off.micCapturing = false;
+        off.version.clear();
         stats_ = state::Stats{};
         ApplySnapshot(off);
         UpdateAudioStats();
@@ -2669,7 +2686,9 @@ private:
         }
         if (MenuItemDef* m = menuBar_->Item(kIdSvcInfo)) {
             const wxString st = running ? "running" : (daemonWanted_ && !connected_) ? "not reachable" : "stopped";
-            m->label = "Background service: " + st + (a.kind.empty() ? wxString() : "  (" + wxString::FromUTF8(a.kind) + ")");
+            wxString ver;
+            if (running) ver = snap_.version.empty() ? wxString(", older version") : ", " + wxString::FromUTF8(snap_.version);
+            m->label = "Background service: " + st + ver + (a.kind.empty() ? wxString() : "  (" + wxString::FromUTF8(a.kind) + ")");
         }
     }
 
@@ -3592,6 +3611,7 @@ private:
                 wxTheApp->CallAfter([this] { ShowInputProblem(true); });
         }
         if (keyChanged) UpdateHeader();
+        UpdateTitle();                                  // the daemon's version arrives with the first snapshot
 
         using clock = std::chrono::steady_clock;
         const auto now = clock::now();

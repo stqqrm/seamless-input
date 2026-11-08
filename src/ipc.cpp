@@ -65,7 +65,7 @@ std::vector<std::string> SerializeSnapshot(const state::Snapshot& s)
     auto b = [](bool x) { return x ? "1" : "0"; };
     v.push_back("SB");
     v.push_back("H " + Enc(s.host) + " " + Enc(s.pubKey) + " " + Enc(s.dataDir) + " " + Enc(s.identNote) + " " +
-                Enc(s.backend) + " " + Enc(s.monsSource));
+                Enc(s.backend) + " " + Enc(s.monsSource) + " " + Enc(s.version));
     for (const auto& m : s.mons)
         v.push_back("M " + std::to_string(m.x) + " " + std::to_string(m.y) + " " + std::to_string(m.w) + " " + std::to_string(m.h));
     v.push_back("G " + Enc(s.group));
@@ -101,6 +101,7 @@ bool ParseSnapshotLine(const std::vector<std::string>& t, state::Snapshot& s)
     auto S = [&](size_t i) { return i < t.size() ? Dec(t[i]) : std::string(); };
     if (k == "H" && t.size() >= 7) {
         s.host = S(1); s.pubKey = S(2); s.dataDir = S(3); s.identNote = S(4); s.backend = S(5); s.monsSource = S(6);
+        if (t.size() >= 8) s.version = S(7);
     } else if (k == "M" && t.size() >= 5) {
         s.mons.push_back({(int)I(1), (int)I(2), (int)I(3), (int)I(4)});
     } else if (k == "G") {
