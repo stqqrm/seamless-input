@@ -2204,13 +2204,13 @@ public:
             wxTheApp->CallAfter([alive, fn, self] { if (*alive) fn(self); });
         };
         h.onSnapshot = [post, this](const state::Snapshot& s) {
-            post([s](MainFrame* f) { f->ApplySnapshot(s); }, this);
+            post([s](MainFrame* f) { if (f->daemonWanted_) f->ApplySnapshot(s); }, this);   // after Stop the view stays empty
         };
         h.onLog = [post, this](const std::string& l) {
             post([l](MainFrame* f) { f->LogRaw(wxString::FromUTF8(l)); }, this);
         };
         h.onStats = [post, this](const state::Stats& st) {
-            post([st](MainFrame* f) { f->stats_ = st; f->UpdateAudioStats(); }, this);
+            post([st](MainFrame* f) { if (!f->daemonWanted_) return; f->stats_ = st; f->UpdateAudioStats(); }, this);
         };
         h.onDisconnected = [post, this]() { post([](MainFrame* f) { f->OnDisconnected(); }, this); };
         client_ = std::make_shared<ipc::Client>(std::move(h));
@@ -2430,7 +2430,25 @@ private:
         Log(daemonWanted_ ? "Lost the connection to the background service - reconnecting"
                           : "Background service stopped");
         retry_ = 0;
+        ShowOffline();
         UpdateHeader();
+    }
+
+    // Without the service nobody is connected: empty the device cards, client list, other hosts and
+    // canvas, so nothing keeps saying "Connected" for a PC that is no longer reachable.
+    void ShowOffline()
+    {
+        state::Snapshot off = snap_;
+        off.peers.clear();
+        off.disc.clear();
+        off.scan.clear();
+        off.scanning = false;
+        off.inputMode = 0;
+        off.inputPeer = -1;
+        off.sysCapturing = off.micCapturing = false;
+        stats_ = state::Stats{};
+        ApplySnapshot(off);
+        UpdateAudioStats();
     }
 
     void SendMonitorsHint()
@@ -2739,6 +2757,7 @@ private:
         if (connected_ && daemonWanted_) {
             daemonWanted_ = false;
             ipc::RequestStop(dataDir_);
+            ShowOffline();
             Log("Stopping the background service (it starts again with the next window, or at login if autostart is on)");
         } else {
             daemonWanted_ = true;
