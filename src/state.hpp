@@ -21,6 +21,7 @@ struct Peer {
     bool mute = false;                   // mute what it sends me
     int  vol = 100;                      // 0..100, what I hear from it
     bool allowed = false;                // may it control this PC? (saved per device, off by default)
+    bool clip = false;                   // share my clipboard with it when the cursor moves over to it
 };
 
 struct Beacon {                          // another instance seen on the LAN (UDP discovery)
@@ -36,7 +37,10 @@ struct Scanned {                         // a host found by the subnet scan
 
 struct Snapshot {
     std::string host, pubKey, dataDir, identNote, backend, monsSource;
+    bool inputCanInject = true;          // false: this PC cannot be controlled (see inputNote)
+    std::string inputNote;               // why keyboard/mouse sharing is limited or unavailable ("" = fine)
     std::string group;                   // group password ("" = none)
+    std::uint64_t clipLimit = 1ull << 30; // largest clipboard (text / files) copied to another PC, in bytes
     std::vector<InputRect> mons;         // this PC's monitors
     bool masterMute = false;
     int  masterVol = 100;

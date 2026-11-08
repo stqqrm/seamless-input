@@ -25,6 +25,7 @@ namespace {
 constexpr ULONG_PTR kTag = 0x53454D4CUL;
 constexpr UINT kMsgKbdOn  = WM_APP + 1;
 constexpr UINT kMsgKbdOff = WM_APP + 2;
+constexpr UINT kPollMs    = 30;           // edge polling while input is local (see PollEdge)
 
 // ---- key translation: Windows hook (vk / scancode+extended)  <->  Linux evdev code
 // Plain (non-extended) set-1 scancodes 0x01..0x58 are numerically identical to evdev codes.
@@ -60,6 +61,8 @@ public:
     const char* Name() const override { return "Windows (SetWindowsHookEx / SendInput)"; }
 
     ~WindowsBackend() override { ShowCursorAgain(); }
+
+    void SetGeometry(const std::vector<InputRect>& monitors) override { mons_ = monitors; }
 
     bool Start(BackendSink sink, std::string* err) override
     {
@@ -305,25 +308,65 @@ private:
         }
         initCv_.notify_all();
         if (!mouse_) return;
+        // The keyboard hook stays installed: while input is local it only reports that the owner is typing
+        // (owner priority), while forwarding it swallows and forwards the keys.
+        kbd_ = SetWindowsHookExW(WH_KEYBOARD_LL, &KbdThunk, GetModuleHandleW(nullptr), 0);
+
+        // A touchpad stops delivering mouse events the moment the finger rests: if the one event
+        // that reached the screen edge was not enough to switch (or the driver reported a point the
+        // hook could not use), nothing would ever look at the edge again. Poll it.
+        pollTimer_ = SetTimer(nullptr, 0, kPollMs, nullptr);
 
         while (GetMessageW(&msg, nullptr, 0, 0) > 0) {
             if (msg.message == kMsgKbdOn) {
-                // The keyboard hook only exists while input is being forwarded.
-                if (!kbd_ && fwd_) kbd_ = SetWindowsHookExW(WH_KEYBOARD_LL, &KbdThunk, GetModuleHandleW(nullptr), 0);
+                if (!kbd_) kbd_ = SetWindowsHookExW(WH_KEYBOARD_LL, &KbdThunk, GetModuleHandleW(nullptr), 0);
                 if (fwd_) ShowOverlay();
             } else if (msg.message == kMsgKbdOff) {
-                if (kbd_) { UnhookWindowsHookEx(kbd_); kbd_ = nullptr; }
                 HideOverlay();
             } else if (msg.message == WM_TIMER && msg.hwnd == nullptr) {
-                Reassert();
+                if (msg.wParam == pollTimer_) PollEdge();
+                else                          Reassert();
             } else {
                 TranslateMessage(&msg);
                 DispatchMessageW(&msg);
             }
         }
+        if (pollTimer_) { KillTimer(nullptr, pollTimer_); pollTimer_ = 0; }
         if (kbd_)   { UnhookWindowsHookEx(kbd_);   kbd_ = nullptr; }
         if (mouse_) { UnhookWindowsHookEx(mouse_); mouse_ = nullptr; }
         if (overlay_) { DestroyWindow(overlay_); overlay_ = nullptr; }
+    }
+
+    // Real state of the mouse buttons (also those of a touchpad). The hook's own bookkeeping can get
+    // stuck when a button event is swallowed by another hook; the system's state cannot.
+    static bool AnyButtonDown()
+    {
+        for (int vk : {VK_LBUTTON, VK_RBUTTON, VK_MBUTTON, VK_XBUTTON1, VK_XBUTTON2})
+            if (GetAsyncKeyState(vk) & 0x8000) return true;
+        return false;
+    }
+
+    // True when (x, y) is within 'band' px of an outer edge of the desktop.
+    bool NearOuterEdge(int x, int y, int band) const
+    {
+        if (mons_.empty()) return false;
+        static const int dirs[4][2] = {{1, 0}, {-1, 0}, {0, 1}, {0, -1}};
+        for (const auto& d : dirs)
+            for (int k = 0; k <= band; ++k)
+                if (!inputgeom::InsideAny(mons_, x + d[0] * (k + 1), y + d[1] * (k + 1))) return true;
+        return false;
+    }
+
+    // Hook thread, ~33 Hz while input is local: if the cursor sits at the edge, tell the engine
+    // (it decides whether there is a PC beyond it). Motion events from the hook do the same, this
+    // just makes sure a cursor that arrived and stopped is not forgotten.
+    void PollEdge()
+    {
+        if (fwd_ || !sink_.onLocalMotion) return;
+        POINT p{};
+        if (!GetCursorPos(&p)) return;
+        if (!NearOuterEdge(p.x, p.y, 3)) return;
+        sink_.onLocalMotion(p.x, p.y, AnyButtonDown());
     }
 
     static LRESULT CALLBACK MouseThunk(int code, WPARAM wp, LPARAM lp)
@@ -385,7 +428,7 @@ private:
 
         if (!fwd_) {
             if (wp == WM_MOUSEMOVE && sink_.onLocalMotion) {
-                sink_.onLocalMotion(ms->pt.x, ms->pt.y, mask_ != 0);
+                sink_.onLocalMotion(ms->pt.x, ms->pt.y, mask_ != 0 && AnyButtonDown());
                 if (fwd_) return 1;                 // forwarding just began: eat this move
             }
             return CallNextHookEx(nullptr, code, wp, lp);
@@ -408,9 +451,13 @@ private:
 
     LRESULT OnKbd(int code, WPARAM wp, LPARAM lp)
     {
-        if (code != HC_ACTION || !fwd_) return CallNextHookEx(nullptr, code, wp, lp);
+        if (code != HC_ACTION) return CallNextHookEx(nullptr, code, wp, lp);
         const auto* k = reinterpret_cast<const KBDLLHOOKSTRUCT*>(lp);
         if (k->dwExtraInfo == kTag) return CallNextHookEx(nullptr, code, wp, lp);
+        if (!fwd_) {
+            if (!(k->flags & (LLKHF_UP | LLKHF_INJECTED)) && sink_.onPhysicalInput) sink_.onPhysicalInput(100);
+            return CallNextHookEx(nullptr, code, wp, lp);
+        }
 
         const bool up = (k->flags & LLKHF_UP) != 0;
         const size_t vk = k->vkCode & 0xFF;
@@ -431,6 +478,8 @@ private:
     HWND overlay_ = nullptr;             // hook thread only
     bool cursorCounted_ = false;         // hook thread only: ShowCursor(FALSE) is in effect
     UINT_PTR overlayTimer_ = 0;          // hook thread only
+    UINT_PTR pollTimer_ = 0;             // hook thread only
+    std::vector<InputRect> mons_;        // set before Start(), read on the hook thread
     std::mutex initMu_;
     std::condition_variable initCv_;
     bool initDone_ = false, hookOk_ = false;

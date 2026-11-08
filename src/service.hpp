@@ -33,6 +33,10 @@ bool SpawnDetached(std::string* err);
 // Makes sure a daemon answers on the IPC port: managed start when autostart is on, else a direct
 // spawn. Blocks up to waitMs. Safe to call when one already runs.
 bool EnsureDaemon(const std::filesystem::path& dataDir, std::string* err, int waitMs = 8000);
+// Force-stops every seamless-input-daemon process of this user (SIGTERM, then SIGKILL on Linux;
+// taskkill on Windows). For a daemon that does not answer: an older version, or a hung one.
+// Returns how many processes were signalled (-1: unknown).
+int KillDaemons();
 // Waits until no daemon answers any more (after RequestStop).
 bool WaitGone(const std::filesystem::path& dataDir, int waitMs);
 

@@ -97,7 +97,15 @@ int Run(bool worker)
     ipc::Server server(core, dir);
     std::string err;
     if (!server.Start(&err)) {
-        if (server.AddressInUse()) { log.Line("A daemon is already running - exiting"); return 0; }
+        if (server.AddressInUse()) {
+            // The port is the single-instance lock, but "taken" does not mean "a working daemon": a hung
+            // daemon or an unrelated program on the same port looks identical until we ask it.
+            if (ipc::Ping(dir, 1500)) { log.Line("A daemon is already running - exiting"); return 0; }
+            log.Line("Port " + std::to_string((int)ipc::kPort) + " is in use, but what listens there does not answer "
+                     "(a hung old daemon or another program). Find it with: ss -ltnp 'sport = :" +
+                     std::to_string((int)ipc::kPort) + "'  and stop it, then start again.");
+            return 1;
+        }
         log.Line("Cannot open the local control port: " + err);
         return 1;
     }

@@ -9,6 +9,7 @@
 #include <future>
 #include <sstream>
 
+#include "clipboard.hpp"
 #include "monitors.hpp"
 #include "paths.hpp"
 
@@ -110,8 +111,8 @@ bool Core::Start(std::string* err)
     NetCallbacks cb;
     cb.onStatus = [this](const std::string& s) { Post([this, s] { Log(s); }); };
     cb.onPeerReady = [this](int id, std::uint32_t inst, const std::string& key, const std::string& name,
-                            const std::string& addr, bool incoming) {
-        Post([=] { OnPeerReady(id, inst, key, name, addr, incoming); });
+                            const std::string& addr, bool incoming, const PeerAudioKeys& ak) {
+        Post([=] { OnPeerReady(id, inst, key, name, addr, incoming, ak); });
     };
     cb.onPeerLost = [this](int id) {
         if (input_) input_->RemovePeer(id);     // hand input back immediately
@@ -164,20 +165,39 @@ bool Core::Start(std::string* err)
         [this](int id, const std::string& line) { net_->Send(id, line); },
         [this](const std::string& msg) { Post([this, msg] { Log("Input: " + msg); }); });
     input_->SetLocalMonitors(mons_);
+    input_->onCursorToPeer = [this](int id) { Post([this, id] { OnCursorToPeer(id); }); };
     input_->onModeChange = [this](InputEngine::Mode m, int id) {
         Post([this, m, id] { inputMode_ = m; inputPeer_ = id; Changed(); });
     };
     {
         std::string msg;
-        if (input_->Start(&msg)) PostLog("Keyboard/mouse sharing ready: " + input_->BackendName());
-        else                     PostLog("Keyboard/mouse sharing unavailable: " + msg);
+        const bool started = input_->Start(&msg);
+        if (started) PostLog("Keyboard/mouse sharing ready: " + input_->BackendName());
+        else         PostLog("Keyboard/mouse sharing unavailable: " + msg);
         if (!msg.empty() && input_->BackendName() != "none") PostLog("Input: " + msg);
+        canInject_ = started && input_->CanInject();
+        inputNote_ = msg.empty() && !started ? "keyboard/mouse sharing could not start" : msg;
+    }
+
+    {
+        ClipShare::Hooks h;
+        h.send = [this](int id, const std::string& line) { if (net_) net_->Send(id, line); };
+        h.log = [this](const std::string& m) { PostLog(m); };
+        clip_ = std::make_unique<ClipShare>(dir_ / "incoming", std::move(h));
+        std::ifstream f(dir_ / "clipboard.txt");
+        std::string k;
+        unsigned long long v = 0;
+        if (f >> k >> v && k == "limit") clip_->SetLimit(v);
     }
 
     Post([this] {
         Log("This PC's key: " + Identity::Fingerprint(ident_->PublicHex()) + "   (data: " + dir_.string() + ")");
         if (!identNote_.empty()) Log("Identity: " + identNote_);
         Log("Monitors (" + monsSource_ + "): " + std::to_string(mons_.size()));
+        const std::string cb = clipboard::Backend();
+        Log(cb.empty() ? "Clipboard sharing unavailable (on Linux install xclip, xsel or wl-clipboard)"
+                       : "Clipboard sharing ready: " + cb + (clipboard::FilesSupported() ? " (text and files)" : " (text only)") +
+                         ", limit " + ClipShare::FormatBytes(clip_ ? clip_->Limit() : ClipShare::kDefaultLimit));
         Log(groupPwd_.empty()
             ? "Ready. No password set - PCs without a password connect automatically."
             : "Ready. PCs with the same group password connect automatically.");
@@ -196,7 +216,7 @@ void Core::Stop()
     // Persist whatever is pending, on the Core thread, before the engines go away.
     {
         auto done = std::make_shared<std::promise<void>>();
-        Post([this, done] { FlushConfig(); done->set_value(); });
+        Post([this, done] { FlushConfig(); if (clip_) clip_->Shutdown(); done->set_value(); });
         done->get_future().wait_for(std::chrono::seconds(3));
     }
     if (input_) input_->Stop();   // return the keyboard/mouse before anything else shuts down
@@ -255,6 +275,9 @@ state::Snapshot Core::GetSnapshot() const
     s.backend = input_ ? input_->BackendName() : "none";
     s.monsSource = monsSource_;
     s.group = groupPwd_;
+    s.clipLimit = clip_ ? clip_->Limit() : ClipShare::kDefaultLimit;
+    s.inputCanInject = canInject_;
+    s.inputNote = inputNote_;
     s.mons = mons_;
     s.masterMute = masterMute_;
     s.masterVol = masterVol_;
@@ -268,7 +291,7 @@ state::Snapshot Core::GetSnapshot() const
         state::Peer p = kv.second;
         layout_.PeerPos(p.id, p.ox, p.oy);
         const auto ts = trust_->Get(p.key);
-        p.allowed = ts == TrustStore::State::Allowed;
+        p.allowed = ts == TrustStore::State::Allowed && canInject_;   // what is in effect, not just what was ticked
         s.peers.push_back(std::move(p));
     }
     for (const auto& kv : disc_) s.disc.push_back(kv.second.b);
@@ -314,7 +337,9 @@ void Core::CmdMonitorsHint(const std::vector<InputRect>& hint)
         input_->Stop();
         input_->SetLocalMonitors(mons_);
         std::string msg;
-        if (!input_->Start(&msg)) Log("Keyboard/mouse sharing unavailable: " + msg);
+        const bool started = input_->Start(&msg);
+        if (!started) Log("Keyboard/mouse sharing unavailable: " + msg);
+        RefreshInputStatus(started, msg);
     }
     Log("Learned this PC's monitor layout from the window (" + std::to_string(mons_.size()) + " monitor(s))");
     if (!peers_.empty() && net_) net_->SetGroup(groupPwd_);    // reconnect: peers learn the new geometry
@@ -419,6 +444,12 @@ void Core::CmdControl(int id, bool allow)
     auto it = peers_.find(id);
     if (it == peers_.end() || !input_) return;
     const state::Peer& p = it->second;
+    if (allow && !canInject_) {
+        // Accepting would make the other PC capture its keyboard and mouse for a PC that cannot react.
+        Log("Cannot allow " + p.name + " to control this PC: " + (inputNote_.empty() ? "input cannot be injected here" : inputNote_));
+        Changed();                                              // the window un-ticks the box
+        return;
+    }
     std::string err;
     if (!trust_->Set(p.key, allow ? TrustStore::State::Allowed : TrustStore::State::Denied, p.name, &err))
         Log("Could not save permissions: " + err);
@@ -428,16 +459,85 @@ void Core::CmdControl(int id, bool allow)
     Changed();
 }
 
+void Core::CmdClearCache()
+{
+    // Cached / remembered data that can be rebuilt: who may control this PC (decided again on the next
+    // connection), the learned monitor layout and the clipboard bookkeeping. Kept: the identity key, the
+    // group password, layouts and per-device audio/clipboard settings.
+    std::string err;
+    if (!trust_->Clear(&err)) Log("Could not save permissions: " + err);
+    for (const auto& kv : peers_) {
+        if (input_) input_->SetPeerAllowed(kv.first, false);    // also hands control back if it is active
+        SendControlState(kv.first);                              // tell the peer: CTRL 0
+    }
+    std::error_code ec;
+    std::filesystem::remove(dir_ / "monitors.txt", ec);
+    if (clip_) clip_->ForgetAll();
+    Log("Cache cleared: remembered permissions and the monitor cache were removed (devices must be allowed again)");
+    Changed();
+}
+
+void Core::CmdRegenKeys()
+{
+    namespace fs = std::filesystem;
+    std::error_code ec;
+    const fs::path file = dir_ / "identity.key", bak = dir_ / "identity.key.bak";
+    fs::remove(bak, ec);
+    fs::rename(file, bak, ec);                                  // LoadOrCreate makes a new key when the file is gone
+    if (ec) { Log("Could not replace the key file: " + ec.message()); return; }
+
+    std::string note;
+    const Identity fresh = Identity::LoadOrCreate(dir_, &note);
+    if (!fs::exists(file, ec) || !note.empty()) {
+        fs::remove(file, ec);
+        fs::rename(bak, file, ec);                              // put the old key back: never end up without one
+        Log("Could not save the new key" + (note.empty() ? std::string() : " (" + note + ")") + ": the old key stays");
+        return;
+    }
+    fs::remove(bak, ec);                                        // the old private key must not linger on disk
+    Log("New keys generated, fingerprint " + fresh.Fingerprint() + ". Restarting the background service ...");
+    CmdQuit();                                                  // network, beacons and peers all pick up the new key on restart
+}
+
+void Core::CmdClipboard(int id, bool share)
+{
+    auto it = peers_.find(id);
+    if (it == peers_.end()) return;
+    state::Peer& p = it->second;
+    if (p.clip == share) return;
+    p.clip = share;
+    if (clip_) clip_->ForgetSent(id);   // switching it on sends the current clipboard at the next crossing
+    if (share && clipboard::Backend().empty())
+        Log("Clipboard sharing needs xclip, xsel or wl-clipboard on this PC");
+    else if (share && !clipboard::FilesSupported())
+        Log("Only text can be shared on this PC (copying files needs xclip or wl-clipboard)");
+    Log((share ? "Sharing clipboard with " : "Stopped sharing clipboard with ") + p.name);
+    RecordPeerAudio(p);                 // per-device settings are saved together (audio + clipboard)
+    Changed();
+}
+
 void Core::SendControlState(int id)
 {
     auto it = peers_.find(id);
     if (it == peers_.end() || !net_) return;
-    net_->Send(id, trust_->Get(it->second.key) == TrustStore::State::Allowed ? "CTRL 1" : "CTRL 0");
+    // "Allowed" is the user's decision; whether control can really work is a separate question. A peer is
+    // only told it may control this PC when injection works, so it never grabs its input for nothing.
+    const bool allowed = trust_->Get(it->second.key) == TrustStore::State::Allowed;
+    net_->Send(id, allowed && canInject_ ? "CTRL 1" : "CTRL 0");
+}
+
+void Core::RefreshInputStatus(bool started, const std::string& msg)
+{
+    const bool can = started && input_ && input_->CanInject();
+    const bool changed = can != canInject_;
+    canInject_ = can;
+    inputNote_ = msg.empty() && !started ? "keyboard/mouse sharing could not start" : msg;
+    if (changed) for (const auto& kv : peers_) SendControlState(kv.first);
 }
 
 // ------------------------------------------------------------------ network results
 void Core::OnPeerReady(int id, std::uint32_t inst, const std::string& key, const std::string& name,
-                       const std::string& addr, bool incoming)
+                       const std::string& addr, bool incoming, const PeerAudioKeys& audioKeys)
 {
     state::Peer& p = peers_[id];
     p.id = id;
@@ -447,9 +547,16 @@ void Core::OnPeerReady(int id, std::uint32_t inst, const std::string& key, const
     p.addr = addr;
     p.incoming = incoming;
     p.placed = false;
+    if (clip_) clip_->PeerLost(id);     // a new connection: the peer's clipboard is unknown again
 
     Log("Connection established with " + name + " (" + addr + "), key " + Identity::Fingerprint(key) + " verified");
     audio_->AddPeer(inst, addr);
+    audio_->SetPeerKeys(inst, audioKeys.tx, audioKeys.rx);      // no keys, no audio in either direction
+    if (!audio_->VirtualMicActive()) {      // microphones of other PCs come out as an input device of this PC
+        std::string info;
+        if (audio_->EnableVirtualMic(&info)) Log("Microphones shared by other PCs appear as the input device \"" + info + "\"");
+        else Log("Microphone forwarding is not available: " + info);
+    }
     net_->Send(id, ScreensLine());      // tell the peer about our monitors
     OnSetChanged();                     // a new set of PCs: switch to its config
     // The layout entry appears once the peer's SCREENS line arrives.
@@ -464,6 +571,7 @@ void Core::OnPeerLost(int id)
         audio_->RemovePeer(it->second.inst);
         peers_.erase(it);
     }
+    if (clip_) clip_->PeerLost(id);
     layout_.RemovePeer(id);             // its virtual window disappears with the connection
     OnSetChanged();
     RefreshCapture();                   // nobody left to hear our audio: stop capturing
@@ -475,6 +583,8 @@ void Core::OnMessage(int id, const std::string& line)
     auto it = peers_.find(id);
     if (it == peers_.end()) return;
     state::Peer& p = it->second;
+
+    if (clip_ && clip_->HandleLine(id, p.name, p.clip || trust_->Get(p.key) == TrustStore::State::Allowed, line)) return;
 
     if (line.rfind("SCREENS ", 0) == 0) {
         if (p.placed) return;
@@ -593,6 +703,8 @@ void Core::RecordPeerAudio(const state::Peer& p, bool force)
     sp.hasMic = true;
     sp.mute = p.mute;
     sp.volume = p.vol;
+    sp.hasClip = true;
+    sp.clip = p.clip;
     if (!force) TouchCfg();
 }
 
@@ -668,6 +780,7 @@ void Core::ApplyConfigSettings()
             p.mic   = a.send && a.source != 1;
             p.mute = false; p.vol = 100;
         }
+        p.clip = sp && sp->hasClip && sp->clip;
         PushPeerAudio(p);
     }
     RefreshCapture();
@@ -741,4 +854,31 @@ void Core::UpdateCapture(AudioSource src, bool want, bool& capturing, const char
     }
     capturing = want;
     Log(std::string(want ? "Capturing " : "Stopped capturing ") + what);
+}
+
+
+// ------------------------------------------------------------------ clipboard sharing
+// The work is done by ClipShare (clipshare.hpp). Core decides WHEN: the cursor moved over to a peer
+// we share the clipboard with.
+void Core::OnCursorToPeer(int id)
+{
+    auto it = peers_.find(id);
+    if (it == peers_.end() || !net_ || !clip_) return;
+    const state::Peer& p = it->second;
+    if (!p.clip || !p.placed || clipboard::Backend().empty()) return;
+    clip_->SendTo(id, p.name);
+}
+
+void Core::CmdClipLimit(std::uint64_t bytes)
+{
+    if (!clip_) return;
+    clip_->SetLimit(bytes);
+    const std::uint64_t v = clip_->Limit();         // clamped
+    {
+        std::ofstream f(dir_ / "clipboard.txt", std::ios::trunc);
+        if (f) f << "limit " << v << "\n";
+        else Log("Could not save the clipboard limit");
+    }
+    Log("Clipboard limit: " + ClipShare::FormatBytes(v));
+    Changed();
 }

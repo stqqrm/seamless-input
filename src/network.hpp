@@ -20,6 +20,13 @@ struct BeaconInfo {
     bool sameGroup = false;         // it knows our group password
 };
 
+// Keys for this peer's UDP audio, derived from the same identity-key secret as the TCP encryption
+// but with their own label (so they never equal the TCP keys). Fresh for every TCP connection.
+struct PeerAudioKeys {
+    std::uint8_t tx[32] = {};     // encrypts audio we send to the peer
+    std::uint8_t rx[32] = {};     // decrypts audio the peer sends to us
+};
+
 // All callbacks are invoked on a non-GUI thread.
 struct NetCallbacks {
     std::function<void(const std::string& msg)> onStatus;
@@ -28,7 +35,8 @@ struct NetCallbacks {
     // that the peer owns the matching private key, so it is safe to use as identity.
     // The peer is accepted only when it knows our group password.
     std::function<void(int id, std::uint32_t instance, const std::string& key,
-                       const std::string& name, const std::string& addr, bool incoming)> onPeerReady;
+                       const std::string& name, const std::string& addr, bool incoming,
+                       const PeerAudioKeys& audioKeys)> onPeerReady;
     std::function<void(int id)> onPeerLost;
     std::function<void(int id, const std::string& line)> onMessage;
     // UDP discovery beacon from another instance on the LAN.

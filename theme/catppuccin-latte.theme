@@ -1,0 +1,13 @@
+# Catppuccin Latte for seamless-input. See README.txt in this folder for the format.
+name = Catppuccin Latte
+dark = false
+page = #eff1f5
+card = #ffffff
+border = #ccd0da
+track = #bcc0cc
+text = #4c4f69
+sub = #6c6f85
+accent = #1e66f5
+ok = #40a02b
+warn = #df8e1d
+bad = #d20f39

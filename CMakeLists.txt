@@ -236,6 +236,16 @@ endif()
 
 install(TARGETS ${PROJECT_NAME} seamless-input-daemon RUNTIME DESTINATION bin)
 
+# --- themes: theme/*.theme are read at run time (Theme menu). Copied next to the GUI executable and
+#     installed to <prefix>/share/seamless-input/theme; users add their own in <data dir>/theme.
+if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/theme")
+    add_custom_command(TARGET ${PROJECT_NAME} POST_BUILD
+        COMMAND ${CMAKE_COMMAND} -E copy_directory
+                "${CMAKE_CURRENT_SOURCE_DIR}/theme" "$<TARGET_FILE_DIR:${PROJECT_NAME}>/theme"
+        COMMENT "Copying themes")
+    install(DIRECTORY theme/ DESTINATION share/seamless-input/theme)
+endif()
+
 # --------------------------------------------------
 # Compiler warnings
 # --------------------------------------------------

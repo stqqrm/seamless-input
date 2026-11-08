@@ -1,6 +1,7 @@
 #include "ipc_server.hpp"
 
 #include <deque>
+#include <cstdlib>
 #include <fstream>
 #include <future>
 
@@ -136,6 +137,14 @@ private:
             c.CmdMaster(I(1) != 0, (int)I(2));
         } else if (cmd == "CONTROL" && t.size() >= 3) {
             c.CmdControl((int)I(1), I(2) != 0);
+        } else if (cmd == "CLIPBOARD" && t.size() >= 3) {
+            c.CmdClipboard((int)I(1), I(2) != 0);
+        } else if (cmd == "CLIPLIMIT" && t.size() >= 2) {
+            c.CmdClipLimit((std::uint64_t)std::strtoull(t[1].c_str(), nullptr, 10));
+        } else if (cmd == "CLEARCACHE") {
+            c.CmdClearCache();
+        } else if (cmd == "REGENKEYS") {
+            c.CmdRegenKeys();
         } else if (cmd == "STOP") {
             c.CmdQuit();
         }

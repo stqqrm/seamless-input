@@ -1,0 +1,13 @@
+# Solarized Light for seamless-input. See README.txt in this folder for the format.
+name = Solarized Light
+dark = false
+page = #eee8d5
+card = #fdf6e3
+border = #d8d1bb
+track = #c9c2ae
+text = #586e75
+sub = #839496
+accent = #268bd2
+ok = #859900
+warn = #b58900
+bad = #dc322f

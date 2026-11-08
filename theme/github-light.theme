@@ -1,0 +1,13 @@
+# GitHub Light for seamless-input. See README.txt in this folder for the format.
+name = GitHub Light
+dark = false
+page = #f6f8fa
+card = #ffffff
+border = #d0d7de
+track = #d8dee4
+text = #24292f
+sub = #57606a
+accent = #0969da
+ok = #1a7f37
+warn = #9a6700
+bad = #cf222e

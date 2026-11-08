@@ -1,0 +1,13 @@
+# Catppuccin Mocha for seamless-input. See README.txt in this folder for the format.
+name = Catppuccin Mocha
+dark = true
+page = #1e1e2e
+card = #313244
+border = #45475a
+track = #585b70
+text = #cdd6f4
+sub = #a6adc8
+accent = #89b4fa
+ok = #a6e3a1
+warn = #f9e2af
+bad = #f38ba8

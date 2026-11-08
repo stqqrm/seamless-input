@@ -62,7 +62,16 @@ install_debian() {
 install_arch() {
     info "Installing Arch Linux dependencies..."
 
-    sudo pacman -Sy --needed --noconfirm \
+    # NEVER use "pacman -Sy" here: refreshing the package database without upgrading the system is
+    # unsupported on Arch. The new libraries it pulls in (libpng, libtiff, ...) bump their sonames
+    # while the already installed programs still want the old ones -> "libXXX.so.N: cannot open
+    # shared object file". If that happened to you: run "sudo pacman -Syu", reboot, delete build/.
+    # Fix for that: do a full upgrade first (or install without refreshing).
+    if [[ "${SI_PACMAN_UPGRADE:-0}" == "1" ]]; then
+        sudo pacman -Syu --noconfirm
+    fi
+
+    sudo pacman -S --needed --noconfirm \
         base-devel \
         cmake \
         git \
@@ -77,12 +86,19 @@ install_arch() {
         libxi \
         libxfixes \
         libxtst \
+        libsm \
+        libice \
         mesa \
         glu \
         libpng \
         libjpeg-turbo \
         libtiff \
-        libnotify
+        libnotify \
+        libpulse \
+        alsa-lib \
+        xdg-utils \
+        xclip \
+        wl-clipboard
 }
 
 install_fedora() {

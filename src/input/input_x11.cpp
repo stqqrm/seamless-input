@@ -29,6 +29,7 @@ namespace {
 class X11Backend : public InputBackend {
 public:
     const char* Name() const override { return "X11 (XInput2 / XGrab / XTest)"; }
+    bool CanInject() const override { return xtest_; }
 
     bool Start(BackendSink sink, std::string* err) override
     {
@@ -53,6 +54,7 @@ public:
         unsigned char mask[XIMaskLen(XI_LASTEVENT)] = {};
         XISetMask(mask, XI_RawMotion);
         XISetMask(mask, XI_RawButtonPress);
+        XISetMask(mask, XI_RawKeyPress);          // the owner typing counts as "the user is here" too
         XIEventMask em;
         em.deviceid = XIAllMasterDevices;
         em.mask_len = (int)sizeof mask;
@@ -65,7 +67,8 @@ public:
             int n = 0;
             XIDeviceInfo* info = XIQueryDevice(dpy_, XIAllDevices, &n);
             for (int i = 0; info && i < n; ++i)
-                if (info[i].use == XISlavePointer && info[i].name && std::strstr(info[i].name, "XTEST"))
+                if ((info[i].use == XISlavePointer || info[i].use == XISlaveKeyboard) && info[i].name &&
+                    std::strstr(info[i].name, "XTEST"))
                     xtestIds_.insert(info[i].deviceid);
             if (info) XIFreeDeviceInfo(info);
         }
@@ -252,7 +255,7 @@ private:
                     if (ev.xcookie.evtype == XI_RawMotion) {
                         LocalMotion();
                         if (!injected && sink_.onPhysicalInput) sink_.onPhysicalInput(RawWeight(re));
-                    } else if (ev.xcookie.evtype == XI_RawButtonPress) {
+                    } else if (ev.xcookie.evtype == XI_RawButtonPress || ev.xcookie.evtype == XI_RawKeyPress) {
                         if (!injected && sink_.onPhysicalInput) sink_.onPhysicalInput(100);
                     }
                 }

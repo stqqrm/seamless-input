@@ -20,6 +20,7 @@
 #include <boost/asio.hpp>
 
 #include "audio.hpp"
+#include "clipshare.hpp"
 #include "config.hpp"
 #include "identity.hpp"
 #include "input/input.hpp"
@@ -62,7 +63,11 @@ public:
     void CmdPeerAudio(int id, bool share, bool mic, bool mute, int vol);
     void CmdMaster(bool mute, int vol);
     void CmdControl(int id, bool allow);                    // may this PC control ours?
+    void CmdClipLimit(std::uint64_t bytes);                 // largest clipboard (text / files) that is copied to another PC
+    void CmdClipboard(int id, bool share);                  // send my clipboard to this PC when the cursor moves over to it
     void CmdMonitorsHint(const std::vector<InputRect>& mons);
+    void CmdClearCache();                                   // forget remembered permissions and the monitor cache
+    void CmdRegenKeys();                                    // new identity key pair, then restart the daemon
     void CmdQuit() { if (onQuit) onQuit(); }
 
 private:
@@ -82,10 +87,13 @@ private:
 
     // network events (already on the Core thread)
     void OnPeerReady(int id, std::uint32_t inst, const std::string& key, const std::string& name,
-                     const std::string& addr, bool incoming);
+                     const std::string& addr, bool incoming, const PeerAudioKeys& audioKeys);
     void OnPeerLost(int id);
     void OnMessage(int id, const std::string& line);
     void SendControlState(int id);      // tell a peer whether it may control this PC (CTRL line)
+
+    // clipboard sharing (Core thread)
+    void OnCursorToPeer(int id);                                   // the cursor moved over to peer 'id'
 
     // layout + saved configs
     void BroadcastRelative(int movedId);
@@ -137,6 +145,11 @@ private:
     bool scanning_ = false;
     int clients_ = 0;
     int ticks_ = 0, scanTick_ = 0;
+
+    void RefreshInputStatus(bool started, const std::string& msg);   // Core thread
+    bool canInject_ = true;                       // this PC can be controlled
+    std::string inputNote_;                       // why not / what is limited
+    std::unique_ptr<ClipShare> clip_;             // clipboard text / files shared with peers
 
     bool masterMute_ = false;
     int masterVol_ = 100;

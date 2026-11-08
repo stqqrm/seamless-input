@@ -1,0 +1,13 @@
+# Tokyo Night for seamless-input. See README.txt in this folder for the format.
+name = Tokyo Night
+dark = true
+page = #1a1b26
+card = #24283b
+border = #3b4261
+track = #414868
+text = #c0caf5
+sub = #8089b3
+accent = #7aa2f7
+ok = #9ece6a
+warn = #e0af68
+bad = #f7768e

@@ -25,6 +25,10 @@ struct SavedPeer {
     bool hasMic = false;   // false: line from before the microphone switch existed (migrated on load)
     bool mute = false;     // mute what this device sends me
     int  volume = 100;     // 0..100 slider units (what I hear from this device)
+
+    // clipboard: send mine to this device when the cursor moves over to it
+    bool hasClip = false;  // false: the file had no "peerclip" line for this peer
+    bool clip = false;
 };
 
 struct SavedAudio {
@@ -78,6 +82,8 @@ public:
     State Get(const std::string& key) const;
     // Stores the decision and writes the file right away (decisions are rare).
     bool Set(const std::string& key, State s, const std::string& name, std::string* err = nullptr);
+    // Forgets every decision (nobody may control this PC afterwards) and writes the file.
+    bool Clear(std::string* err = nullptr);
 
 private:
     struct Entry { State state = State::Unknown; std::string name; };

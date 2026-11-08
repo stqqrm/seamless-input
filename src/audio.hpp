@@ -16,8 +16,9 @@ struct AudioPeerStat {
     bool receiving;    // packets arrived within the last second
 };
 
-// Sends this PC's audio to all registered peers (UDP) and mixes the audio
-// received from them into the default playback device.
+// Sends this PC's audio to all registered peers (UDP) and mixes the system audio
+// received from them into the default playback device. Audio is only sent while it is audible
+// (silence is not transmitted). Received microphones go to a virtual microphone.
 class AudioEngine {
 public:
     explicit AudioEngine(std::uint32_t myInstance);
@@ -33,6 +34,10 @@ public:
     // Peers come from the TCP mesh: audio is only accepted from / sent to these.
     void AddPeer(std::uint32_t instance, const std::string& ip);
     void RemovePeer(std::uint32_t instance);
+
+    // Per-connection keys (see PeerAudioKeys in network.hpp). Audio is encrypted and authenticated with
+    // them; a peer without keys gets no audio and none is accepted from it.
+    void SetPeerKeys(std::uint32_t instance, const std::uint8_t tx[32], const std::uint8_t rx[32]);
 
     // Start/stop capturing one source on its default device. The two sources run
     // independently and are sent as separate streams, so a device can get the
@@ -52,6 +57,15 @@ public:
 
     std::vector<AudioPeerStat> Stats();
     float InputLevel() const;        // 0..1 peak of what we are sending (loudest source)
+
+    // The microphone of the OTHER PCs is not played through the speakers: it is forwarded to a virtual
+    // microphone that applications on this PC can select as an input device.
+    //   Linux    a PulseAudio/PipeWire virtual source "Seamless Input Microphone" (needs pactl)
+    //   Windows  plays into a virtual audio cable ("CABLE Input" of VB-Cable); applications use "CABLE Output"
+    // Idempotent. true: *info is the name applications will see. false: *info says why it is not available
+    // (until it works, microphones received from other PCs are silently dropped).
+    bool EnableVirtualMic(std::string* info);
+    bool VirtualMicActive() const;
 
     static bool SystemAudioSupported();
 
