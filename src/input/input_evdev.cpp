@@ -553,6 +553,8 @@ private:
         }
         if (fwd_ && code > 0 && code < 0x100 && d.keyboard)         // keyboard keys
             Emit(InputKind::Key, code, value ? 1 : 0);              // value 2 (repeat) -> another "down"
+        else if (!fwd_ && value == 1 && code > 0 && code < 0x100 && d.keyboard && sink_.onPhysicalInput)
+            sink_.onPhysicalInput(100);                             // the owner is typing (own uinput devices are not read)
     }
 
     void Frame(Dev& d)

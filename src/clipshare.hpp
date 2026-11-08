@@ -85,6 +85,8 @@ private:
         std::string peerName;
         std::vector<Item> items;
         std::uint64_t total = 0;
+        std::string sig;                 // what is being sent (see sentSig_)
+        bool ok = false;                 // everything was sent
         std::mutex m;
         std::condition_variable cv;
         int state = 0;                   // 0 waiting for the answer, 1 accepted, 2 refused / aborted

@@ -308,6 +308,9 @@ private:
         }
         initCv_.notify_all();
         if (!mouse_) return;
+        // The keyboard hook stays installed: while input is local it only reports that the owner is typing
+        // (owner priority), while forwarding it swallows and forwards the keys.
+        kbd_ = SetWindowsHookExW(WH_KEYBOARD_LL, &KbdThunk, GetModuleHandleW(nullptr), 0);
 
         // A touchpad stops delivering mouse events the moment the finger rests: if the one event
         // that reached the screen edge was not enough to switch (or the driver reported a point the
@@ -316,11 +319,9 @@ private:
 
         while (GetMessageW(&msg, nullptr, 0, 0) > 0) {
             if (msg.message == kMsgKbdOn) {
-                // The keyboard hook only exists while input is being forwarded.
-                if (!kbd_ && fwd_) kbd_ = SetWindowsHookExW(WH_KEYBOARD_LL, &KbdThunk, GetModuleHandleW(nullptr), 0);
+                if (!kbd_) kbd_ = SetWindowsHookExW(WH_KEYBOARD_LL, &KbdThunk, GetModuleHandleW(nullptr), 0);
                 if (fwd_) ShowOverlay();
             } else if (msg.message == kMsgKbdOff) {
-                if (kbd_) { UnhookWindowsHookEx(kbd_); kbd_ = nullptr; }
                 HideOverlay();
             } else if (msg.message == WM_TIMER && msg.hwnd == nullptr) {
                 if (msg.wParam == pollTimer_) PollEdge();
@@ -450,9 +451,13 @@ private:
 
     LRESULT OnKbd(int code, WPARAM wp, LPARAM lp)
     {
-        if (code != HC_ACTION || !fwd_) return CallNextHookEx(nullptr, code, wp, lp);
+        if (code != HC_ACTION) return CallNextHookEx(nullptr, code, wp, lp);
         const auto* k = reinterpret_cast<const KBDLLHOOKSTRUCT*>(lp);
         if (k->dwExtraInfo == kTag) return CallNextHookEx(nullptr, code, wp, lp);
+        if (!fwd_) {
+            if (!(k->flags & (LLKHF_UP | LLKHF_INJECTED)) && sink_.onPhysicalInput) sink_.onPhysicalInput(100);
+            return CallNextHookEx(nullptr, code, wp, lp);
+        }
 
         const bool up = (k->flags & LLKHF_UP) != 0;
         const size_t vk = k->vkCode & 0xFF;

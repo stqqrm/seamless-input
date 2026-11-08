@@ -401,6 +401,8 @@ std::string UriToPath(std::string u)
 bool GnomeStyleDesktop()
 {
     const char* d = std::getenv("XDG_CURRENT_DESKTOP");
+    if (!d || !*d) d = std::getenv("XDG_SESSION_DESKTOP");     // a daemon started outside the desktop session
+    if (!d || !*d) d = std::getenv("DESKTOP_SESSION");         // may only have some of these
     if (!d) return false;
     std::string s(d);
     std::transform(s.begin(), s.end(), s.begin(), [](unsigned char c) { return (char)std::toupper(c); });

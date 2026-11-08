@@ -34,6 +34,9 @@ constexpr int kEdgeBand      = 2;       // px: a cursor this close to an outer e
                                         // (touchpads decelerate and may stop 1-2 px short of the edge)
 constexpr auto kCooldown     = std::chrono::milliseconds(250);
 constexpr auto kRetry        = std::chrono::milliseconds(750);
+// PC owner priority: the person sitting at a PC always wins over whoever is remote controlling it.
+// After the owner touched their mouse/keyboard nobody may (re)take control of that PC for this long.
+constexpr auto kOwnerHold    = std::chrono::milliseconds(3000);
 
 std::unique_ptr<InputBackend> CreateBackend(std::string* why)
 {
@@ -70,6 +73,8 @@ struct InputEngine::Impl {
         bool allowed = false;          // it may control this PC
         bool accepts = false;          // it said (CTRL 1) that this PC may control it
         bool warned = false;           // already logged that it does not allow remote control
+        Clock::time_point holdUntil{}; // its owner is using it: do not take control before this time
+        bool holdLogged = false;       // already logged that we are waiting for it
     };
     struct Crossing { int peer = -1; int x = 0, y = 0; };
     struct Out { int peer = 0; InputEvent ev; std::string raw; bool isRaw = false; };
@@ -94,6 +99,7 @@ struct InputEngine::Impl {
     int vx = 0, vy = 0;                 // Forwarding: where the cursor is on the controlled peer (its desktop coords)
     int physAcc = 0;                    // Controlled: motion of the local (real) mouse in the current window
     Clock::time_point physStart{};
+    Clock::time_point ownerLast{};      // the last time the REAL mouse / keyboard of this PC was used
     int exitX = 0, exitY = 0;           // Forwarding: where our cursor goes on a forced stop
     std::set<int> keysDown, btnsDown;   // Controlled: what we injected and must release
     Clock::time_point lastSwitch{};
@@ -170,6 +176,7 @@ struct InputEngine::Impl {
     bool FindCrossingWorld(int wx, int wy, int dx, int dy, int onlyPeer, int excludePeer,
                            bool forControl, Crossing& out) const
     {
+        const auto now = Clock::now();
         int bestGap = INT_MAX;
         auto consider = [&](int pid, int rx, int ry, int rw, int rh, int toX, int toY) {
             int gap, ex, ey;
@@ -205,6 +212,7 @@ struct InputEngine::Impl {
             const Peer& P = kv.second;
             if (!P.placed || (forControl && !P.accepts) || (onlyPeer >= 0 && kv.first != onlyPeer) ||
                 kv.first == excludePeer) continue;
+            if (forControl && now < P.holdUntil) continue;      // its owner is using it right now
             const int pox = (int)std::lround(P.ox), poy = (int)std::lround(P.oy);
             for (const auto& m : P.mons)
                 consider(kv.first, pox + m.x - P.bx, poy + m.y - P.by, m.w, m.h, P.bx - pox, P.by - poy);
@@ -296,7 +304,15 @@ struct InputEngine::Impl {
             Crossing c;
             if (!FindCrossing(ex, ey, d[0], d[1], -1, false, c)) continue;
             auto it = peers.find(c.peer);
-            if (it == peers.end() || it->second.accepts || it->second.warned) continue;
+            if (it == peers.end()) continue;
+            if (it->second.accepts) {
+                if (now < it->second.holdUntil && !it->second.holdLogged) {
+                    it->second.holdLogged = true;
+                    log("The owner of the PC at this edge is using it - waiting a few seconds before taking control");
+                }
+                continue;
+            }
+            if (it->second.warned) continue;
             it->second.warned = true;
             log("The PC at this edge does not allow remote control (turn on \"Allow remote control\" for this PC there)");
             return;
@@ -389,21 +405,25 @@ struct InputEngine::Impl {
         Notify();
     }
 
-    // The user of THIS PC touched its own mouse while a peer controls it: they win.
+    // The user of THIS PC touched its own mouse or keyboard. They always win: a peer that is controlling
+    // this PC loses control at once (TAKE), and nobody can take it again until kOwnerHold has passed
+    // without the owner touching anything (see ENTER in HandleMessage).
     void OnPhysicalInput(int weight)
     {
         std::lock_guard<std::mutex> lk(mu);
-        if (!started || mode != Mode::Controlled) { physAcc = 0; return; }
+        if (!started || mode == Mode::Forwarding) { physAcc = 0; return; }   // forwarding: the owner is at the other PC
         const auto now = Clock::now();
-        if (now - lastSwitch < std::chrono::milliseconds(350)) return;     // let the hand-over settle
+        if (mode == Mode::Controlled && now - lastSwitch < std::chrono::milliseconds(350)) return;   // let the hand-over settle
         if (physAcc == 0 || now - physStart > std::chrono::milliseconds(400)) { physStart = now; physAcc = 0; }
         physAcc += weight;
         if (physAcc < 40) return;                                          // ignore bumps and jitter
         physAcc = 0;
+        ownerLast = now;
+        if (mode != Mode::Controlled) return;
 
         ReleaseInjectedLocked();
         PushRaw(peerId, "TAKE");
-        log("Local mouse moved - took control back from the other PC");
+        log("Local mouse/keyboard used - took control back from the other PC");
         mode = Mode::Local;
         lastSwitch = now;
         peerId = -1;
@@ -621,6 +641,12 @@ bool InputEngine::HandleMessage(int id, const std::string& line)
         // keyboard and mouse, and nothing would happen here.
         const bool ok = d_->started && d_->be && d_->be->CanInject() && it != d_->peers.end() &&
                         it->second.placed && it->second.allowed && d_->mode == Mode::Local;
+        if (ok && d_->ownerLast != Clock::time_point{} && Clock::now() - d_->ownerLast < kOwnerHold) {
+            // The owner is using this PC: not a refusal, just "later". TAKE makes the controller give the
+            // keyboard/mouse back and wait; it will try again by itself when the owner has been idle.
+            d_->PushRaw(id, "TAKE");
+            return true;
+        }
         if (!ok) {
             d_->PushRaw(id, "DENY");
             return true;
@@ -643,10 +669,12 @@ bool InputEngine::HandleMessage(int id, const std::string& line)
         return true;
     }
 
-    if (line == "TAKE") {      // the controlled PC's user grabbed their mouse: back to this PC
+    if (line == "TAKE") {      // the controlled PC's owner used their mouse/keyboard: back to this PC, then wait
         std::lock_guard<std::mutex> lk(d_->mu);
+        auto it = d_->peers.find(id);
+        if (it != d_->peers.end()) { it->second.holdUntil = Clock::now() + kOwnerHold; it->second.holdLogged = false; }
         if (d_->mode == Mode::Forwarding && d_->peerId == id) {
-            d_->log("The other PC's user took control back");
+            d_->log("The owner of the other PC is using it - control returned, waiting a few seconds");
             d_->StopForwardingLocked(false, -1, -1);
         }
         return true;

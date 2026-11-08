@@ -271,6 +271,7 @@ void ClipShare::SendTo(int peer, const std::string& peerName)
     o->xfer = nextXfer_++;
     o->items = std::move(items);
     o->total = total;
+    o->sig = sig;
     {
         std::lock_guard<std::mutex> lk(mtx_);
         out_[peer] = o;
@@ -280,10 +281,21 @@ void ClipShare::SendTo(int peer, const std::string& peerName)
 
 void ClipShare::RunOut(std::shared_ptr<Out> o)
 {
+    // A transfer that did not complete (refused, no answer, error, connection lost) must not be remembered as
+    // "the peer already has this", otherwise the same clipboard would never be offered again.
     struct Done {
+        ClipShare* self;
         std::shared_ptr<Out> o;
-        ~Done() { o->done = true; }
-    } done{o};
+        ~Done()
+        {
+            if (!o->ok) {
+                std::lock_guard<std::mutex> lk(self->mtx_);
+                auto s = self->sentSig_.find(o->peer);
+                if (s != self->sentSig_.end() && s->second == o->sig) self->sentSig_.erase(s);
+            }
+            o->done = true;
+        }
+    } done{this, o};
 
     const std::string x = std::to_string(o->xfer);
     auto stopped = [&] {
@@ -352,6 +364,7 @@ void ClipShare::RunOut(std::shared_ptr<Out> o)
         Send(o->peer, "CLIPE " + x + " " + std::to_string(idx));
     }
     Send(o->peer, "CLIPF " + x);
+    o->ok = true;
 
     std::string what;
     if (o->items.size() == 1 && !o->items[0].file) what = "text";
@@ -436,7 +449,11 @@ void ClipShare::OnOffer(int peer, const std::string& peerName, bool mayWrite, st
     AbortIn(peer, false);                               // a new offer replaces an unfinished one
     const std::string x = std::to_string(xfer);
     if (!is || nItems == 0 || nItems > kMaxItems) { Send(peer, "CLIPN " + x + " ERROR"); return; }
-    if (!mayWrite) { Send(peer, "CLIPN " + x + " DENIED"); return; }
+    if (!mayWrite) {
+        Send(peer, "CLIPN " + x + " DENIED");
+        Log("Clipboard from " + peerName + " refused: turn on \"Share my clipboard\" for that PC here (or allow it to control this PC)");
+        return;
+    }
     const std::uint64_t limit = limit_.load();
     if (total > limit) {
         Send(peer, "CLIPN " + x + " LIMIT " + std::to_string(limit));

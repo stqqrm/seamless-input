@@ -14,7 +14,8 @@
 //   Forwarding   local input is swallowed and sent to one peer (ENTER/M/B/W/K).
 //   Controlled   a peer drives this PC. When its cursor leaves through the edge
 //                that borders the controller, control goes back (RETURN); when this
-//                PC's own mouse is moved, control goes back too (TAKE).
+//                PC's own mouse is moved or keyboard used, control goes back too (TAKE) and stays with the
+//                owner until they have been idle for a few seconds.
 //
 // With several PCs the controller follows the controlled cursor in its own layout and
 // hops straight to a third PC when the cursor runs off towards it (RELEASE + ENTER).
@@ -27,7 +28,9 @@
 //   K code down    controller -> peer   key (Linux evdev code)
 //   RETURN x y     peer -> controller   cursor left the peer, put yours at x,y
 //   RELEASE        controller -> peer   stop controlling (also sent when control hops to a third PC)
-//   TAKE           peer -> controller   the peer's user moved their own mouse: control is theirs again
+//   TAKE           peer -> controller   the peer's owner used their own mouse/keyboard: control is theirs again.
+//                                       Also the answer to an ENTER that arrives while the owner is active.
+//                                       The controller waits a few seconds before it tries again (owner priority).
 //   DENY           peer -> controller   refused / revoked
 //   CTRL 0|1       peer -> controller   "you may (not) control me" (sent whenever that changes; handled by
 //                                       Core, which calls SetPeerAccepts). The controller never takes over

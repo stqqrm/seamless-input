@@ -552,6 +552,11 @@ void Core::OnPeerReady(int id, std::uint32_t inst, const std::string& key, const
     Log("Connection established with " + name + " (" + addr + "), key " + Identity::Fingerprint(key) + " verified");
     audio_->AddPeer(inst, addr);
     audio_->SetPeerKeys(inst, audioKeys.tx, audioKeys.rx);      // no keys, no audio in either direction
+    if (!audio_->VirtualMicActive()) {      // microphones of other PCs come out as an input device of this PC
+        std::string info;
+        if (audio_->EnableVirtualMic(&info)) Log("Microphones shared by other PCs appear as the input device \"" + info + "\"");
+        else Log("Microphone forwarding is not available: " + info);
+    }
     net_->Send(id, ScreensLine());      // tell the peer about our monitors
     OnSetChanged();                     // a new set of PCs: switch to its config
     // The layout entry appears once the peer's SCREENS line arrives.

@@ -1009,6 +1009,11 @@ private:
     bool on_ = false, hover_ = false, focus_ = false;
 };
 
+// Volume controls: the master bar in the toolbar and the per-device bars use the same sizes.
+constexpr int kVolSpeakerSize = 34;
+constexpr int kVolSliderWidth = 170;
+constexpr int kVolPctWidth    = 44;
+
 // Horizontal slider: thin track, accent fill, round thumb. Sends wxEVT_SLIDER (GetInt()).
 class FlatSlider : public wxControl {
 public:
@@ -1689,7 +1694,7 @@ public:
     std::function<void(int)> onClosed;                      // chosen item index, or -1
     std::function<void(int)> onSwitch;                      // Left / Right arrow: -1 or +1
 
-    MenuPopup(wxWindow* parent, const Theme& t, std::vector<MenuItemDef> items)
+    MenuPopup(wxWindow* parent, const Theme& t, std::vector<MenuItemDef> items, int minWidth = -1)
         : wxPopupTransientWindow(parent, wxBORDER_NONE), t_(t), items_(std::move(items))
     {
         SetBackgroundStyle(wxBG_STYLE_PAINT);
@@ -1715,7 +1720,7 @@ public:
                 textW = std::max(textW, w);
             }
         }
-        const int width = std::max(FromDIP(210), 2 + 2 * pad_ + checkW_ + textW + side_);
+        const int width = std::max(minWidth >= 0 ? minWidth : FromDIP(210), 2 + 2 * pad_ + checkW_ + textW + side_);
         const int height = y + pad_ + 1;
         SetClientSize(width, height);
 
@@ -1862,6 +1867,131 @@ private:
     int pad_ = 4, side_ = 12, checkW_ = 26;
     int hover_ = -1, chosen_ = -1;
     bool closed_ = false;
+};
+
+// Themed drop-down (replaces wxChoice, which cannot be themed). Looks like an InputBox with a chevron;
+// the list is the same MenuPopup the menu bar uses. Fires onChange(index) when the user picks an entry.
+class DropDown : public wxControl {
+public:
+    std::function<void(int)> onChange;
+
+    DropDown(wxWindow* parent, const Theme& t, std::vector<wxString> items, int sel = 0)
+        : wxControl(parent, wxID_ANY, wxDefaultPosition, wxDefaultSize, wxBORDER_NONE | wxWANTS_CHARS),
+          t_(t), items_(std::move(items)), sel_(sel)
+    {
+        SetBackgroundStyle(wxBG_STYLE_PAINT);
+        SetCursor(wxCursor(wxCURSOR_HAND));
+        Bind(wxEVT_PAINT, &DropDown::OnPaint, this);
+        Bind(wxEVT_ENTER_WINDOW, [this](wxMouseEvent&) { hover_ = true; Refresh(); });
+        Bind(wxEVT_LEAVE_WINDOW, [this](wxMouseEvent&) { hover_ = false; Refresh(); });
+        Bind(wxEVT_LEFT_DOWN, [this](wxMouseEvent&) {
+            if (!IsEnabled()) return;
+            SetFocus();
+            // the click that dismissed the list also lands here: do not reopen it straight away
+            const auto since = std::chrono::steady_clock::now() - closedAt_;
+            if (since < std::chrono::milliseconds(250)) return;
+            Open();
+        });
+        Bind(wxEVT_SET_FOCUS,  [this](wxFocusEvent& e) { focus_ = true;  Refresh(); e.Skip(); });
+        Bind(wxEVT_KILL_FOCUS, [this](wxFocusEvent& e) { focus_ = false; Refresh(); e.Skip(); });
+        Bind(wxEVT_KEY_DOWN, [this](wxKeyEvent& e) {
+            switch (e.GetKeyCode()) {
+                case WXK_RETURN: case WXK_NUMPAD_ENTER: case WXK_SPACE: case WXK_F4: Open(); break;
+                case WXK_UP:   Pick(sel_ - 1); break;
+                case WXK_DOWN: Pick(sel_ + 1); break;
+                default: e.Skip(); break;
+            }
+        });
+    }
+
+    bool AcceptsFocus() const override { return IsEnabled(); }
+    bool Enable(bool on = true) override { const bool r = wxControl::Enable(on); Refresh(); return r; }
+
+    int GetSelection() const { return sel_; }
+    void SetSelection(int i)
+    {
+        if (i < 0 || i >= (int)items_.size() || i == sel_) return;
+        sel_ = i;
+        Refresh();
+    }
+
+protected:
+    wxSize DoGetBestSize() const override
+    {
+        int w = 0;
+        for (const auto& it : items_) w = std::max(w, GetTextExtent(it).x);
+        return wxSize(w + FromDIP(14) + FromDIP(34), GetCharHeight() + FromDIP(22));
+    }
+
+private:
+    void Pick(int i)
+    {
+        if (i < 0 || i >= (int)items_.size() || i == sel_) return;
+        sel_ = i;
+        Refresh();
+        if (onChange) onChange(sel_);
+    }
+
+    void Open()
+    {
+        if (popup_ || items_.empty()) return;
+        std::vector<MenuItemDef> defs;
+        for (size_t i = 0; i < items_.size(); ++i) {
+            MenuItemDef d;
+            d.id = (int)i;
+            d.label = items_[i];
+            d.check = true;
+            d.checked = (int)i == sel_;
+            defs.push_back(d);
+        }
+        auto* p = new MenuPopup(this, t_, defs, GetSize().x);
+        popup_ = p;
+        open_ = true;
+        p->onClosed = [this, p](int chosen) {
+            if (p == popup_) popup_ = nullptr;
+            open_ = false;
+            closedAt_ = std::chrono::steady_clock::now();
+            Refresh();
+            CallAfter([p] { p->Destroy(); });
+            if (chosen >= 0) CallAfter([this, chosen] { Pick(chosen); });
+        };
+        p->Position(ClientToScreen(wxPoint(0, GetSize().y + 2)), wxSize(0, 0));
+        p->Popup(p->FocusTarget());
+        Refresh();
+    }
+
+    void OnPaint(wxPaintEvent&)
+    {
+        wxAutoBufferedPaintDC pdc(this);
+        pdc.SetBackground(wxBrush(GetBackgroundColour()));
+        pdc.Clear();
+        wxGCDC dc(pdc);
+        const wxSize s = GetClientSize();
+        wxColour fill = t_.page;
+        if (hover_ && IsEnabled()) fill = MixColour(fill, t_.text, 6);
+        dc.SetPen(wxPen(focus_ || open_ ? t_.accent : t_.border, 1));
+        dc.SetBrush(wxBrush(fill));
+        dc.DrawRoundedRectangle(0, 0, s.x, s.y, 8);
+
+        dc.SetFont(GetFont());
+        dc.SetTextForeground(IsEnabled() ? t_.text : t_.sub);
+        const wxString label = (sel_ >= 0 && sel_ < (int)items_.size()) ? items_[(size_t)sel_] : wxString();
+        const wxSize te = dc.GetTextExtent(label);
+        dc.DrawText(label, FromDIP(12), (s.y - te.y) / 2);
+
+        // chevron
+        const int cx = s.x - FromDIP(17), cy = s.y / 2, a = FromDIP(4);
+        const wxPoint pts[3] = { wxPoint(cx - a, cy - a / 2), wxPoint(cx, cy + a / 2 + 1), wxPoint(cx + a, cy - a / 2) };
+        dc.SetPen(wxPen(IsEnabled() ? t_.sub : t_.border, 2));
+        dc.DrawLines(3, pts);
+    }
+
+    const Theme& t_;                      // the frame's theme_: assigning to it re-colours the widget
+    std::vector<wxString> items_;
+    int sel_ = 0;
+    bool hover_ = false, focus_ = false, open_ = false;
+    MenuPopup* popup_ = nullptr;
+    std::chrono::steady_clock::time_point closedAt_{};
 };
 
 // The strip with the menu titles (File, Service, ...). Fires onCommand(id, checked) for a chosen item.
@@ -2110,12 +2240,13 @@ public:
         root->Add(canvas_, 2, wxEXPAND | wxALL, 10);
 
         // ---- lower part: tabs
-        tabs_ = new TabBar(this, theme_, {"Devices", "Network"});
+        tabs_ = new TabBar(this, theme_, {"Devices", "Network", "Settings"});
         root->Add(tabs_, 0, wxEXPAND | wxLEFT | wxRIGHT, 10);
         pages_ = new wxSimplebook(this, wxID_ANY);
         pages_->SetBackgroundColour(theme_.page);
         pages_->AddPage(BuildDevicesPage(pages_), "Devices", true);
         pages_->AddPage(BuildNetworkPage(pages_), "Network");
+        pages_->AddPage(BuildSettingsPage(pages_), "Settings");
         tabs_->onSelect = [this](int i) {
             pages_->ChangeSelection((size_t)i);
             if (wxWindow* pg = pages_->GetCurrentPage()) pg->Layout();
@@ -2134,7 +2265,7 @@ public:
         groupCtl_->Bind(wxEVT_TEXT_ENTER, [this](wxCommandEvent&) { ApplyGroupPassword(); });
         clipBtn_->Bind(wxEVT_BUTTON, [this](wxCommandEvent&) { ApplyClipLimit(); });
         clipLimitCtl_->Bind(wxEVT_TEXT_ENTER, [this](wxCommandEvent&) { ApplyClipLimit(); });
-        clipUnit_->Bind(wxEVT_CHOICE, [this](wxCommandEvent&) { ApplyClipLimit(); });
+        clipUnit_->onChange = [this](int) { ApplyClipLimit(); };
         ShowClipLimit(clipLimit_);
 
         masterMute_->onToggle = [this](bool) { SendMaster(); };
@@ -2602,7 +2733,7 @@ private:
     }
 
     // ---------------------------------------------------------------- pages
-    // Network tab: clients + other hosts on the left; group, manual connect and activity log on the right.
+    // Network tab: clients + other hosts on the left; manual connect and activity log on the right.
     wxWindow* BuildNetworkPage(wxWindow* parent)
     {
         auto* p = new wxPanel(parent);
@@ -2634,60 +2765,8 @@ private:
         cliSizer_->Add(othEmpty_, 0, wxALIGN_CENTER_HORIZONTAL | wxTOP, 10);
         left->Add(cliScroll_, 1, wxEXPAND);
 
-        // ================= right: group, connect, activity
+        // ================= right: connect, activity
         auto* right = new wxBoxSizer(wxVERTICAL);
-
-        // --- group
-        auto* groupCard = new CardPanel(p, theme_, false);
-        {
-            auto* gv = new wxBoxSizer(wxVERTICAL);
-            gv->Add(MakeHeader(groupCard, "Group"), 0, wxBOTTOM, 2);
-            gv->Add(MakeLabel(groupCard, "PCs with the same password connect automatically. Leave empty for no password.", true), 0, wxBOTTOM, 8);
-            auto* gr = new wxBoxSizer(wxHORIZONTAL);
-            auto* groupBox = new InputBox(groupCard, theme_, wxTE_PASSWORD | wxTE_PROCESS_ENTER,
-                                          wxString::FromUTF8(groupPwd_), "password");
-            groupCtl_ = groupBox->ctl;
-            groupBtn_ = new FlatButton(groupCard, theme_, "Apply", true);
-            gr->Add(groupBox, 1, wxALIGN_CENTER_VERTICAL | wxRIGHT, 8);
-            gr->Add(groupBtn_, 0, wxALIGN_CENTER_VERTICAL);
-            gv->Add(gr, 0, wxEXPAND);
-            groupLbl_ = MakeLabel(groupCard, "", true);
-            gv->Add(groupLbl_, 0, wxTOP, 8);
-            auto* go = new wxBoxSizer(wxVERTICAL);
-            go->Add(gv, 1, wxEXPAND | wxALL, 14);
-            groupCard->SetSizer(go);
-            ApplyBackground(groupCard, theme_.card);
-        }
-        right->Add(groupCard, 0, wxEXPAND | wxBOTTOM, 8);
-
-        // --- clipboard transfer limit
-        auto* clipCard = new CardPanel(p, theme_, false);
-        {
-            auto* cv = new wxBoxSizer(wxVERTICAL);
-            cv->Add(MakeHeader(clipCard, "Clipboard"), 0, wxBOTTOM, 2);
-            cv->Add(MakeLabel(clipCard, "Largest text or set of files that is copied to another PC. Bigger clipboards are neither sent nor accepted.", true), 0, wxBOTTOM, 8);
-            auto* cr = new wxBoxSizer(wxHORIZONTAL);
-            auto* clipBox = new InputBox(clipCard, theme_, wxTE_PROCESS_ENTER, "1", "size");
-            clipLimitCtl_ = clipBox->ctl;
-            clipBox->SetMinSize(wxSize(110, -1));
-            clipUnit_ = new wxChoice(clipCard, wxID_ANY);
-            clipUnit_->Append("KiB");
-            clipUnit_->Append("MiB");
-            clipUnit_->Append("GiB");
-            clipUnit_->SetSelection(2);
-            clipBtn_ = new FlatButton(clipCard, theme_, "Apply", true);
-            cr->Add(clipBox, 1, wxALIGN_CENTER_VERTICAL | wxRIGHT, 8);
-            cr->Add(clipUnit_, 0, wxALIGN_CENTER_VERTICAL | wxRIGHT, 8);
-            cr->Add(clipBtn_, 0, wxALIGN_CENTER_VERTICAL);
-            cv->Add(cr, 0, wxEXPAND);
-            clipLbl_ = MakeLabel(clipCard, "", true);
-            cv->Add(clipLbl_, 0, wxTOP, 8);
-            auto* co = new wxBoxSizer(wxVERTICAL);
-            co->Add(cv, 1, wxEXPAND | wxALL, 14);
-            clipCard->SetSizer(co);
-            ApplyBackground(clipCard, theme_.card);
-        }
-        right->Add(clipCard, 0, wxEXPAND | wxBOTTOM, 8);
 
         // --- connect by address
         auto* connCard = new CardPanel(p, theme_, false);
@@ -2738,6 +2817,68 @@ private:
         return p;
     }
 
+    // Settings tab: group password and clipboard transfer limit.
+    wxWindow* BuildSettingsPage(wxWindow* parent)
+    {
+        auto* p = new wxPanel(parent);
+        p->SetBackgroundColour(theme_.page);
+        auto* root = new wxBoxSizer(wxHORIZONTAL);
+        auto* col = new wxBoxSizer(wxVERTICAL);
+
+        // --- group
+        auto* groupCard = new CardPanel(p, theme_, false);
+        {
+            auto* gv = new wxBoxSizer(wxVERTICAL);
+            gv->Add(MakeHeader(groupCard, "Group"), 0, wxBOTTOM, 2);
+            gv->Add(MakeLabel(groupCard, "PCs with the same password connect automatically. Leave empty for no password.", true), 0, wxBOTTOM, 8);
+            auto* gr = new wxBoxSizer(wxHORIZONTAL);
+            auto* groupBox = new InputBox(groupCard, theme_, wxTE_PASSWORD | wxTE_PROCESS_ENTER,
+                                          wxString::FromUTF8(groupPwd_), "password");
+            groupCtl_ = groupBox->ctl;
+            groupBtn_ = new FlatButton(groupCard, theme_, "Apply", true);
+            gr->Add(groupBox, 1, wxALIGN_CENTER_VERTICAL | wxRIGHT, 8);
+            gr->Add(groupBtn_, 0, wxALIGN_CENTER_VERTICAL);
+            gv->Add(gr, 0, wxEXPAND);
+            groupLbl_ = MakeLabel(groupCard, "", true);
+            gv->Add(groupLbl_, 0, wxTOP, 8);
+            auto* go = new wxBoxSizer(wxVERTICAL);
+            go->Add(gv, 1, wxEXPAND | wxALL, 14);
+            groupCard->SetSizer(go);
+            ApplyBackground(groupCard, theme_.card);
+        }
+        col->Add(groupCard, 0, wxEXPAND | wxBOTTOM, 8);
+
+        // --- clipboard transfer limit
+        auto* clipCard = new CardPanel(p, theme_, false);
+        {
+            auto* cv = new wxBoxSizer(wxVERTICAL);
+            cv->Add(MakeHeader(clipCard, "Clipboard"), 0, wxBOTTOM, 2);
+            cv->Add(MakeLabel(clipCard, "Largest text or set of files that is copied to another PC. Bigger clipboards are neither sent nor accepted.", true), 0, wxBOTTOM, 8);
+            auto* cr = new wxBoxSizer(wxHORIZONTAL);
+            auto* clipBox = new InputBox(clipCard, theme_, wxTE_PROCESS_ENTER, "1", "size");
+            clipLimitCtl_ = clipBox->ctl;
+            clipBox->SetMinSize(wxSize(110, -1));
+            clipUnit_ = new DropDown(clipCard, theme_, {"KiB", "MiB", "GiB"}, 2);
+            clipBtn_ = new FlatButton(clipCard, theme_, "Apply", true);
+            cr->Add(clipBox, 1, wxALIGN_CENTER_VERTICAL | wxRIGHT, 8);
+            cr->Add(clipUnit_, 0, wxALIGN_CENTER_VERTICAL | wxRIGHT, 8);
+            cr->Add(clipBtn_, 0, wxALIGN_CENTER_VERTICAL);
+            cv->Add(cr, 0, wxEXPAND);
+            clipLbl_ = MakeLabel(clipCard, "", true);
+            cv->Add(clipLbl_, 0, wxTOP, 8);
+            auto* co = new wxBoxSizer(wxVERTICAL);
+            co->Add(cv, 1, wxEXPAND | wxALL, 14);
+            clipCard->SetSizer(co);
+            ApplyBackground(clipCard, theme_.card);
+        }
+        col->Add(clipCard, 0, wxEXPAND | wxBOTTOM, 8);
+
+        root->Add(col, 1, wxEXPAND | wxALL, 10);
+        root->AddStretchSpacer(1);
+        p->SetSizer(root);
+        return p;
+    }
+
     // "Title ............ count"
     wxSizer* MakeSection(wxWindow* parent, const wxString& title, wxStaticText*& count)
     {
@@ -2776,17 +2917,17 @@ private:
         auto* bar = new CardPanel(p, theme_, false);
         auto* bv = new wxBoxSizer(wxVERTICAL);
 
-        masterMute_ = new SpeakerButton(bar, theme_, 32);
-        volSlider_ = new FlatSlider(bar, theme_, 0, 100, 100, 150);
+        masterMute_ = new SpeakerButton(bar, theme_, kVolSpeakerSize);
+        volSlider_ = new FlatSlider(bar, theme_, 0, 100, 100, kVolSliderWidth);
         masterPct_ = MakeLabel(bar, "100%", true);
-        masterPct_->SetMinSize(wxSize(44, -1));
+        masterPct_->SetMinSize(wxSize(kVolPctWidth, -1));
 
         auto* r1 = new wxBoxSizer(wxHORIZONTAL);
         r1->Add(MakeLabel(bar, "Scroll Lock returns control to this PC", true), 0, wxALIGN_CENTER_VERTICAL);
         r1->AddStretchSpacer();
         r1->Add(MakeLabel(bar, "Master output", true), 0, wxALIGN_CENTER_VERTICAL | wxRIGHT, 8);
-        r1->Add(masterMute_, 0, wxALIGN_CENTER_VERTICAL | wxRIGHT, 4);
-        r1->Add(volSlider_, 0, wxALIGN_CENTER_VERTICAL | wxRIGHT, 4);
+        r1->Add(masterMute_, 0, wxALIGN_CENTER_VERTICAL | wxRIGHT, 6);
+        r1->Add(volSlider_, 0, wxALIGN_CENTER_VERTICAL | wxRIGHT, 6);
         r1->Add(masterPct_, 0, wxALIGN_CENTER_VERTICAL);
         bv->Add(r1, 0, wxEXPAND | wxALL, 14);
         bar->SetSizer(bv);
@@ -2850,7 +2991,7 @@ private:
             r.share->SetToolTip("Sharing system audio is not supported on this platform");
         }
         r.mic = new FlatCheck(c, theme_, "Share my microphone");
-        r.mic->SetToolTip("Send this PC's microphone to this device only");
+        r.mic->SetToolTip("Forward this PC's microphone to that device as a virtual microphone (it shows up as an input device there)");
         r.clip = new FlatCheck(c, theme_, "Share my clipboard");
         r.clip->SetToolTip("Send this PC's clipboard (text, or one or more files) to this device when the cursor moves over to it.\n"
                            "It is accepted there if this device may control that PC or shares its clipboard back.\n"
@@ -2864,22 +3005,23 @@ private:
         checks->Add(r.allow, 0);
 
         // audio from this device
-        r.mute = new SpeakerButton(c, theme_, 34);
-        r.vol = new FlatSlider(c, theme_, 0, 100, 100, 170);
+        r.mute = new SpeakerButton(c, theme_, kVolSpeakerSize);
+        r.vol = new FlatSlider(c, theme_, 0, 100, 100, kVolSliderWidth);
         r.pct = MakeLabel(c, "100%", true);
-        r.pct->SetMinSize(wxSize(44, -1));
+        r.pct->SetMinSize(wxSize(kVolPctWidth, -1));
         r.level = new LevelBar(c, theme_, wxSize(-1, 8));
         r.audioState = MakeLabel(c, "", true);
         auto* top = new wxBoxSizer(wxHORIZONTAL);
+        top->AddStretchSpacer();        // keep the row against the right edge, like the master output
         top->Add(r.mute, 0, wxALIGN_CENTER_VERTICAL | wxRIGHT, 6);
-        top->Add(r.vol, 1, wxALIGN_CENTER_VERTICAL | wxRIGHT, 6);
+        top->Add(r.vol, 0, wxALIGN_CENTER_VERTICAL | wxRIGHT, 6);
         top->Add(r.pct, 0, wxALIGN_CENTER_VERTICAL);
         auto* audio = new wxBoxSizer(wxVERTICAL);
         audio->Add(MakeLabel(c, "Audio from this device", true), 0, wxBOTTOM, 2);
         audio->Add(top, 0, wxEXPAND);
         audio->Add(r.level, 0, wxEXPAND | wxTOP, 4);
         audio->Add(r.audioState, 0, wxTOP, 3);
-        audio->SetMinSize(wxSize(300, -1));
+        audio->SetMinSize(wxSize(kVolSpeakerSize + 6 + kVolSliderWidth + 6 + kVolPctWidth, -1));   // exactly the width of the master output row
 
         auto* h = new wxBoxSizer(wxHORIZONTAL);
         h->Add(info, 1, wxALIGN_CENTER_VERTICAL | wxRIGHT, 16);
@@ -3016,7 +3158,7 @@ private:
                      wxOK | wxICON_WARNING, this);
     }
 
-    // ------------------------------------------------------------ clipboard limit (Network tab)
+    // ------------------------------------------------------------ clipboard limit (Settings tab)
     static wxString WithSeparators(unsigned long long v)
     {
         std::string s = std::to_string(v), o;
@@ -3608,7 +3750,7 @@ private:
     std::map<std::string, OthRow> othRows_;
     wxTextCtrl* groupCtl_ = nullptr;
     wxTextCtrl* clipLimitCtl_ = nullptr;
-    wxChoice* clipUnit_ = nullptr;
+    DropDown* clipUnit_ = nullptr;
     FlatButton* clipBtn_ = nullptr;
     wxStaticText* clipLbl_ = nullptr;
     bool inputChecked_ = false;                     // the start-up check for input problems was done
