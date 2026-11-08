@@ -6,7 +6,9 @@
 #include <fcntl.h>
 #include <linux/input.h>
 #include <linux/uinput.h>
+#include <grp.h>
 #include <poll.h>
+#include <pwd.h>
 #include <sys/eventfd.h>
 #include <sys/inotify.h>
 #include <sys/ioctl.h>
@@ -22,6 +24,7 @@
 #include <mutex>
 #include <set>
 #include <thread>
+#include <vector>
 
 #ifndef REL_WHEEL_HI_RES
 #define REL_WHEEL_HI_RES 0x0b
@@ -83,6 +86,24 @@ void Put(int fd, int type, int code, int value)
     if (write(fd, &e, sizeof e) < 0) { /* device gone: nothing sensible to do */ }
 }
 
+// Membership of the 'input' group alone proves nothing: the session must have it (log out/in after
+// being added), the uinput module must be loaded and /dev/uinput must be writable for the group.
+// This only explains what is missing; the real test is opening /dev/uinput.
+std::string InputGroupHint()
+{
+    const group* g = getgrnam("input");
+    if (!g) return "the 'input' group does not exist on this system";
+    bool inSession = getegid() == g->gr_gid;
+    std::vector<gid_t> gs(256);
+    const int n = getgroups((int)gs.size(), gs.data());
+    for (int i = 0; i < n; ++i) if (gs[i] == g->gr_gid) inSession = true;
+    if (inSession) return "this session is in the 'input' group";
+    const passwd* pw = getpwuid(getuid());
+    if (pw) for (char** m = g->gr_mem; m && *m; ++m) if (std::strcmp(*m, pw->pw_name) == 0)
+        return "you were added to the 'input' group, but this login session does not have it yet: log out and back in";
+    return "you are not in the 'input' group";
+}
+
 int MakeUinput(bool keyboard, const char* name)
 {
     const int fd = open("/dev/uinput", O_WRONLY | O_NONBLOCK | O_CLOEXEC);
@@ -122,6 +143,7 @@ int MakeUinput(bool keyboard, const char* name)
 class EvdevBackend : public InputBackend {
 public:
     const char* Name() const override { return "evdev + uinput (Wayland / any session)"; }
+    bool CanInject() const override { return uKbd_ >= 0 && uPtr_ >= 0; }
 
     void SetGeometry(const std::vector<InputRect>& m) override
     {
@@ -144,6 +166,7 @@ public:
         if (inotify_ >= 0) inotify_add_watch(inotify_, "/dev/input", IN_CREATE | IN_DELETE);
 
         uKbd_ = MakeUinput(true,  "seamless-input virtual keyboard");
+        const int uErr = uKbd_ < 0 ? errno : 0;
         uPtr_ = MakeUinput(false, "seamless-input virtual mouse");
 
         ScanDevices(false);
@@ -157,8 +180,12 @@ public:
             return false;
         }
         if (uKbd_ < 0 || uPtr_ < 0) {
-            if (err) *err = "cannot open /dev/uinput (load the module and allow access, see linux-input-setup.sh): "
-                            "this PC can control others but cannot be controlled";
+            std::string why = uErr == ENOENT ? "the uinput kernel module is not loaded (sudo modprobe uinput)"
+                            : (uErr == EACCES || uErr == EPERM) ? "permission denied on /dev/uinput"
+                            : std::strerror(uErr ? uErr : EIO);
+            if (err) *err = "cannot open /dev/uinput: " + why + "; " + InputGroupHint() +
+                            ". Run linux-input-setup.sh, then log out and back in. "
+                            "This PC can control others but cannot be controlled.";
         }
 
         run_ = true;

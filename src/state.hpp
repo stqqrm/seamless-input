@@ -37,7 +37,10 @@ struct Scanned {                         // a host found by the subnet scan
 
 struct Snapshot {
     std::string host, pubKey, dataDir, identNote, backend, monsSource;
+    bool inputCanInject = true;          // false: this PC cannot be controlled (see inputNote)
+    std::string inputNote;               // why keyboard/mouse sharing is limited or unavailable ("" = fine)
     std::string group;                   // group password ("" = none)
+    std::uint64_t clipLimit = 1ull << 30; // largest clipboard (text / files) copied to another PC, in bytes
     std::vector<InputRect> mons;         // this PC's monitors
     bool masterMute = false;
     int  masterVol = 100;

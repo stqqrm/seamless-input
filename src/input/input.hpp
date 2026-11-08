@@ -60,6 +60,7 @@ public:
     bool Start(std::string* msg);                                // msg: error or warning
     void Stop();
     std::string BackendName() const;
+    bool CanInject() const;                                      // can this PC be controlled? (valid after Start())
 
     // Layout: (ox, oy) is the peer's top-left corner relative to this PC's top-left
     // corner in canvas "world" pixels (exactly what Canvas keeps).

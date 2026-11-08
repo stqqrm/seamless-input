@@ -1,8 +1,11 @@
 #include "clipboard.hpp"
 
+#include <algorithm>
+#include <cctype>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <sstream>
 #if defined(__linux__)
 #include <csignal>
 #endif
@@ -122,11 +125,19 @@ std::string ToUtf8(const wchar_t* w, size_t len)
     return s;
 }
 
+struct DropFilesHeader {                    // DROPFILES (shlobj.h) without the include
+    DWORD pFiles;
+    POINT pt;
+    BOOL fNC;
+    BOOL fWide;
+};
+
 } // namespace
 
 std::string Backend() { return "Windows clipboard"; }
+bool FilesSupported() { return true; }
 
-bool GetText(std::string& out)
+bool GetText(std::string& out, std::size_t maxBytes)
 {
     out.clear();
     if (!IsClipboardFormatAvailable(CF_UNICODETEXT)) return false;
@@ -147,7 +158,7 @@ bool GetText(std::string& out)
                 if (u8[i] == '\r' && i + 1 < u8.size() && u8[i + 1] == '\n') continue;
                 t += u8[i];
             }
-            if (!t.empty() && t.size() <= kMaxBytes) { out = std::move(t); ok = true; }
+            if (!t.empty() && t.size() <= maxBytes) { out = std::move(t); ok = true; }
         }
     }
     CloseClipboard();
@@ -182,12 +193,99 @@ bool SetText(const std::string& text)
     return ok;
 }
 
+bool GetFiles(std::vector<std::filesystem::path>& files)
+{
+    files.clear();
+    if (!IsClipboardFormatAvailable(CF_HDROP)) return false;
+    HWND owner = Owner();
+    if (!owner || !OpenRetry(owner)) return false;
+    if (HANDLE h = GetClipboardData(CF_HDROP)) {
+        // DROPFILES header followed by a double-NUL terminated list (parsed by hand: no shell32 needed)
+        const SIZE_T total = GlobalSize(h);
+        if (const char* base = static_cast<const char*>(GlobalLock(h))) {
+            if (total > sizeof(DropFilesHeader)) {
+                const auto* d = reinterpret_cast<const DropFilesHeader*>(base);
+                if (d->pFiles >= sizeof(DropFilesHeader) && d->pFiles < total) {
+                    if (d->fWide) {
+                        const wchar_t* p = reinterpret_cast<const wchar_t*>(base + d->pFiles);
+                        const wchar_t* end = reinterpret_cast<const wchar_t*>(base + total);
+                        while (p < end && *p) {
+                            const wchar_t* e = p;
+                            while (e < end && *e) ++e;
+                            files.emplace_back(std::wstring(p, e));
+                            p = e + 1;
+                        }
+                    } else {                       // ANSI list from an old program
+                        const char* p = base + d->pFiles;
+                        const char* end = base + total;
+                        while (p < end && *p) {
+                            const char* e = p;
+                            while (e < end && *e) ++e;
+                            const std::string a(p, e);
+                            const int n = MultiByteToWideChar(CP_ACP, 0, a.data(), (int)a.size(), nullptr, 0);
+                            std::wstring w((size_t)(n > 0 ? n : 0), L'\0');
+                            if (n > 0) MultiByteToWideChar(CP_ACP, 0, a.data(), (int)a.size(), &w[0], n);
+                            files.emplace_back(w);
+                            p = e + 1;
+                        }
+                    }
+                }
+            }
+            GlobalUnlock(h);
+        }
+    }
+    CloseClipboard();
+    return !files.empty();
+}
+
+bool SetFiles(const std::vector<std::filesystem::path>& files)
+{
+    if (files.empty()) return false;
+    std::wstring list;                       // path\0path\0...\0\0
+    for (const auto& f : files) {
+        list += f.wstring();
+        list += L'\0';
+    }
+    list += L'\0';
+    const SIZE_T bytes = sizeof(DropFilesHeader) + list.size() * sizeof(wchar_t);
+    HGLOBAL mem = GlobalAlloc(GMEM_MOVEABLE | GMEM_ZEROINIT, bytes);
+    if (!mem) return false;
+    if (auto* d = static_cast<DropFilesHeader*>(GlobalLock(mem))) {
+        d->pFiles = sizeof(DropFilesHeader);
+        d->fWide = TRUE;
+        std::memcpy(reinterpret_cast<char*>(d) + sizeof(DropFilesHeader), list.data(), list.size() * sizeof(wchar_t));
+        GlobalUnlock(mem);
+    } else {
+        GlobalFree(mem);
+        return false;
+    }
+    HGLOBAL effect = GlobalAlloc(GMEM_MOVEABLE, sizeof(DWORD));          // "copy", not "move"
+    if (effect) {
+        if (auto* e = static_cast<DWORD*>(GlobalLock(effect))) { *e = 1; GlobalUnlock(effect); }
+    }
+    HWND owner = Owner();
+    if (!owner || !OpenRetry(owner)) { GlobalFree(mem); if (effect) GlobalFree(effect); return false; }
+    EmptyClipboard();
+    const bool ok = SetClipboardData(CF_HDROP, mem) != nullptr;
+    if (!ok) GlobalFree(mem);
+    if (effect) {
+        if (!(ok && SetClipboardData(RegisterClipboardFormatW(L"Preferred DropEffect"), effect))) GlobalFree(effect);
+    }
+    CloseClipboard();
+    return ok;
+}
+
 #elif defined(__linux__)
 // ------------------------------------------------------------------ Linux (external tools)
 namespace {
 
 struct Tools {
-    std::string name, get, set;             // empty name: nothing available
+    std::string name;                       // empty: nothing available
+    std::string get, set;                   // text
+    bool files = false;
+    std::string list;                       // prints the offered targets / mime types, one per line
+    std::string readUri, readGnome;         // print file lists
+    std::string writeUri, writeGnome;       // read a file list from stdin and put it on the clipboard
 };
 
 bool Have(const char* tool)
@@ -207,12 +305,24 @@ const Tools& Pick()
             r.name = "wl-clipboard";
             r.get = "timeout 2 wl-paste --no-newline --type text/plain 2>/dev/null";
             r.set = "timeout 3 wl-copy 2>/dev/null";
+            r.files = true;
+            r.list = "timeout 2 wl-paste --list-types 2>/dev/null";
+            r.readUri = "timeout 5 wl-paste --no-newline --type text/uri-list 2>/dev/null";
+            r.readGnome = "timeout 5 wl-paste --no-newline --type x-special/gnome-copied-files 2>/dev/null";
+            r.writeUri = "timeout 5 wl-copy --type text/uri-list 2>/dev/null";
+            r.writeGnome = "timeout 5 wl-copy --type x-special/gnome-copied-files 2>/dev/null";
         } else if ((x || wl) && Have("xclip")) {
             r.name = "xclip";
             r.get = "timeout 2 xclip -selection clipboard -o 2>/dev/null";
             r.set = "timeout 3 xclip -selection clipboard -i 2>/dev/null";
+            r.files = true;
+            r.list = "timeout 2 xclip -selection clipboard -t TARGETS -o 2>/dev/null";
+            r.readUri = "timeout 5 xclip -selection clipboard -t text/uri-list -o 2>/dev/null";
+            r.readGnome = "timeout 5 xclip -selection clipboard -t x-special/gnome-copied-files -o 2>/dev/null";
+            r.writeUri = "timeout 5 xclip -selection clipboard -t text/uri-list -i 2>/dev/null";
+            r.writeGnome = "timeout 5 xclip -selection clipboard -t x-special/gnome-copied-files -i 2>/dev/null";
         } else if ((x || wl) && Have("xsel")) {
-            r.name = "xsel";
+            r.name = "xsel";                // text only: xsel cannot choose the clipboard target
             r.get = "timeout 2 xsel --clipboard --output 2>/dev/null";
             r.set = "timeout 3 xsel --clipboard --input 2>/dev/null";
         }
@@ -221,44 +331,148 @@ const Tools& Pick()
     return t;
 }
 
+bool RunRead(const std::string& cmd, std::size_t maxBytes, std::string& out, bool* tooBig = nullptr)
+{
+    out.clear();
+    if (tooBig) *tooBig = false;
+    FILE* p = popen(cmd.c_str(), "r");
+    if (!p) return false;
+    char buf[4096];
+    std::size_t n;
+    bool big = false;
+    while ((n = std::fread(buf, 1, sizeof buf, p)) > 0) {
+        if (out.size() + n > maxBytes) { big = true; break; }
+        out.append(buf, n);
+    }
+    const int rc = pclose(p);
+    if (tooBig) *tooBig = big;
+    if (big || rc != 0 || out.empty()) { out.clear(); return false; }
+    return true;
+}
+
+bool RunWrite(const std::string& cmd, const std::string& data)
+{
+    FILE* p = popen(cmd.c_str(), "w");
+    if (!p) return false;
+    const std::size_t w = std::fwrite(data.data(), 1, data.size(), p);
+    const int rc = pclose(p);               // the tool forks into the background to own the selection
+    return w == data.size() && rc == 0;
+}
+
+std::string PercentDecode(const std::string& s)
+{
+    std::string o;
+    for (std::size_t i = 0; i < s.size(); ++i) {
+        if (s[i] == '%' && i + 2 < s.size() + 0 && std::isxdigit((unsigned char)s[i + 1]) && std::isxdigit((unsigned char)s[i + 2])) {
+            o += (char)std::stoi(s.substr(i + 1, 2), nullptr, 16);
+            i += 2;
+        } else {
+            o += s[i];
+        }
+    }
+    return o;
+}
+
+std::string PercentEncodePath(const std::string& s)
+{
+    static const char* hex = "0123456789ABCDEF";
+    std::string o;
+    for (unsigned char c : s) {
+        if (std::isalnum(c) || c == '/' || c == '-' || c == '_' || c == '.' || c == '~') o += (char)c;
+        else { o += '%'; o += hex[c >> 4]; o += hex[c & 15]; }
+    }
+    return o;
+}
+
+// "file:///home/a/b%20c" -> /home/a/b c ; anything that is not a local file URI -> empty
+std::string UriToPath(std::string u)
+{
+    while (!u.empty() && (u.back() == '\r' || u.back() == ' ' || u.back() == '\n')) u.pop_back();
+    if (u.compare(0, 7, "file://") != 0) return {};
+    u.erase(0, 7);
+    if (!u.empty() && u[0] != '/') {          // file://host/path : only "localhost" is local
+        const auto slash = u.find('/');
+        if (slash == std::string::npos || u.substr(0, slash) != "localhost") return {};
+        u.erase(0, slash);
+    }
+    return PercentDecode(u);
+}
+
+bool GnomeStyleDesktop()
+{
+    const char* d = std::getenv("XDG_CURRENT_DESKTOP");
+    if (!d) return false;
+    std::string s(d);
+    std::transform(s.begin(), s.end(), s.begin(), [](unsigned char c) { return (char)std::toupper(c); });
+    for (const char* k : {"GNOME", "UNITY", "BUDGIE", "CINNAMON", "MATE", "XFCE", "PANTHEON", "COSMIC"})
+        if (s.find(k) != std::string::npos) return true;
+    return false;
+}
+
 } // namespace
 
 std::string Backend() { return Pick().name; }
+bool FilesSupported() { return Pick().files; }
 
-bool GetText(std::string& out)
+bool GetText(std::string& out, std::size_t maxBytes)
 {
     out.clear();
     const Tools& t = Pick();
     if (t.name.empty()) return false;
-    FILE* p = popen(t.get.c_str(), "r");
-    if (!p) return false;
-    char buf[4096];
-    std::size_t n;
-    bool tooBig = false;
-    while ((n = std::fread(buf, 1, sizeof buf, p)) > 0) {
-        if (out.size() + n > kMaxBytes) { tooBig = true; break; }
-        out.append(buf, n);
-    }
-    const int rc = pclose(p);
-    if (tooBig || rc != 0 || out.empty()) { out.clear(); return false; }
-    return true;
+    return RunRead(t.get, maxBytes, out);
 }
 
 bool SetText(const std::string& text)
 {
     const Tools& t = Pick();
     if (t.name.empty()) return false;
-    FILE* p = popen(t.set.c_str(), "w");
-    if (!p) return false;
-    const std::size_t w = std::fwrite(text.data(), 1, text.size(), p);
-    const int rc = pclose(p);               // the tool forks into the background to own the selection
-    return w == text.size() && rc == 0;
+    return RunWrite(t.set, text);
+}
+
+bool GetFiles(std::vector<std::filesystem::path>& files)
+{
+    files.clear();
+    const Tools& t = Pick();
+    if (!t.files) return false;
+    std::string types;
+    if (!RunRead(t.list, 64 * 1024, types)) return false;
+    const bool gnome = types.find("x-special/gnome-copied-files") != std::string::npos;
+    const bool uri = types.find("text/uri-list") != std::string::npos;
+    if (!gnome && !uri) return false;
+
+    std::string data;
+    if (!RunRead(gnome ? t.readGnome : t.readUri, 4 * 1024 * 1024, data)) return false;
+    std::istringstream is(data);
+    std::string line;
+    while (std::getline(is, line)) {
+        if (line.empty() || line[0] == '#' || line == "copy" || line == "cut" || line == "copy\r" || line == "cut\r") continue;
+        const std::string p = UriToPath(line);
+        if (!p.empty()) files.emplace_back(p);
+    }
+    return !files.empty();
+}
+
+bool SetFiles(const std::vector<std::filesystem::path>& files)
+{
+    const Tools& t = Pick();
+    if (!t.files || files.empty()) return false;
+    const bool gnome = GnomeStyleDesktop();
+    std::string data;
+    if (gnome) data = "copy";
+    for (const auto& f : files) {
+        const std::string uri = "file://" + PercentEncodePath(f.string());
+        data += gnome ? "\n" + uri : uri + "\r\n";
+    }
+    return RunWrite(gnome ? t.writeGnome : t.writeUri, data);
 }
 
 #else
 std::string Backend() { return {}; }
-bool GetText(std::string& out) { out.clear(); return false; }
+bool FilesSupported() { return false; }
+bool GetText(std::string& out, std::size_t) { out.clear(); return false; }
 bool SetText(const std::string&) { return false; }
+bool GetFiles(std::vector<std::filesystem::path>& f) { f.clear(); return false; }
+bool SetFiles(const std::vector<std::filesystem::path>&) { return false; }
 #endif
 
 } // namespace clipboard

@@ -20,6 +20,7 @@
 #include <boost/asio.hpp>
 
 #include "audio.hpp"
+#include "clipshare.hpp"
 #include "config.hpp"
 #include "identity.hpp"
 #include "input/input.hpp"
@@ -62,6 +63,7 @@ public:
     void CmdPeerAudio(int id, bool share, bool mic, bool mute, int vol);
     void CmdMaster(bool mute, int vol);
     void CmdControl(int id, bool allow);                    // may this PC control ours?
+    void CmdClipLimit(std::uint64_t bytes);                 // largest clipboard (text / files) that is copied to another PC
     void CmdClipboard(int id, bool share);                  // send my clipboard to this PC when the cursor moves over to it
     void CmdMonitorsHint(const std::vector<InputRect>& mons);
     void CmdClearCache();                                   // forget remembered permissions and the monitor cache
@@ -92,7 +94,6 @@ private:
 
     // clipboard sharing (Core thread)
     void OnCursorToPeer(int id);                                   // the cursor moved over to peer 'id'
-    bool OnClipLine(int id, const state::Peer& p, const std::string& line);   // CLIPD chunk; true if it was one
 
     // layout + saved configs
     void BroadcastRelative(int movedId);
@@ -145,10 +146,10 @@ private:
     int clients_ = 0;
     int ticks_ = 0, scanTick_ = 0;
 
-    struct ClipIn { long long xfer = 0; int count = 0, next = 0; std::string b64; };
-    std::map<int, ClipIn> clipIn_;                // clipboard being received, per peer
-    std::map<int, std::size_t> clipSent_;         // hash of the text the peer already has (sent or received)
-    long long clipXfer_ = 0;
+    void RefreshInputStatus(bool started, const std::string& msg);   // Core thread
+    bool canInject_ = true;                       // this PC can be controlled
+    std::string inputNote_;                       // why not / what is limited
+    std::unique_ptr<ClipShare> clip_;             // clipboard text / files shared with peers
 
     bool masterMute_ = false;
     int masterVol_ = 100;

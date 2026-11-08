@@ -1,0 +1,13 @@
+# Dracula for seamless-input. See README.txt in this folder for the format.
+name = Dracula
+dark = true
+page = #282a36
+card = #343746
+border = #44475a
+track = #565a76
+text = #f8f8f2
+sub = #9aa2c7
+accent = #bd93f9
+ok = #50fa7b
+warn = #f1fa8c
+bad = #ff5555

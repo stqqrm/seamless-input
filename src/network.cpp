@@ -67,7 +67,7 @@ public:
     Session(tcp::socket sock, int id, bool incoming, std::uint32_t myInstance,
             std::string myName, const Identity& ident, SessionEvents ev)
         : sock_(std::move(sock)), id_(id), incoming_(incoming), myInstance_(myInstance),
-          myName_(std::move(myName)), ident_(ident), ev_(std::move(ev)), buf_(16384),
+          myName_(std::move(myName)), ident_(ident), ev_(std::move(ev)), buf_(131072),
           myNonce_(Identity::RandomHex(16)), hb_(sock_.get_executor()) {}
 
     void Start()

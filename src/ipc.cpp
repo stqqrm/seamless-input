@@ -69,6 +69,8 @@ std::vector<std::string> SerializeSnapshot(const state::Snapshot& s)
     for (const auto& m : s.mons)
         v.push_back("M " + std::to_string(m.x) + " " + std::to_string(m.y) + " " + std::to_string(m.w) + " " + std::to_string(m.h));
     v.push_back("G " + Enc(s.group));
+    v.push_back("Q " + std::to_string(s.clipLimit));
+    v.push_back(std::string("X ") + b(s.inputCanInject) + " " + Enc(s.inputNote));
     v.push_back(std::string("A ") + b(s.masterMute) + " " + std::to_string(s.masterVol) + " " + b(s.sysCapturing) + " " +
                 b(s.micCapturing) + " " + b(s.scanning));
     v.push_back("I " + std::to_string(s.inputMode) + " " + std::to_string(s.inputPeer));
@@ -103,6 +105,11 @@ bool ParseSnapshotLine(const std::vector<std::string>& t, state::Snapshot& s)
         s.mons.push_back({(int)I(1), (int)I(2), (int)I(3), (int)I(4)});
     } else if (k == "G") {
         s.group = S(1);
+    } else if (k == "X") {
+        s.inputCanInject = I(1) != 0;
+        s.inputNote = S(2);
+    } else if (k == "Q") {
+        s.clipLimit = t.size() > 1 ? (std::uint64_t)std::strtoull(t[1].c_str(), nullptr, 10) : (1ull << 30);
     } else if (k == "A" && t.size() >= 6) {
         s.masterMute = I(1) != 0; s.masterVol = (int)I(2); s.sysCapturing = I(3) != 0; s.micCapturing = I(4) != 0; s.scanning = I(5) != 0;
     } else if (k == "I" && t.size() >= 3) {

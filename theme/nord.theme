@@ -1,0 +1,13 @@
+# Nord for seamless-input. See README.txt in this folder for the format.
+name = Nord
+dark = true
+page = #2e3440
+card = #3b4252
+border = #434c5e
+track = #4c566a
+text = #eceff4
+sub = #9aa5b8
+accent = #88c0d0
+ok = #a3be8c
+warn = #ebcb8b
+bad = #bf616a

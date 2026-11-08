@@ -1,0 +1,13 @@
+# Solarized Dark for seamless-input. See README.txt in this folder for the format.
+name = Solarized Dark
+dark = true
+page = #002b36
+card = #073642
+border = #0f4854
+track = #586e75
+text = #93a1a1
+sub = #839496
+accent = #268bd2
+ok = #859900
+warn = #b58900
+bad = #dc322f

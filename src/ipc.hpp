@@ -9,7 +9,8 @@
 //   L <text>            activity log line          SCAN | SELECT <ip> | GROUP <pwd>
 //   ST <...>            audio levels (4 Hz)        MOVE <id> <x> <y> | AUDIO <id> <s> <m> <mute> <vol>
 //                                                  MASTER <mute> <vol> | CONTROL <id> <0|1>
-//                                                  CLIPBOARD <id> <0|1> | CLEARCACHE | REGENKEYS
+//                                                  CLIPBOARD <id> <0|1> | CLIPLIMIT <bytes>
+//                                                  CLEARCACHE | REGENKEYS
 //                                                  STOP | PING
 // Text fields are percent-encoded (see Enc); the empty string is "~".
 #include <atomic>

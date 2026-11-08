@@ -1,0 +1,13 @@
+# Gruvbox Light for seamless-input. See README.txt in this folder for the format.
+name = Gruvbox Light
+dark = false
+page = #f2e5bc
+card = #fbf1c7
+border = #d5c4a1
+track = #bdae93
+text = #3c3836
+sub = #7c6f64
+accent = #076678
+ok = #79740e
+warn = #b57614
+bad = #9d0006

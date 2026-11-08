@@ -19,6 +19,7 @@
 #include <wx/timer.h>
 
 #include <algorithm>
+#include <cctype>
 #include <chrono>
 #include <climits>
 #include <cmath>
@@ -54,6 +55,33 @@
 // Positions are "world" pixels: the group's top-left corner relative to the
 // top-left corner of this PC's desktop.
 // ============================================================================
+// Theme data. The palettes come from theme/*.theme files (see ThemeStore below). Widgets keep a
+// REFERENCE to the frame's theme_, so assigning a new palette to it re-colours everything they draw.
+// ============================================================================
+struct Theme {
+    wxString name;
+    bool dark = false;
+    wxColour page, card, border, track, text, sub, accent, ok, warn, bad;
+};
+
+// Maps a colour of the OLD theme to the same role in the NEW one; unknown colours stay as they are.
+static wxColour RemapColour(const wxColour& c, const Theme& o, const Theme& n)
+{
+    if (!c.IsOk()) return c;
+    if (c == o.page)   return n.page;
+    if (c == o.card)   return n.card;
+    if (c == o.border) return n.border;
+    if (c == o.track)  return n.track;
+    if (c == o.text)   return n.text;
+    if (c == o.sub)    return n.sub;
+    if (c == o.accent) return n.accent;
+    if (c == o.ok)     return n.ok;
+    if (c == o.warn)   return n.warn;
+    if (c == o.bad)    return n.bad;
+    return c;
+}
+
+// ============================================================================
 class Canvas : public wxPanel {
 public:
     struct Group {
@@ -65,6 +93,8 @@ public:
     };
 
     std::function<void(int, double, double)> onPeerMoved;
+
+    void SetTheme(const Theme* t) { th_ = t; Refresh(); }      // the frame's theme_ (lives as long as the frame)
 
     explicit Canvas(wxWindow* parent)
         : wxPanel(parent, wxID_ANY, wxDefaultPosition, wxSize(420, 260))
@@ -359,9 +389,28 @@ private:
 
     void DrawGroup(wxDC& dc, const Group& g, const View& v, bool local, bool dragging)
     {
-        const wxColour fill = local ? wxColour(48, 108, 226) : wxColour(66, 54, 38);
-        const wxColour edge = local ? wxColour(132, 180, 255) : wxColour(255, 176, 72);
-        const wxColour text = local ? wxColour(246, 249, 255) : wxColour(255, 218, 160);
+        wxColour fill = local ? wxColour(48, 108, 226) : wxColour(66, 54, 38);
+        wxColour edge = local ? wxColour(132, 180, 255) : wxColour(255, 176, 72);
+        wxColour text = local ? wxColour(246, 249, 255) : wxColour(255, 218, 160);
+        if (th_) {
+            // this PC: solid accent; other PCs: a pale tint of the warning colour, dashed outline
+            auto mix = [](const wxColour& a, const wxColour& b, int pct) {
+                return wxColour((unsigned char)(a.Red() + (b.Red() - a.Red()) * pct / 100),
+                                (unsigned char)(a.Green() + (b.Green() - a.Green()) * pct / 100),
+                                (unsigned char)(a.Blue() + (b.Blue() - a.Blue()) * pct / 100));
+            };
+            const wxColour white(255, 255, 255), black(0, 0, 0);
+            if (local) {
+                fill = th_->accent;
+                edge = mix(th_->accent, th_->dark ? white : black, 35);
+                const int lum = (fill.Red() * 299 + fill.Green() * 587 + fill.Blue() * 114) / 1000;
+                text = lum > 150 ? wxColour(20, 22, 28) : wxColour(246, 249, 255);
+            } else {
+                fill = mix(th_->card, th_->warn, th_->dark ? 22 : 30);
+                edge = th_->warn;
+                text = th_->dark ? mix(th_->warn, white, 35) : mix(th_->warn, black, 45);
+            }
+        }
 
         int minX = INT_MAX, minY = INT_MAX;
         for (const auto& m : g.mons) {
@@ -389,12 +438,20 @@ private:
     void OnPaint(wxPaintEvent&)
     {
         wxAutoBufferedPaintDC pdc(this);
-        pdc.SetBackground(wxBrush(wxColour(24, 26, 31)));
+        const wxColour gridCol = th_ ? th_->border : wxColour(52, 56, 65);
+        const wxColour hintCol = th_ ? th_->sub : wxColour(140, 146, 158);
+        pdc.SetBackground(wxBrush(th_ ? (th_->dark ? wxColour((unsigned char)(th_->page.Red() * 80 / 100),
+                                                               (unsigned char)(th_->page.Green() * 80 / 100),
+                                                               (unsigned char)(th_->page.Blue() * 80 / 100))
+                                                  : wxColour((unsigned char)(th_->page.Red() * 94 / 100),
+                                                             (unsigned char)(th_->page.Green() * 94 / 100),
+                                                             (unsigned char)(th_->page.Blue() * 94 / 100)))
+                                  : wxColour(24, 26, 31)));
         pdc.Clear();
         wxGCDC dc(pdc);                    // anti-aliased drawing
 
         wxSize s = GetClientSize();
-        dc.SetPen(wxPen(wxColour(52, 56, 65)));
+        dc.SetPen(wxPen(gridCol));
         for (int x = 16; x < s.x; x += 24)
             for (int y = 16; y < s.y; y += 24) dc.DrawPoint(x, y);   // dotted grid
 
@@ -405,7 +462,7 @@ private:
         if (peers_.empty()) {
             int bottom = 0;
             for (const auto& m : local_.mons) bottom = std::max(bottom, MonRect(local_, m, v).GetBottom());
-            dc.SetTextForeground(wxColour(140, 146, 158));
+            dc.SetTextForeground(hintCol);
             wxString hint = "Waiting for other seamless-input PCs on the LAN ...";
             wxSize ext = dc.GetTextExtent(hint);
             dc.DrawText(hint, (s.x - ext.x) / 2, bottom + 14);
@@ -481,6 +538,7 @@ private:
     std::vector<Group> peers_;
     int dragId_ = -1;
     bool frozen_ = false;
+    const Theme* th_ = nullptr;
     View frozenView_;
     double grabX_ = 0, grabY_ = 0;
 };
@@ -513,15 +571,11 @@ static wxString ScreensText(const std::vector<wxRect>& mons)
 // Look & feel: a small theme (follows the system's light/dark setting) and a few
 // custom-drawn controls used by the Devices tab.
 // ============================================================================
-struct Theme {
-    bool dark = false;
-    wxColour page, card, border, track, text, sub, accent, ok, warn, bad;
-};
-
-static Theme MakeTheme()
+static Theme BuiltinTheme(bool dark)
 {
     Theme t;
-    t.dark = wxSystemSettings::GetAppearance().IsDark();
+    t.dark = dark;
+    t.name = dark ? "Dark" : "Light";
     // Explicit colours: on Windows the system text colour stays black even in dark mode.
     if (t.dark) {
         t.text   = wxColour(232, 234, 240);
@@ -547,6 +601,207 @@ static Theme MakeTheme()
         t.bad    = wxColour(214, 62, 62);
     }
     return t;
+}
+
+static const char* const kSystemThemeName = "System (auto)";
+
+static Theme SystemTheme()
+{
+    Theme t = BuiltinTheme(wxSystemSettings::GetAppearance().IsDark());
+    t.name = kSystemThemeName;
+    return t;
+}
+
+// ---------------------------------------------------------------- theme files (theme/*.theme)
+static std::filesystem::path PathFromWx(const wxString& s)
+{
+#ifdef __WXMSW__
+    return std::filesystem::path(std::wstring(s.wc_str()));
+#else
+    return std::filesystem::path(std::string(s.utf8_str()));
+#endif
+}
+
+static wxString WxFromPath(const std::filesystem::path& p)
+{
+#ifdef __WXMSW__
+    return wxString(p.wstring());
+#else
+    return wxString::FromUTF8(p.string().c_str());
+#endif
+}
+
+static std::string LowerStr(std::string v)
+{
+    for (auto& c : v) c = (char)std::tolower((unsigned char)c);
+    return v;
+}
+
+static std::string TrimStr(const std::string& v)
+{
+    const auto b = v.find_first_not_of(" \t\r\n");
+    if (b == std::string::npos) return {};
+    return v.substr(b, v.find_last_not_of(" \t\r\n") - b + 1);
+}
+
+// The folder in the user's data directory (yours: survives updates, wins over the shipped files).
+static std::filesystem::path UserThemeDir() { return paths::DataDir() / "theme"; }
+
+// Folders searched for *.theme files; a later folder replaces a theme of the same name.
+static std::vector<std::filesystem::path> ThemeDirs()
+{
+    std::vector<std::filesystem::path> d;
+    const std::filesystem::path exe = PathFromWx(wxStandardPaths::Get().GetExecutablePath()).parent_path();
+    d.push_back(exe / "theme");                                          // next to the program (build folder, portable copy)
+    d.push_back(exe.parent_path() / "share" / "seamless-input" / "theme"); // installed: <prefix>/bin + <prefix>/share
+    d.push_back(UserThemeDir());
+    return d;
+}
+
+static bool ParseHexColour(const std::string& text, wxColour& out)
+{
+    std::string v = TrimStr(text);
+    if (!v.empty() && v[0] == '#') v.erase(0, 1);
+    if (v.size() != 6) return false;
+    for (char c : v) if (!std::isxdigit((unsigned char)c)) return false;
+    const unsigned long n = std::stoul(v, nullptr, 16);
+    out = wxColour((unsigned char)((n >> 16) & 255), (unsigned char)((n >> 8) & 255), (unsigned char)(n & 255));
+    return true;
+}
+
+// Live switching recognises a colour by its value, so two roles must never share one.
+static void MakeDistinct(Theme& t)
+{
+    wxColour* c[] = {&t.page, &t.card, &t.border, &t.track, &t.text, &t.sub, &t.accent, &t.ok, &t.warn, &t.bad};
+    for (size_t i = 1; i < 10; ++i) {
+        for (int guard = 0; guard < 8; ++guard) {
+            bool dup = false;
+            for (size_t j = 0; j < i; ++j) {
+                if (*c[i] == *c[j]) {
+                    const int b = c[i]->Blue();
+                    *c[i] = wxColour(c[i]->Red(), c[i]->Green(), (unsigned char)(b < 255 ? b + 1 : b - 1));
+                    dup = true;
+                }
+            }
+            if (!dup) break;
+        }
+    }
+}
+
+static bool LoadThemeFile(const std::filesystem::path& file, Theme& out, std::string& err)
+{
+    std::ifstream in(file, std::ios::binary);
+    if (!in) { err = "cannot read the file"; return false; }
+    std::map<std::string, std::string> kv;
+    std::string line;
+    bool first = true;
+    while (std::getline(in, line)) {
+        if (first && line.compare(0, 3, "\xEF\xBB\xBF") == 0) line.erase(0, 3);    // UTF-8 byte order mark
+        first = false;
+        const std::string t = TrimStr(line);
+        if (t.empty() || t[0] == '#' || t[0] == ';') continue;
+        const auto eq = t.find('=');
+        if (eq == std::string::npos) continue;
+        kv[LowerStr(TrimStr(t.substr(0, eq)))] = TrimStr(t.substr(eq + 1));
+    }
+    std::string name = kv["name"];
+    if (name.empty()) name = file.stem().string();
+
+    wxColour pageProbe;
+    bool dark;
+    if (kv.count("dark")) {
+        const std::string d = LowerStr(kv["dark"]);
+        dark = d == "true" || d == "1" || d == "yes";
+    } else if (kv.count("page") && ParseHexColour(kv["page"], pageProbe)) {
+        dark = (pageProbe.Red() * 299 + pageProbe.Green() * 587 + pageProbe.Blue() * 114) / 1000 < 128;
+    } else {
+        dark = true;
+    }
+
+    Theme t = BuiltinTheme(dark);                       // keys that are missing keep the built-in colour
+    struct Field { const char* key; wxColour* col; };
+    const Field fields[] = {{"page", &t.page}, {"card", &t.card}, {"border", &t.border}, {"track", &t.track},
+                            {"text", &t.text}, {"sub", &t.sub}, {"accent", &t.accent}, {"ok", &t.ok},
+                            {"warn", &t.warn}, {"bad", &t.bad}};
+    for (const auto& f : fields) {
+        auto it = kv.find(f.key);
+        if (it == kv.end()) continue;
+        if (!ParseHexColour(it->second, *f.col)) { err = std::string("bad colour for '") + f.key + "' (use #RRGGBB)"; return false; }
+    }
+    MakeDistinct(t);
+    t.name = wxString::FromUTF8(name.c_str());
+    out = t;
+    return true;
+}
+
+struct ThemeEntry {
+    Theme theme;
+    std::filesystem::path file;                         // empty: built in
+};
+
+// All themes: the built-in Light and Dark, then every theme file found (same name = later wins).
+static std::vector<ThemeEntry> LoadThemes(std::vector<std::string>* problems = nullptr)
+{
+    std::map<std::string, ThemeEntry> byName;           // lower-case name: sorted menu, no duplicates
+    for (bool dark : {false, true}) {
+        ThemeEntry e;
+        e.theme = BuiltinTheme(dark);
+        byName[LowerStr(std::string(e.theme.name.utf8_str()))] = e;
+    }
+    for (const auto& dir : ThemeDirs()) {
+        std::error_code ec;
+        if (!std::filesystem::is_directory(dir, ec)) continue;
+        std::vector<std::filesystem::path> files;
+        for (const auto& de : std::filesystem::directory_iterator(dir, ec)) {
+            std::error_code ec2;
+            if (!de.is_regular_file(ec2)) continue;
+            if (LowerStr(de.path().extension().string()) != ".theme") continue;
+            files.push_back(de.path());
+        }
+        std::sort(files.begin(), files.end());
+        for (const auto& f : files) {
+            ThemeEntry e;
+            std::string err;
+            if (!LoadThemeFile(f, e.theme, err)) {
+                if (problems) problems->push_back(f.filename().string() + ": " + err);
+                continue;
+            }
+            e.file = f;
+            byName[LowerStr(std::string(e.theme.name.utf8_str()))] = e;
+        }
+    }
+    std::vector<ThemeEntry> v;
+    for (auto& kv : byName) v.push_back(std::move(kv.second));
+    return v;
+}
+
+static std::filesystem::path ThemeChoiceFile() { return paths::DataDir() / "gui-theme.txt"; }
+
+static std::string LoadThemeChoice()
+{
+    std::ifstream f(ThemeChoiceFile());
+    std::string l;
+    std::getline(f, l);
+    return TrimStr(l);
+}
+
+static void SaveThemeChoice(const wxString& name)
+{
+    std::error_code ec;
+    std::filesystem::create_directories(paths::DataDir(), ec);
+    std::ofstream f(ThemeChoiceFile(), std::ios::trunc);
+    if (f) f << std::string(name.utf8_str()) << "\n";
+}
+
+// The theme chosen last time (by name), else the system's light / dark setting.
+static Theme InitialTheme()
+{
+    const std::string want = LoadThemeChoice();
+    if (!want.empty() && LowerStr(want) != LowerStr(kSystemThemeName)) {
+        for (const auto& e : LoadThemes())
+            if (LowerStr(std::string(e.theme.name.utf8_str())) == LowerStr(want)) return e.theme;
+    }
+    return SystemTheme();
 }
 
 
@@ -595,7 +850,7 @@ private:
         dc.DrawRoundedRectangle(0, 0, s.x, s.y, 8);
     }
 
-    Theme t_;
+    const Theme& t_;                      // the frame's theme_: assigning to it re-colours the widget
     bool focus_ = false;
 };
 
@@ -671,7 +926,7 @@ private:
         dc.DrawText(label_, (s.x - te.x) / 2, (s.y - te.y) / 2);
     }
 
-    Theme t_;
+    const Theme& t_;                      // the frame's theme_: assigning to it re-colours the widget
     wxString label_;
     bool primary_;
     bool hover_ = false, down_ = false, focus_ = false;
@@ -749,7 +1004,7 @@ private:
         dc.DrawText(label_, kBox + 9, (s.y - te.y) / 2);
     }
 
-    Theme t_;
+    const Theme& t_;                      // the frame's theme_: assigning to it re-colours the widget
     wxString label_;
     bool on_ = false, hover_ = false, focus_ = false;
 };
@@ -859,7 +1114,7 @@ private:
         dc.DrawCircle(wxPoint((int)tx, (int)cy), (int)r);
     }
 
-    Theme t_;
+    const Theme& t_;                      // the frame's theme_: assigning to it re-colours the widget
     int min_, max_, val_, width_;
     bool hover_ = false, drag_ = false, focus_ = false;
 };
@@ -892,6 +1147,7 @@ public:
 
     // Different card colour (used as a background hint, e.g. for seamless-input clients)
     void SetFill(const wxColour& c) { fill_ = c; hasFill_ = true; Refresh(); }
+    void RemapColours(const Theme& o, const Theme& n) { accent_ = RemapColour(accent_, o, n); Refresh(); }
 
 private:
     void OnPaint(wxPaintEvent&)
@@ -911,7 +1167,7 @@ private:
         }
     }
 
-    Theme t_;
+    const Theme& t_;                      // the frame's theme_: assigning to it re-colours the widget
     bool hasAccent_;
     wxColour accent_;
     wxColour fill_;
@@ -956,7 +1212,7 @@ private:
         }
     }
 
-    Theme t_;
+    const Theme& t_;                      // the frame's theme_: assigning to it re-colours the widget
     float level_ = 0;
 };
 
@@ -1006,13 +1262,14 @@ private:
         gc->DrawEllipse(on_ ? s.x - 3 - d : 3, 2 + 3, d, d);
     }
 
-    Theme t_;
+    const Theme& t_;                      // the frame's theme_: assigning to it re-colours the widget
     bool on_ = false, hover_ = false;
 };
 
 // Rounded label with a tinted background ("Connected", "Waiting", ...).
 class StatusPill : public wxControl {
 public:
+    void RemapColours(const Theme& o, const Theme& n) { col_ = RemapColour(col_, o, n); Refresh(); }
     StatusPill(wxWindow* parent, const Theme& t)
         : wxControl(parent, wxID_ANY, wxDefaultPosition, wxDefaultSize, wxBORDER_NONE), t_(t)
     {
@@ -1056,7 +1313,7 @@ private:
         dc.DrawText(text_, (s.x - te.x) / 2, (s.y - te.y) / 2);
     }
 
-    Theme t_;
+    const Theme& t_;                      // the frame's theme_: assigning to it re-colours the widget
     wxString text_;
     wxColour col_;
 };
@@ -1106,13 +1363,14 @@ private:
         dc.DrawText(text_, tx, (s.y - te.y) / 2);
     }
 
-    Theme t_;
+    const Theme& t_;                      // the frame's theme_: assigning to it re-colours the widget
     wxString text_;
 };
 
 // Round badge with the first letter of a name.
 class Avatar : public wxControl {
 public:
+    void RemapColours(const Theme& o, const Theme& n) { col_ = RemapColour(col_, o, n); Refresh(); }
     Avatar(wxWindow* parent, const Theme& t, int size = 40)
         : wxControl(parent, wxID_ANY, wxDefaultPosition, wxSize(size, size), wxBORDER_NONE), t_(t), col_(t.accent)
     {
@@ -1150,7 +1408,7 @@ private:
         dc.DrawText(letter_, (s.x - te.x) / 2, (s.y - te.y) / 2);
     }
 
-    Theme t_;
+    const Theme& t_;                      // the frame's theme_: assigning to it re-colours the widget
     wxString letter_;
     wxColour col_;
 };
@@ -1247,7 +1505,7 @@ private:
         gc->PopState();
     }
 
-    Theme t_;
+    const Theme& t_;                      // the frame's theme_: assigning to it re-colours the widget
     bool muted_ = false, hover_ = false, down_ = false;
 };
 
@@ -1276,6 +1534,36 @@ static void DarkenTree(wxWindow* w)
     for (wxWindow* c : w->GetChildren()) DarkenTree(c);
 #else
     (void)w;
+#endif
+}
+
+// Switching between a dark and a light theme while the window is open (Windows only; no-op elsewhere).
+static void NativeLookTree(wxWindow* w, bool dark)
+{
+#ifdef __WXMSW__
+    if (!w) return;
+    if (dynamic_cast<wxChoice*>(w))        DarkenNative(w, dark ? L"DarkMode_CFD" : L"CFD");
+    else if (auto* lc = dynamic_cast<wxListCtrl*>(w)) {
+        DarkenNative(w, dark ? L"DarkMode_Explorer" : L"Explorer");
+        if (HWND hdr = ListView_GetHeader((HWND)lc->GetHWND())) SetWindowTheme(hdr, dark ? L"DarkMode_ItemsView" : L"ItemsView", nullptr);
+    }
+    else if (dynamic_cast<wxButton*>(w) || dynamic_cast<wxTextCtrl*>(w) || dynamic_cast<wxScrolledWindow*>(w))
+        DarkenNative(w, dark ? L"DarkMode_Explorer" : L"Explorer");
+    for (wxWindow* c : w->GetChildren()) NativeLookTree(c, dark);
+#else
+    (void)w; (void)dark;
+#endif
+}
+
+static void SetTitleBarDark(wxWindow* w, bool dark)
+{
+#ifdef __WXMSW__
+    if (!w || !w->GetHWND()) return;
+    BOOL on = dark ? TRUE : FALSE;
+    DwmSetWindowAttribute((HWND)w->GetHWND(), 20, &on, sizeof on);
+    DwmSetWindowAttribute((HWND)w->GetHWND(), 19, &on, sizeof on);
+#else
+    (void)w; (void)dark;
 #endif
 }
 
@@ -1371,7 +1659,7 @@ private:
         }
     }
 
-    Theme t_;
+    const Theme& t_;                      // the frame's theme_: assigning to it re-colours the widget
     std::vector<wxString> labels_;
     int sel_ = 0, hover_ = -1;
 };
@@ -1567,7 +1855,7 @@ private:
         }
     }
 
-    Theme t_;
+    const Theme& t_;                      // the frame's theme_: assigning to it re-colours the widget
     std::vector<MenuItemDef> items_;
     std::vector<Row> rows_;
     wxPanel* body_ = nullptr;
@@ -1624,6 +1912,13 @@ public:
         menus_.push_back({ title, std::move(items) });
         Refresh();
         return (int)menus_.size() - 1;
+    }
+
+    void SetMenuItems(int idx, std::vector<MenuItemDef> items)
+    {
+        if (idx < 0 || idx >= (int)menus_.size()) return;
+        menus_[(size_t)idx].items = std::move(items);
+        Refresh();
     }
 
     MenuItemDef* Item(int id)
@@ -1741,7 +2036,7 @@ private:
         }
     }
 
-    Theme t_;
+    const Theme& t_;                      // the frame's theme_: assigning to it re-colours the widget
     std::vector<MenuDef> menus_;
     MenuPopup* popup_ = nullptr;
     int open_ = -1, hover_ = -1, closedIdx_ = -1;
@@ -1810,6 +2105,7 @@ public:
 
         // ---- monitor layout
         canvas_ = new Canvas(this);
+        canvas_->SetTheme(&theme_);
         canvas_->SetLocal(host_, localMons_);
         root->Add(canvas_, 2, wxEXPAND | wxALL, 10);
 
@@ -1836,6 +2132,10 @@ public:
         scanBtn_->Bind(wxEVT_BUTTON, [this](wxCommandEvent&) { StartScan(); });
         groupBtn_->Bind(wxEVT_BUTTON, [this](wxCommandEvent&) { ApplyGroupPassword(); });
         groupCtl_->Bind(wxEVT_TEXT_ENTER, [this](wxCommandEvent&) { ApplyGroupPassword(); });
+        clipBtn_->Bind(wxEVT_BUTTON, [this](wxCommandEvent&) { ApplyClipLimit(); });
+        clipLimitCtl_->Bind(wxEVT_TEXT_ENTER, [this](wxCommandEvent&) { ApplyClipLimit(); });
+        clipUnit_->Bind(wxEVT_CHOICE, [this](wxCommandEvent&) { ApplyClipLimit(); });
+        ShowClipLimit(clipLimit_);
 
         masterMute_->onToggle = [this](bool) { SendMaster(); };
         volSlider_->Bind(wxEVT_SLIDER, [this](wxCommandEvent&) {
@@ -1883,7 +2183,8 @@ private:
     static constexpr int kTimerId     = 9000;
     static constexpr int kAnimTimerId = 9001;
     enum { kIdAutostart = 9100, kIdSvcInfo, kIdToggleSvc, kIdQuitAll, kIdOpenFileMenu, kIdOpenSettingsMenu,
-           kIdClearCache, kIdRegenKeys, kIdViewKeys };
+           kIdClearCache, kIdRegenKeys, kIdViewKeys,
+           kIdThemeSystem = 9400, kIdThemeReload, kIdThemeFolder, kIdThemeBase = 9500 };   // kIdThemeBase + n: the n-th theme
 
     struct Entry { wxString name; std::string ip; wxString status; };
     struct Discovered {
@@ -2047,7 +2348,15 @@ private:
                                         item(kIdRegenKeys, "Regenerate keys"),
                                         item(kIdViewKeys, "View keys") });
 
-        menuBar_->onOpen = [this](int) { RefreshServiceMenu(); };
+        {
+            std::vector<std::string> problems;
+            themes_ = LoadThemes(&problems);
+            for (const auto& p : problems) Log("Theme skipped: " + wxString::FromUTF8(p.c_str()));
+            themeName_ = theme_.name;
+            themeMenuIdx_ = menuBar_->AddMenu("Theme", ThemeMenuItems());
+        }
+
+        menuBar_->onOpen = [this](int) { RefreshServiceMenu(); RefreshThemeMenu(); };
         menuBar_->onCommand = [this](int id, bool checked) {
             wxCommandEvent ev(wxEVT_MENU, id);
             ev.SetEventObject(menuBar_);
@@ -2062,6 +2371,13 @@ private:
         Bind(wxEVT_MENU, [this](wxCommandEvent&) { OnClearCache(); }, kIdClearCache);
         Bind(wxEVT_MENU, [this](wxCommandEvent&) { OnRegenKeys(); }, kIdRegenKeys);
         Bind(wxEVT_MENU, [this](wxCommandEvent&) { OnViewKeys(); }, kIdViewKeys);
+        Bind(wxEVT_MENU, [this](wxCommandEvent&) { ApplyTheme(SystemTheme(), true); }, kIdThemeSystem);
+        Bind(wxEVT_MENU, [this](wxCommandEvent&) { ReloadThemes(); }, kIdThemeReload);
+        Bind(wxEVT_MENU, [this](wxCommandEvent&) { OpenThemeFolder(); }, kIdThemeFolder);
+        Bind(wxEVT_MENU, [this](wxCommandEvent& e) {
+            const size_t i = (size_t)(e.GetId() - kIdThemeBase);
+            if (i < themes_.size()) ApplyTheme(themes_[i].theme, true);
+        }, kIdThemeBase, kIdThemeBase + 299);
         Bind(wxEVT_MENU, [this](wxCommandEvent&) { menuBar_->OpenMenu(0); }, kIdOpenFileMenu);
         Bind(wxEVT_MENU, [this](wxCommandEvent&) { menuBar_->OpenMenu(1); }, kIdOpenSettingsMenu);
 
@@ -2073,6 +2389,102 @@ private:
         keys.emplace_back(wxACCEL_ALT, (int)'S', kIdOpenSettingsMenu);
 #endif
         SetAcceleratorTable(wxAcceleratorTable((int)keys.size(), keys.data()));
+    }
+
+    // ------------------------------------------------------------ themes (theme/*.theme)
+    std::vector<MenuItemDef> ThemeMenuItems() const
+    {
+        std::vector<MenuItemDef> v;
+        MenuItemDef sp;
+        sp.separator = true;
+
+        MenuItemDef sys;
+        sys.id = kIdThemeSystem;
+        sys.label = kSystemThemeName;
+        sys.accel = "light / dark";
+        sys.check = true;
+        sys.checked = themeName_ == kSystemThemeName;
+        v.push_back(sys);
+        v.push_back(sp);
+        for (size_t i = 0; i < themes_.size() && i < 299; ++i) {
+            MenuItemDef d;
+            d.id = kIdThemeBase + (int)i;
+            d.label = themes_[i].theme.name;
+            d.accel = themes_[i].theme.dark ? "dark" : "light";
+            d.check = true;
+            d.checked = themes_[i].theme.name == themeName_;
+            v.push_back(d);
+        }
+        v.push_back(sp);
+        MenuItemDef rl;
+        rl.id = kIdThemeReload;
+        rl.label = "Reload themes";
+        v.push_back(rl);
+        MenuItemDef of;
+        of.id = kIdThemeFolder;
+        of.label = "Open theme folder";
+        v.push_back(of);
+        return v;
+    }
+
+    void RefreshThemeMenu()
+    {
+        if (!menuBar_) return;
+        if (MenuItemDef* m = menuBar_->Item(kIdThemeSystem)) m->checked = themeName_ == kSystemThemeName;
+        for (size_t i = 0; i < themes_.size() && i < 299; ++i)
+            if (MenuItemDef* m = menuBar_->Item(kIdThemeBase + (int)i)) m->checked = themes_[i].theme.name == themeName_;
+    }
+
+    void ReloadThemes()
+    {
+        std::vector<std::string> problems;
+        themes_ = LoadThemes(&problems);
+        for (const auto& p : problems) Log("Theme skipped: " + wxString::FromUTF8(p.c_str()));
+        if (menuBar_) menuBar_->SetMenuItems(themeMenuIdx_, ThemeMenuItems());
+        Log(wxString::Format("%d themes loaded", (int)themes_.size()));
+        if (themeName_ != kSystemThemeName)              // the chosen theme may just have been edited
+            for (const auto& e : themes_)
+                if (e.theme.name == themeName_) { ApplyTheme(e.theme, false); break; }
+    }
+
+    void OpenThemeFolder()
+    {
+        std::error_code ec;
+        std::filesystem::create_directories(UserThemeDir(), ec);
+        const wxString dir = WxFromPath(UserThemeDir());
+        if (!wxLaunchDefaultApplication(dir))
+            wxMessageBox("Could not open the folder:\n" + dir, "Themes", wxOK | wxICON_WARNING, this);
+    }
+
+    // Colours an existing widget tree: every colour that belongs to the old palette becomes the same role of the new one.
+    static void ReThemeTree(wxWindow* w, const Theme& o, const Theme& n)
+    {
+        const wxColour bg = w->GetBackgroundColour(), nbg = RemapColour(bg, o, n);
+        if (nbg != bg) w->SetBackgroundColour(nbg);
+        const wxColour fg = w->GetForegroundColour(), nfg = RemapColour(fg, o, n);
+        if (nfg != fg) w->SetForegroundColour(nfg);
+        if (auto* c = dynamic_cast<CardPanel*>(w))  c->RemapColours(o, n);
+        if (auto* p = dynamic_cast<StatusPill*>(w)) p->RemapColours(o, n);
+        if (auto* a = dynamic_cast<Avatar*>(w))     a->RemapColours(o, n);
+        for (wxWindow* c : w->GetChildren()) ReThemeTree(c, o, n);
+        w->Refresh();
+    }
+
+    void ApplyTheme(const Theme& nt, bool save)
+    {
+        const Theme old = theme_;
+        Freeze();
+        theme_ = nt;                                     // widgets hold a reference to this: custom-drawn ones follow at once
+        themeName_ = nt.name;
+        ReThemeTree(this, old, nt);
+        for (auto& kv : cliRows_) kv.second.card->SetFill(ClientTint());     // derived from the palette: recompute
+        if (canvas_) canvas_->Refresh();
+        SetTitleBarDark(this, nt.dark);
+        NativeLookTree(this, nt.dark);
+        Thaw();
+        Layout();
+        Refresh();
+        if (save) SaveThemeChoice(nt.name);
     }
 
     void RefreshServiceMenu()
@@ -2248,6 +2660,35 @@ private:
         }
         right->Add(groupCard, 0, wxEXPAND | wxBOTTOM, 8);
 
+        // --- clipboard transfer limit
+        auto* clipCard = new CardPanel(p, theme_, false);
+        {
+            auto* cv = new wxBoxSizer(wxVERTICAL);
+            cv->Add(MakeHeader(clipCard, "Clipboard"), 0, wxBOTTOM, 2);
+            cv->Add(MakeLabel(clipCard, "Largest text or set of files that is copied to another PC. Bigger clipboards are neither sent nor accepted.", true), 0, wxBOTTOM, 8);
+            auto* cr = new wxBoxSizer(wxHORIZONTAL);
+            auto* clipBox = new InputBox(clipCard, theme_, wxTE_PROCESS_ENTER, "1", "size");
+            clipLimitCtl_ = clipBox->ctl;
+            clipBox->SetMinSize(wxSize(110, -1));
+            clipUnit_ = new wxChoice(clipCard, wxID_ANY);
+            clipUnit_->Append("KiB");
+            clipUnit_->Append("MiB");
+            clipUnit_->Append("GiB");
+            clipUnit_->SetSelection(2);
+            clipBtn_ = new FlatButton(clipCard, theme_, "Apply", true);
+            cr->Add(clipBox, 1, wxALIGN_CENTER_VERTICAL | wxRIGHT, 8);
+            cr->Add(clipUnit_, 0, wxALIGN_CENTER_VERTICAL | wxRIGHT, 8);
+            cr->Add(clipBtn_, 0, wxALIGN_CENTER_VERTICAL);
+            cv->Add(cr, 0, wxEXPAND);
+            clipLbl_ = MakeLabel(clipCard, "", true);
+            cv->Add(clipLbl_, 0, wxTOP, 8);
+            auto* co = new wxBoxSizer(wxVERTICAL);
+            co->Add(cv, 1, wxEXPAND | wxALL, 14);
+            clipCard->SetSizer(co);
+            ApplyBackground(clipCard, theme_.card);
+        }
+        right->Add(clipCard, 0, wxEXPAND | wxBOTTOM, 8);
+
         // --- connect by address
         auto* connCard = new CardPanel(p, theme_, false);
         {
@@ -2411,9 +2852,9 @@ private:
         r.mic = new FlatCheck(c, theme_, "Share my microphone");
         r.mic->SetToolTip("Send this PC's microphone to this device only");
         r.clip = new FlatCheck(c, theme_, "Share my clipboard");
-        r.clip->SetToolTip("Send this PC's clipboard text to this device when the cursor moves over to it.\n"
+        r.clip->SetToolTip("Send this PC's clipboard (text, or one or more files) to this device when the cursor moves over to it.\n"
                            "It is accepted there if this device may control that PC or shares its clipboard back.\n"
-                           "On Linux this needs xclip, xsel or wl-clipboard.");
+                           "On Linux, text needs xclip, xsel or wl-clipboard; copying files needs xclip or wl-clipboard.");
         r.allow = new FlatCheck(c, theme_, "Allow remote control");
         r.allow->SetToolTip("Let this device use this PC's keyboard and mouse");
         auto* checks = new wxBoxSizer(wxVERTICAL);
@@ -2475,6 +2916,11 @@ private:
         });
         r.allow->Bind(wxEVT_CHECKBOX, [this, id](wxCommandEvent& e) {
             if (peers_.find(id) == peers_.end()) return;
+            if (e.IsChecked() && !snap_.inputCanInject) {      // cannot work: do not even try
+                if (auto it = devRows_.find(id); it != devRows_.end()) it->second.allow->SetValue(false);
+                ShowInputProblem(false);
+                return;
+            }
             client_->Send("CONTROL " + std::to_string(id) + (e.IsChecked() ? " 1" : " 0"));
         });
         r.mute->onToggle = [this, id](bool m) {
@@ -2545,6 +2991,92 @@ private:
             : wxString::FromUTF8("\xE2\x97\x8F  Password active"));
         groupLbl_->SetForegroundColour(groupPwd_.empty() ? theme_.warn : theme_.ok);
         groupLbl_->Refresh();
+    }
+
+    // ------------------------------------------------------------ input problems
+    // Shown at start when this PC cannot be controlled (or cannot share input at all).
+    void ShowInputProblem(bool atStart)
+    {
+        const bool none = snap_.backend == "none";
+        wxString msg;
+        if (none) msg = "Keyboard and mouse sharing could not start on this PC.\n\n";
+        else      msg = "This PC can control other PCs, but it cannot be controlled.\n\n";
+        if (!snap_.inputNote.empty()) msg += wxString::FromUTF8(snap_.inputNote.c_str()) + "\n\n";
+        msg += "Remote control of this PC is switched off until this works, so the other PC does not "
+               "lose its keyboard and mouse while trying.\n\n";
+#if defined(__WXGTK__)
+        msg += "How to fix it (Linux):\n"
+               "1. Run linux-input-setup.sh (it asks for sudo).\n"
+               "2. Log out and back in.\n\n"
+               "Being in the 'input' group is not enough by itself: the group must be active in this login "
+               "session, the 'uinput' kernel module must be loaded, and /dev/uinput must be writable for the "
+               "group (the script sets up the udev rule).";
+#endif
+        wxMessageBox(msg, atStart ? "Keyboard and mouse sharing" : "Remote control not possible",
+                     wxOK | wxICON_WARNING, this);
+    }
+
+    // ------------------------------------------------------------ clipboard limit (Network tab)
+    static wxString WithSeparators(unsigned long long v)
+    {
+        std::string s = std::to_string(v), o;
+        for (size_t i = 0; i < s.size(); ++i) {
+            if (i && (s.size() - i) % 3 == 0) o += ',';
+            o += s[i];
+        }
+        return wxString::FromUTF8(o.c_str());
+    }
+
+    void UpdateClipLabel(const wxString& error = wxString())
+    {
+        if (!error.empty()) {
+            clipLbl_->SetLabelText(error);
+            clipLbl_->SetForegroundColour(theme_.warn);
+        } else {
+            wxString unit;
+            unsigned long long v = clipLimit_;
+            if (clipLimit_ % (1ull << 30) == 0)      { v = clipLimit_ >> 30; unit = "GiB"; }
+            else if (clipLimit_ % (1ull << 20) == 0) { v = clipLimit_ >> 20; unit = "MiB"; }
+            else                                     { v = clipLimit_ >> 10; unit = "KiB"; }
+            clipLbl_->SetLabelText("Limit: " + WithSeparators(v) + " " + unit + "  (" + WithSeparators(clipLimit_) + " bytes)");
+            clipLbl_->SetForegroundColour(theme_.ok);
+        }
+        clipLbl_->Refresh();
+    }
+
+    // Shows a byte count as "<value> <KiB|MiB|GiB>", using the largest unit that divides it exactly.
+    void ShowClipLimit(unsigned long long bytes)
+    {
+        clipLimit_ = bytes;
+        unsigned long long v = bytes >> 10;
+        int unit = 0;
+        if (bytes % (1ull << 30) == 0)      { v = bytes >> 30; unit = 2; }
+        else if (bytes % (1ull << 20) == 0) { v = bytes >> 20; unit = 1; }
+        clipLimitCtl_->ChangeValue(wxString::Format("%llu", v));
+        clipUnit_->SetSelection(unit);
+        UpdateClipLabel();
+    }
+
+    void ApplyClipLimit()
+    {
+        wxString s = clipLimitCtl_->GetValue();
+        s.Trim(true).Trim(false);
+        wxULongLong_t v = 0;
+        if (s.empty() || !s.ToULongLong(&v) || v == 0) {
+            UpdateClipLabel("Enter a whole number, 1 or more.");
+            return;
+        }
+        const int u = clipUnit_->GetSelection();           // 0 KiB, 1 MiB, 2 GiB
+        if (u < 0) return;
+        const unsigned long long mult = 1ull << (10 + 10 * u);
+        if (v > (1ull << 40) / mult) {
+            UpdateClipLabel("The largest possible limit is 1024 GiB.");
+            return;
+        }
+        clipLimit_ = (unsigned long long)v * mult;
+        clipEdited_ = std::chrono::steady_clock::now();
+        client_->Send("CLIPLIMIT " + std::to_string(clipLimit_));
+        UpdateClipLabel();
     }
 
     void ApplyGroupPassword()
@@ -2843,6 +3375,11 @@ private:
         snapLines_ = lines;
         const bool keyChanged = snap_.pubKey != s.pubKey;
         snap_ = s;
+        if (!inputChecked_) {                           // once per start, with the first real answer from the daemon
+            inputChecked_ = true;
+            if (!s.inputCanInject || s.backend == "none")
+                wxTheApp->CallAfter([this] { ShowInputProblem(true); });
+        }
         if (keyChanged) UpdateHeader();
 
         using clock = std::chrono::steady_clock;
@@ -2865,6 +3402,11 @@ private:
             groupCtl_->ChangeValue(wxString::FromUTF8(groupPwd_));
         }
         groupInit_ = true;
+
+        if (!clipInit_ || (s.clipLimit != clipLimit_ && now - clipEdited_ > std::chrono::milliseconds(1500))) {
+            ShowClipLimit(s.clipLimit);
+            clipInit_ = true;
+        }
 
         inputMode_ = s.inputMode;
         inputPeer_ = s.inputPeer;
@@ -3065,6 +3607,14 @@ private:
     bool listDirty_ = false;
     std::map<std::string, OthRow> othRows_;
     wxTextCtrl* groupCtl_ = nullptr;
+    wxTextCtrl* clipLimitCtl_ = nullptr;
+    wxChoice* clipUnit_ = nullptr;
+    FlatButton* clipBtn_ = nullptr;
+    wxStaticText* clipLbl_ = nullptr;
+    bool inputChecked_ = false;                     // the start-up check for input problems was done
+    unsigned long long clipLimit_ = 1ull << 30;     // 1 GiB until the daemon tells us otherwise
+    bool clipInit_ = false;
+    std::chrono::steady_clock::time_point clipEdited_;
     FlatButton* groupBtn_ = nullptr;
     wxStaticText* groupLbl_ = nullptr;
     wxScrolledWindow* cliScroll_ = nullptr;
@@ -3076,7 +3626,10 @@ private:
     wxBoxSizer* devSizer_ = nullptr;
     wxStaticText* emptyLbl_ = nullptr;
     std::map<int, DevRow> devRows_;
-    Theme theme_ = MakeTheme();
+    Theme theme_ = InitialTheme();
+    wxString themeName_;                            // the theme in use (menu check mark, saved choice)
+    std::vector<ThemeEntry> themes_;                // everything found in the theme folders
+    int themeMenuIdx_ = -1;
     wxTextCtrl* target_ = nullptr;
     wxTextCtrl* log_ = nullptr;
     FlatButton* goBtn_ = nullptr;

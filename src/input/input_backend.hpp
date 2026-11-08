@@ -35,6 +35,11 @@ public:
     virtual bool Start(BackendSink sink, std::string* err) = 0;
     virtual void Stop() = 0;
 
+    // After a successful Start(): can this PC be controlled, i.e. can input really be injected?
+    // false = it can control others but injected input would go nowhere. The engine then refuses to be
+    // controlled, so the other PC never ends up with a captured keyboard and mouse and no way back.
+    virtual bool CanInject() const { return true; }
+
     // Monitor rectangles of this PC in desktop coordinates. Call before Start().
     virtual void SetGeometry(const std::vector<InputRect>& /*monitors*/) {}
 

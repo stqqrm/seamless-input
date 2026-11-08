@@ -1,0 +1,13 @@
+# Gruvbox Dark for seamless-input. See README.txt in this folder for the format.
+name = Gruvbox Dark
+dark = true
+page = #282828
+card = #3c3836
+border = #504945
+track = #665c54
+text = #ebdbb2
+sub = #a89984
+accent = #83a598
+ok = #b8bb26
+warn = #fabd2f
+bad = #fb4934

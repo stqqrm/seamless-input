@@ -171,9 +171,23 @@ bool Core::Start(std::string* err)
     };
     {
         std::string msg;
-        if (input_->Start(&msg)) PostLog("Keyboard/mouse sharing ready: " + input_->BackendName());
-        else                     PostLog("Keyboard/mouse sharing unavailable: " + msg);
+        const bool started = input_->Start(&msg);
+        if (started) PostLog("Keyboard/mouse sharing ready: " + input_->BackendName());
+        else         PostLog("Keyboard/mouse sharing unavailable: " + msg);
         if (!msg.empty() && input_->BackendName() != "none") PostLog("Input: " + msg);
+        canInject_ = started && input_->CanInject();
+        inputNote_ = msg.empty() && !started ? "keyboard/mouse sharing could not start" : msg;
+    }
+
+    {
+        ClipShare::Hooks h;
+        h.send = [this](int id, const std::string& line) { if (net_) net_->Send(id, line); };
+        h.log = [this](const std::string& m) { PostLog(m); };
+        clip_ = std::make_unique<ClipShare>(dir_ / "incoming", std::move(h));
+        std::ifstream f(dir_ / "clipboard.txt");
+        std::string k;
+        unsigned long long v = 0;
+        if (f >> k >> v && k == "limit") clip_->SetLimit(v);
     }
 
     Post([this] {
@@ -182,7 +196,8 @@ bool Core::Start(std::string* err)
         Log("Monitors (" + monsSource_ + "): " + std::to_string(mons_.size()));
         const std::string cb = clipboard::Backend();
         Log(cb.empty() ? "Clipboard sharing unavailable (on Linux install xclip, xsel or wl-clipboard)"
-                       : "Clipboard sharing ready: " + cb);
+                       : "Clipboard sharing ready: " + cb + (clipboard::FilesSupported() ? " (text and files)" : " (text only)") +
+                         ", limit " + ClipShare::FormatBytes(clip_ ? clip_->Limit() : ClipShare::kDefaultLimit));
         Log(groupPwd_.empty()
             ? "Ready. No password set - PCs without a password connect automatically."
             : "Ready. PCs with the same group password connect automatically.");
@@ -201,7 +216,7 @@ void Core::Stop()
     // Persist whatever is pending, on the Core thread, before the engines go away.
     {
         auto done = std::make_shared<std::promise<void>>();
-        Post([this, done] { FlushConfig(); done->set_value(); });
+        Post([this, done] { FlushConfig(); if (clip_) clip_->Shutdown(); done->set_value(); });
         done->get_future().wait_for(std::chrono::seconds(3));
     }
     if (input_) input_->Stop();   // return the keyboard/mouse before anything else shuts down
@@ -260,6 +275,9 @@ state::Snapshot Core::GetSnapshot() const
     s.backend = input_ ? input_->BackendName() : "none";
     s.monsSource = monsSource_;
     s.group = groupPwd_;
+    s.clipLimit = clip_ ? clip_->Limit() : ClipShare::kDefaultLimit;
+    s.inputCanInject = canInject_;
+    s.inputNote = inputNote_;
     s.mons = mons_;
     s.masterMute = masterMute_;
     s.masterVol = masterVol_;
@@ -273,7 +291,7 @@ state::Snapshot Core::GetSnapshot() const
         state::Peer p = kv.second;
         layout_.PeerPos(p.id, p.ox, p.oy);
         const auto ts = trust_->Get(p.key);
-        p.allowed = ts == TrustStore::State::Allowed;
+        p.allowed = ts == TrustStore::State::Allowed && canInject_;   // what is in effect, not just what was ticked
         s.peers.push_back(std::move(p));
     }
     for (const auto& kv : disc_) s.disc.push_back(kv.second.b);
@@ -319,7 +337,9 @@ void Core::CmdMonitorsHint(const std::vector<InputRect>& hint)
         input_->Stop();
         input_->SetLocalMonitors(mons_);
         std::string msg;
-        if (!input_->Start(&msg)) Log("Keyboard/mouse sharing unavailable: " + msg);
+        const bool started = input_->Start(&msg);
+        if (!started) Log("Keyboard/mouse sharing unavailable: " + msg);
+        RefreshInputStatus(started, msg);
     }
     Log("Learned this PC's monitor layout from the window (" + std::to_string(mons_.size()) + " monitor(s))");
     if (!peers_.empty() && net_) net_->SetGroup(groupPwd_);    // reconnect: peers learn the new geometry
@@ -424,6 +444,12 @@ void Core::CmdControl(int id, bool allow)
     auto it = peers_.find(id);
     if (it == peers_.end() || !input_) return;
     const state::Peer& p = it->second;
+    if (allow && !canInject_) {
+        // Accepting would make the other PC capture its keyboard and mouse for a PC that cannot react.
+        Log("Cannot allow " + p.name + " to control this PC: " + (inputNote_.empty() ? "input cannot be injected here" : inputNote_));
+        Changed();                                              // the window un-ticks the box
+        return;
+    }
     std::string err;
     if (!trust_->Set(p.key, allow ? TrustStore::State::Allowed : TrustStore::State::Denied, p.name, &err))
         Log("Could not save permissions: " + err);
@@ -446,8 +472,7 @@ void Core::CmdClearCache()
     }
     std::error_code ec;
     std::filesystem::remove(dir_ / "monitors.txt", ec);
-    clipSent_.clear();
-    clipIn_.clear();
+    if (clip_) clip_->ForgetAll();
     Log("Cache cleared: remembered permissions and the monitor cache were removed (devices must be allowed again)");
     Changed();
 }
@@ -481,9 +506,11 @@ void Core::CmdClipboard(int id, bool share)
     state::Peer& p = it->second;
     if (p.clip == share) return;
     p.clip = share;
-    clipSent_.erase(id);                // switching it on sends the current text at the next crossing
+    if (clip_) clip_->ForgetSent(id);   // switching it on sends the current clipboard at the next crossing
     if (share && clipboard::Backend().empty())
         Log("Clipboard sharing needs xclip, xsel or wl-clipboard on this PC");
+    else if (share && !clipboard::FilesSupported())
+        Log("Only text can be shared on this PC (copying files needs xclip or wl-clipboard)");
     Log((share ? "Sharing clipboard with " : "Stopped sharing clipboard with ") + p.name);
     RecordPeerAudio(p);                 // per-device settings are saved together (audio + clipboard)
     Changed();
@@ -493,7 +520,19 @@ void Core::SendControlState(int id)
 {
     auto it = peers_.find(id);
     if (it == peers_.end() || !net_) return;
-    net_->Send(id, trust_->Get(it->second.key) == TrustStore::State::Allowed ? "CTRL 1" : "CTRL 0");
+    // "Allowed" is the user's decision; whether control can really work is a separate question. A peer is
+    // only told it may control this PC when injection works, so it never grabs its input for nothing.
+    const bool allowed = trust_->Get(it->second.key) == TrustStore::State::Allowed;
+    net_->Send(id, allowed && canInject_ ? "CTRL 1" : "CTRL 0");
+}
+
+void Core::RefreshInputStatus(bool started, const std::string& msg)
+{
+    const bool can = started && input_ && input_->CanInject();
+    const bool changed = can != canInject_;
+    canInject_ = can;
+    inputNote_ = msg.empty() && !started ? "keyboard/mouse sharing could not start" : msg;
+    if (changed) for (const auto& kv : peers_) SendControlState(kv.first);
 }
 
 // ------------------------------------------------------------------ network results
@@ -508,8 +547,7 @@ void Core::OnPeerReady(int id, std::uint32_t inst, const std::string& key, const
     p.addr = addr;
     p.incoming = incoming;
     p.placed = false;
-    clipSent_.erase(id);                // a new connection: the peer's clipboard is unknown again
-    clipIn_.erase(id);
+    if (clip_) clip_->PeerLost(id);     // a new connection: the peer's clipboard is unknown again
 
     Log("Connection established with " + name + " (" + addr + "), key " + Identity::Fingerprint(key) + " verified");
     audio_->AddPeer(inst, addr);
@@ -528,8 +566,7 @@ void Core::OnPeerLost(int id)
         audio_->RemovePeer(it->second.inst);
         peers_.erase(it);
     }
-    clipSent_.erase(id);
-    clipIn_.erase(id);
+    if (clip_) clip_->PeerLost(id);
     layout_.RemovePeer(id);             // its virtual window disappears with the connection
     OnSetChanged();
     RefreshCapture();                   // nobody left to hear our audio: stop capturing
@@ -542,7 +579,7 @@ void Core::OnMessage(int id, const std::string& line)
     if (it == peers_.end()) return;
     state::Peer& p = it->second;
 
-    if (OnClipLine(id, p, line)) return;
+    if (clip_ && clip_->HandleLine(id, p.name, p.clip || trust_->Get(p.key) == TrustStore::State::Allowed, line)) return;
 
     if (line.rfind("SCREENS ", 0) == 0) {
         if (p.placed) return;
@@ -816,80 +853,27 @@ void Core::UpdateCapture(AudioSource src, bool want, bool& capturing, const char
 
 
 // ------------------------------------------------------------------ clipboard sharing
-// Wire format (text only, UTF-8), one or more lines per transfer because a protocol line may not
-// exceed the read buffer (16 KiB, 4 KiB-ish after encryption overhead):
-//     CLIPD <transfer id> <chunk index> <chunk count> <base64 of up to 1800 bytes>
-// The sender is the PC whose cursor just moved over to the peer; the receiver accepts it when it
-// shares its own clipboard with that peer or when that peer may control this PC.
-namespace {
-constexpr std::size_t kClipChunk = 1800;
-constexpr int kClipMaxChunks = (int)(clipboard::kMaxBytes / kClipChunk) + 2;
-}
-
+// The work is done by ClipShare (clipshare.hpp). Core decides WHEN: the cursor moved over to a peer
+// we share the clipboard with.
 void Core::OnCursorToPeer(int id)
 {
     auto it = peers_.find(id);
-    if (it == peers_.end() || !net_) return;
+    if (it == peers_.end() || !net_ || !clip_) return;
     const state::Peer& p = it->second;
     if (!p.clip || !p.placed || clipboard::Backend().empty()) return;
-
-    std::string text;
-    if (!clipboard::GetText(text) || text.empty()) return;          // nothing (or nothing textual) to send
-
-    const std::size_t h = std::hash<std::string>{}(text);
-    auto sent = clipSent_.find(id);
-    if (sent != clipSent_.end() && sent->second == h) return;       // it already has exactly this text
-    clipSent_[id] = h;
-
-    const long long xfer = ++clipXfer_;
-    const std::size_t count = (text.size() + kClipChunk - 1) / kClipChunk;
-    for (std::size_t i = 0; i < count; ++i) {
-        net_->Send(id, "CLIPD " + std::to_string(xfer) + " " + std::to_string(i) + " " + std::to_string(count) + " " +
-                       clipboard::Base64Encode(text.substr(i * kClipChunk, kClipChunk)));
-    }
-    Log("Clipboard sent to " + p.name + " (" + std::to_string(text.size()) + " bytes)");
+    clip_->SendTo(id, p.name);
 }
 
-bool Core::OnClipLine(int id, const state::Peer& p, const std::string& line)
+void Core::CmdClipLimit(std::uint64_t bytes)
 {
-    if (line.rfind("CLIPD ", 0) != 0) return false;
-
-    long long xfer = 0;
-    int idx = 0, count = 0, off = 0;
-    if (std::sscanf(line.c_str(), "CLIPD %lld %d %d %n", &xfer, &idx, &count, &off) < 3 || off <= 0 ||
-        (std::size_t)off > line.size())
-        return true;
-
-    // Somebody who neither shares with us nor may control us does not get to write to our clipboard.
-    if (!(p.clip || trust_->Get(p.key) == TrustStore::State::Allowed)) return true;
-    if (count < 1 || count > kClipMaxChunks || idx < 0 || idx >= count) { clipIn_.erase(id); return true; }
-
-    ClipIn& in = clipIn_[id];
-    if (idx == 0) {
-        in = ClipIn{};
-        in.xfer = xfer;
-        in.count = count;
-    } else if (in.xfer != xfer || in.count != count || in.next != idx) {
-        clipIn_.erase(id);                                          // lost or out of order: drop the transfer
-        return true;
+    if (!clip_) return;
+    clip_->SetLimit(bytes);
+    const std::uint64_t v = clip_->Limit();         // clamped
+    {
+        std::ofstream f(dir_ / "clipboard.txt", std::ios::trunc);
+        if (f) f << "limit " << v << "\n";
+        else Log("Could not save the clipboard limit");
     }
-    in.b64.append(line, (std::size_t)off, std::string::npos);
-    if (in.b64.size() > clipboard::kMaxBytes / 3 * 4 + 16) { clipIn_.erase(id); return true; }
-    ++in.next;
-    if (in.next < in.count) return true;
-
-    std::string text;
-    const bool decoded = clipboard::Base64Decode(in.b64, text);
-    clipIn_.erase(id);
-    if (!decoded || text.empty() || text.size() > clipboard::kMaxBytes ||
-        text.find('\0') != std::string::npos)
-        return true;
-
-    if (clipboard::SetText(text)) {
-        clipSent_[id] = std::hash<std::string>{}(text);             // do not echo it straight back
-        Log("Clipboard received from " + p.name + " (" + std::to_string(text.size()) + " bytes)");
-    } else {
-        Log("Could not set this PC's clipboard (is xclip / xsel / wl-clipboard installed?)");
-    }
-    return true;
+    Log("Clipboard limit: " + ClipShare::FormatBytes(v));
+    Changed();
 }

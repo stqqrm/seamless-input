@@ -1,0 +1,13 @@
+# Monokai for seamless-input. See README.txt in this folder for the format.
+name = Monokai
+dark = true
+page = #272822
+card = #34352e
+border = #49483e
+track = #5c5d52
+text = #f8f8f2
+sub = #a8a99a
+accent = #66d9ef
+ok = #a6e22e
+warn = #e6db74
+bad = #f92672

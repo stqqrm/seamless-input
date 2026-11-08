@@ -29,6 +29,7 @@ namespace {
 class X11Backend : public InputBackend {
 public:
     const char* Name() const override { return "X11 (XInput2 / XGrab / XTest)"; }
+    bool CanInject() const override { return xtest_; }
 
     bool Start(BackendSink sink, std::string* err) override
     {

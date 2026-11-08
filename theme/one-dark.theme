@@ -1,0 +1,13 @@
+# One Dark for seamless-input. See README.txt in this folder for the format.
+name = One Dark
+dark = true
+page = #282c34
+card = #333842
+border = #3e4451
+track = #4b5263
+text = #abb2bf
+sub = #7f848e
+accent = #61afef
+ok = #98c379
+warn = #e5c07b
+bad = #e06c75

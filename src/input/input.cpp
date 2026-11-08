@@ -535,6 +535,11 @@ void InputEngine::Stop()
     d_->be.reset();
 }
 
+bool InputEngine::CanInject() const
+{
+    return d_->be && d_->be->CanInject();
+}
+
 std::string InputEngine::BackendName() const
 {
     return d_->be ? d_->be->Name() : std::string("none");
@@ -612,8 +617,10 @@ bool InputEngine::HandleMessage(int id, const std::string& line)
         std::lock_guard<std::mutex> lk(d_->mu);
         auto it = d_->peers.find(id);
         // Who may control this PC is decided per device by 'allowed'; nobody is asked.
-        const bool ok = d_->started && it != d_->peers.end() && it->second.placed && it->second.allowed &&
-                        d_->mode == Mode::Local;
+        // A PC that cannot inject input must never accept control: the controller would capture its own
+        // keyboard and mouse, and nothing would happen here.
+        const bool ok = d_->started && d_->be && d_->be->CanInject() && it != d_->peers.end() &&
+                        it->second.placed && it->second.allowed && d_->mode == Mode::Local;
         if (!ok) {
             d_->PushRaw(id, "DENY");
             return true;
