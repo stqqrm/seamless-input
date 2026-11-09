@@ -275,7 +275,7 @@ state::Snapshot Core::GetSnapshot() const
     s.pubKey = ident_->PublicHex();
     s.dataDir = dir_.string();
     s.identNote = identNote_;
-    s.backend = input_ ? input_->BackendName() : "none";
+    s.backend = input_ ? input_->BackendName() : "";   // "": input is still starting (not a failure)
     s.monsSource = monsSource_;
     s.version = appver::Full();
     s.group = groupPwd_;

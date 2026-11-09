@@ -2492,11 +2492,16 @@ private:
         wxString svcState = connected_ ? "connected"
                           : !daemonWanted_ ? "stopped"
                           : connecting_ ? "starting..." : "not connected";
-        hdrSub_->SetLabelText(wxString::Format(
+        wxString line = wxString::Format(
             "IP %s   |   Key %s   |   TCP %d   UDP %d (discovery)   UDP %d (audio)   |   Background service: %s",
             ips.empty() ? wxString("-") : ips,
             snap_.pubKey.empty() ? wxString("-") : wxString::FromUTF8(Identity::Fingerprint(snap_.pubKey)),
-            (int)kTcpPort, (int)kDiscoveryPort, (int)kAudioPort, svcState));
+            (int)kTcpPort, (int)kDiscoveryPort, (int)kAudioPort, svcState);
+        // Only a finished start-up that failed counts: while the daemon is still starting the backend is empty.
+        const bool inputBad = connected_ && (snap_.backend == "none" || !snap_.inputCanInject);
+        if (inputBad) line += "   |   This PC cannot be controlled (see the activity log)";
+        hdrSub_->SetLabelText(line);
+        hdrSub_->SetToolTip(inputBad && !snap_.inputNote.empty() ? wxString::FromUTF8(snap_.inputNote.c_str()) : wxString());
     }
 
     // ------------------------------------------------------------ service menu
@@ -3588,9 +3593,8 @@ private:
         const auto lines = ipc::SerializeSnapshot(s);
         if (lines == snapLines_) return;                // nothing visible changed
         snapLines_ = lines;
-        const bool keyChanged = snap_.pubKey != s.pubKey;
         snap_ = s;
-        if (keyChanged) UpdateHeader();
+        UpdateHeader();                                 // pubkey, connection state and input problems
         UpdateTitle();                                  // the daemon's version arrives with the first snapshot
         if (daemonWanted_ && connected_ && !mismatchAsked_ && s.version != appver::Full()) {
             mismatchAsked_ = true;                      // once; a failed restart or a restart that still mismatches asks again
