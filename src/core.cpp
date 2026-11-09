@@ -166,7 +166,6 @@ bool Core::Start(std::string* err)
         [this](int id, const std::string& line) { net_->Send(id, line); },
         [this](const std::string& msg) { Post([this, msg] { Log("Input: " + msg); }); });
     input_->SetLocalMonitors(mons_);
-    input_->onCursorToPeer = [this](int id) { Post([this, id] { OnCursorToPeer(id); }); };
     input_->onModeChange = [this](InputEngine::Mode m, int id) {
         Post([this, m, id] { inputMode_ = m; inputPeer_ = id; Changed(); });
     };
@@ -184,11 +183,16 @@ bool Core::Start(std::string* err)
         ClipShare::Hooks h;
         h.send = [this](int id, const std::string& line) { if (net_) net_->Send(id, line); };
         h.log = [this](const std::string& m) { PostLog(m); };
+        h.applied = [this] { clipWatchRebase_ = true; };       // our own write is not a copy by the user
         clip_ = std::make_unique<ClipShare>(dir_ / "incoming", std::move(h));
+        clip_->SetOrigin(net_->Instance());
         std::ifstream f(dir_ / "clipboard.txt");
         std::string k;
         unsigned long long v = 0;
-        if (f >> k >> v && k == "limit") clip_->SetLimit(v);
+        while (f >> k >> v) {
+            if (k == "limit") clip_->SetLimit(v);
+            else if (k == "telemetry") clipTelemetry_ = v != 0;
+        }
     }
 
     Post([this] {
@@ -207,6 +211,7 @@ bool Core::Start(std::string* err)
     });
     net_->SetGroup(groupPwd_);
     net_->Start();
+    StartClipWatch();
 
     ScheduleTick();
     return true;
@@ -215,6 +220,7 @@ bool Core::Start(std::string* err)
 void Core::Stop()
 {
     if (!running_.exchange(false)) return;
+    StopClipWatch();
 
     // Persist whatever is pending, on the Core thread, before the engines go away.
     {
@@ -251,7 +257,13 @@ void Core::Tick()
 {
     const auto now = Clock::now();
     if (cfgDirty_ && now - dirtyAt_ > std::chrono::milliseconds(600)) FlushConfig();
+    {
+        bool any = false;                                       // the watcher only polls while there is somebody to share with
+        for (const auto& kv : peers_) any = any || kv.second.placed;
+        clipWatchActive_ = any;
+    }
     if (++ticks_ % 4 != 0) return;
+    PollMonitors();
 
     bool removed = false;
     for (auto it = disc_.begin(); it != disc_.end();) {
@@ -280,6 +292,7 @@ state::Snapshot Core::GetSnapshot() const
     s.version = appver::Full();
     s.group = groupPwd_;
     s.clipLimit = clip_ ? clip_->Limit() : ClipShare::kDefaultLimit;
+    s.clipTelemetry = clipTelemetry_;
     s.inputCanInject = canInject_;
     s.inputNote = inputNote_;
     s.mons = mons_;
@@ -330,14 +343,21 @@ void Core::CmdMonitorsHint(const std::vector<InputRect>& hint)
     if (h.empty() || SameRects(h, mons_)) return;
     if (!preferHint_ && monsSource_ == "system") return;
 
-    mons_ = h;
-    monsSource_ = "window";
-    {
+    ApplyLocalMonitors(h, "window", true);
+}
+
+// Called when this PC's monitors really changed. Everything that knows about the geometry is told:
+// the layout, the input engine (keyboard / mouse edges), every connected PC and the window.
+void Core::ApplyLocalMonitors(const std::vector<InputRect>& mons, const char* source, bool persist)
+{
+    mons_ = mons;
+    monsSource_ = source;
+    if (persist) {
         std::ofstream out(dir_ / "monitors.txt", std::ios::trunc);
         for (const auto& r : mons_) out << r.x << " " << r.y << " " << r.w << " " << r.h << "\n";
     }
     layout_.SetLocal(mons_);
-    if (input_) {
+    if (input_) {                                       // the backends read the geometry when they start
         input_->Stop();
         input_->SetLocalMonitors(mons_);
         std::string msg;
@@ -345,9 +365,40 @@ void Core::CmdMonitorsHint(const std::vector<InputRect>& hint)
         if (!started) Log("Keyboard/mouse sharing unavailable: " + msg);
         RefreshInputStatus(started, msg);
     }
-    Log("Learned this PC's monitor layout from the window (" + std::to_string(mons_.size()) + " monitor(s))");
-    if (!peers_.empty() && net_) net_->SetGroup(groupPwd_);    // reconnect: peers learn the new geometry
+    std::string desc;
+    for (const auto& m : mons_) desc += (desc.empty() ? "" : " + ") + std::to_string(m.w) + "x" + std::to_string(m.h);
+    Log(std::string("Monitor layout changed (") + source + "): " + std::to_string(mons_.size()) + " monitor(s): " + desc);
+    if (net_) for (const auto& kv : peers_) net_->Send(kv.first, ScreensLine());    // peers update their picture of this PC
+    ReplacePeersAfterMonitorChange();
     Changed();
+}
+
+// The shape of this PC's desktop changed, so a peer may now overlap one of the new monitors: PCs that this
+// PC placed are pushed out of the way and told. (The other PCs decide for themselves when they get our SCREENS.)
+void Core::ReplacePeersAfterMonitorChange()
+{
+    for (const auto& kv : peers_) {
+        const state::Peer& p = kv.second;
+        double x = 0, y = 0;
+        if (!p.placed || !p.incoming || !layout_.PeerPos(kv.first, x, y)) continue;
+        const auto pos = layout_.PlacePeer(kv.first, x, y);
+        SendPos(kv.first, pos.first, pos.second);
+        BroadcastRelative(kv.first);
+    }
+}
+
+// Windows and X11 can tell the daemon about monitor changes itself, so it asks once a second. A change
+// has to be seen twice in a row: while a resolution or a rotation is being switched the OS passes through
+// odd states that must not reshuffle the layout.
+void Core::PollMonitors()
+{
+    if (preferHint_ || !running_) return;               // Wayland: the window reports (MONITORS)
+    auto nat = monitors::Native();
+    if (nat.size() > 16) nat.resize(16);
+    if (nat.empty() || SameRects(nat, mons_)) { pendingMons_.clear(); return; }
+    if (!SameRects(nat, pendingMons_)) { pendingMons_ = nat; return; }
+    pendingMons_.clear();
+    ApplyLocalMonitors(nat, "system", false);
 }
 
 // ------------------------------------------------------------------ commands
@@ -510,7 +561,7 @@ void Core::CmdClipboard(int id, bool share)
     state::Peer& p = it->second;
     if (p.clip == share) return;
     p.clip = share;
-    if (clip_) clip_->ForgetSent(id);   // switching it on sends the current clipboard at the next crossing
+    if (clip_) clip_->ForgetSent(id);   // switching it on sends the next thing copied here
     if (share && clipboard::Backend().empty())
         Log("Clipboard sharing needs xclip, xsel or wl-clipboard on this PC");
     else if (share && !clipboard::FilesSupported())
@@ -599,7 +650,6 @@ void Core::OnMessage(int id, const std::string& line)
     if (clip_ && clip_->HandleLine(id, p.name, p.clip || trust_->Get(p.key) == TrustStore::State::Allowed, line)) return;
 
     if (line.rfind("SCREENS ", 0) == 0) {
-        if (p.placed) return;
         std::istringstream is(line.substr(8));
         int n = 0;
         is >> n;
@@ -610,6 +660,26 @@ void Core::OnMessage(int id, const std::string& line)
             if (w > 0 && h > 0) mons.push_back({x, y, w, h});
         }
         if (mons.empty()) mons.push_back({0, 0, 1920, 1080});
+        if (p.placed) {                     // it announced its monitors again: they changed
+            if (SameRects(mons, p.mons)) return;
+            p.mons = mons;
+            layout_.UpdatePeerMons(id, mons);
+            double x = 0, y = 0;
+            if (layout_.PeerPos(id, x, y)) {
+                if (p.incoming) {           // we place this PC: keep it where it was, unless it now overlaps something
+                    const auto pos = layout_.PlacePeer(id, x, y);
+                    x = pos.first;
+                    y = pos.second;
+                }
+                input_->SetPeer(id, mons, x, y);
+                if (p.incoming) { SendPos(id, x, y); BroadcastRelative(id); }
+            }
+            std::string desc;
+            for (const auto& m : mons) desc += (desc.empty() ? "" : " + ") + std::to_string(m.w) + "x" + std::to_string(m.h);
+            Log(p.name + " changed its monitors: " + std::to_string(mons.size()) + " monitor(s): " + desc);
+            Changed();
+            return;
+        }
         p.mons = mons;
         p.placed = true;
 
@@ -914,35 +984,106 @@ std::string Core::ClipBlocker(const state::Peer& p) const
                "), this PC runs build " + appver::kBuildId + " (protocol " + std::to_string(ClipShare::kProtocol) +
                "): restart the daemon on the PC with the older build";
     if (std::chrono::steady_clock::now() - p.readyAt < std::chrono::seconds(3))
-        return "still waiting for " + p.name + " to report its version, it works at the next crossing";
+        return "still waiting for " + p.name + " to report its version, it works at the next copy";
     return p.name + " did not report a version: it runs an old build, or an old daemon is still running there. "
            "Stop it (seamless-input-daemon --stop) and start build " + appver::kBuildId;
 }
 
 // ------------------------------------------------------------------ clipboard sharing
-// The work is done by ClipShare (clipshare.hpp). Core decides WHEN: the cursor moved over to a peer
-// we share the clipboard with.
-void Core::OnCursorToPeer(int id)
+// The work is done by ClipShare (clipshare.hpp). Core decides WHEN: the moment the user copies something
+// on this PC, the new clipboard goes to every PC it is shared with. A small thread watches the system
+// clipboard for changes (Windows: its sequence number; Linux: a hash of what the clipboard tool prints).
+void Core::StartClipWatch()
 {
-    auto it = peers_.find(id);
-    if (it == peers_.end() || !net_ || !clip_) return;
-    const state::Peer& p = it->second;
-    if (!p.clip || !p.placed || clipboard::Backend().empty()) return;
-    const std::string blocked = ClipBlocker(p);
-    if (!blocked.empty()) { Log("Clipboard not sent to " + p.name + ": " + blocked); return; }
-    clip_->SendTo(id, p.name);
+    if (clipWatch_.joinable() || clipboard::Backend().empty()) return;
+    clipWatchRun_ = true;
+    clipWatch_ = std::thread([this] { ClipWatchLoop(); });
+}
+
+void Core::StopClipWatch()
+{
+    clipWatchRun_ = false;
+    if (clipWatch_.joinable()) clipWatch_.join();
+}
+
+void Core::ClipWatchLoop()
+{
+#ifdef _WIN32
+    constexpr int kPollMs = 100;        // GetClipboardSequenceNumber costs nothing
+#else
+    constexpr int kPollMs = 700;        // every poll runs the clipboard tool
+#endif
+    auto pause = [this](int ms) {
+        for (int i = 0; i < ms && clipWatchRun_; i += 20) std::this_thread::sleep_for(std::chrono::milliseconds(20));
+    };
+    std::uint64_t last = 0;
+    bool armed = false;
+    while (clipWatchRun_) {
+        pause(kPollMs);
+        if (!clipWatchActive_) { armed = false; continue; }     // alone: no tool is run, and what is on the clipboard when a PC connects is not sent
+        std::uint64_t t = clipboard::ChangeToken();
+        if (t == 0) continue;
+        if (!armed || clipWatchRebase_.exchange(false)) { last = t; armed = true; continue; }
+        if (t == last) continue;
+#ifdef _WIN32
+        // many programs write the clipboard several times in a row: wait until it is quiet
+        for (int i = 0; i < 10 && clipWatchRun_; ++i) {
+            pause(100);
+            const std::uint64_t t2 = clipboard::ChangeToken();
+            if (t2 == t) break;
+            t = t2;
+        }
+#endif
+        last = t;
+        Post([this] { OnLocalClipboardChanged(); });
+    }
+}
+
+void Core::OnLocalClipboardChanged()
+{
+    if (!net_ || !clip_ || clipboard::Backend().empty()) return;
+    std::vector<ClipShare::Target> targets;
+    for (const auto& kv : peers_) {
+        const state::Peer& p = kv.second;
+        if (!p.clip || !p.placed) continue;
+        const std::string blocked = ClipBlocker(p);
+        if (!blocked.empty()) { Log("Clipboard not sent to " + p.name + ": " + blocked); continue; }
+        targets.push_back({kv.first, p.name});
+    }
+    clip_->SendToAll(targets);          // also cancels uploads / downloads of older clipboards when there is nobody to send to
+}
+
+state::ClipActivity Core::GetClipActivity()
+{
+    state::ClipActivity a;
+    if (!clip_) return a;
+    for (const auto& t : clip_->Activity()) a.items.push_back({t.upload, t.peer, t.done, t.total, t.finished});
+    return a;
+}
+
+void Core::SaveClipSettings()
+{
+    std::ofstream f(dir_ / "clipboard.txt", std::ios::trunc);
+    if (!f) { Log("Could not save the clipboard settings"); return; }
+    f << "limit " << (clip_ ? clip_->Limit() : ClipShare::kDefaultLimit) << "\n";
+    f << "telemetry " << (clipTelemetry_ ? 1 : 0) << "\n";
 }
 
 void Core::CmdClipLimit(std::uint64_t bytes)
 {
     if (!clip_) return;
     clip_->SetLimit(bytes);
-    const std::uint64_t v = clip_->Limit();         // clamped
-    {
-        std::ofstream f(dir_ / "clipboard.txt", std::ios::trunc);
-        if (f) f << "limit " << v << "\n";
-        else Log("Could not save the clipboard limit");
-    }
-    Log("Clipboard limit: " + ClipShare::FormatBytes(v));
+    SaveClipSettings();
+    Log("Clipboard limit: " + ClipShare::FormatBytes(clip_->Limit()));    // clamped
+    Changed();
+}
+
+void Core::CmdClipTelemetry(bool on)
+{
+    if (on == clipTelemetry_) return;
+    clipTelemetry_ = on;
+    SaveClipSettings();
+    Log(on ? "Clipboard telemetry on: a popup shows the progress of clipboard uploads and downloads"
+           : "Clipboard telemetry off");
     Changed();
 }

@@ -146,6 +146,11 @@ struct DropFilesHeader {                    // DROPFILES
 std::string Backend() { return "Windows clipboard"; }
 bool FilesSupported() { return true; }
 
+std::uint64_t ChangeToken()
+{
+    return (std::uint64_t)GetClipboardSequenceNumber();     // 0 only when the window station denies access
+}
+
 bool GetText(std::string& out, std::size_t maxBytes)
 {
     out.clear();
@@ -510,6 +515,45 @@ bool GnomeStyleDesktop()
 std::string Backend() { return Pick().name; }
 bool FilesSupported() { return Pick().files; }
 
+namespace {
+
+// FNV-1a over everything the command prints (only the first 4 MiB are hashed, the length is mixed in).
+// Nothing is kept in memory, so a huge text on the clipboard costs time but not memory.
+std::uint64_t HashCommand(const std::string& cmd, std::uint64_t h)
+{
+    FILE* p = popen(cmd.c_str(), "r");
+    if (!p) return h;
+    char buf[8192];
+    std::size_t n, total = 0;
+    while ((n = std::fread(buf, 1, sizeof buf, p)) > 0) {
+        for (std::size_t i = 0; i < n && total + i < (4u << 20); ++i) { h ^= (unsigned char)buf[i]; h *= 1099511628211ull; }
+        total += n;
+    }
+    pclose(p);
+    h ^= (std::uint64_t)total;
+    h *= 1099511628211ull;
+    return h;
+}
+
+} // namespace
+
+std::uint64_t ChangeToken()
+{
+    const Tools& t = Pick();
+    if (t.name.empty()) return 0;
+    std::uint64_t h = 1469598103934665603ull;
+    std::string types;
+    bool files = false;
+    if (!t.list.empty() && RunRead(t.list, 64 * 1024, types)) {
+        for (unsigned char c : types) { h ^= c; h *= 1099511628211ull; }
+        const bool gnome = types.find("x-special/gnome-copied-files") != std::string::npos;
+        const bool uri = types.find("text/uri-list") != std::string::npos;
+        if (t.files && (gnome || uri)) { files = true; h = HashCommand(gnome ? t.readGnome : t.readUri, h); }
+    }
+    if (!files) h = HashCommand(t.get, h);
+    return h ? h : 1;
+}
+
 bool GetText(std::string& out, std::size_t maxBytes)
 {
     out.clear();
@@ -572,6 +616,7 @@ bool SetFiles(const std::vector<std::filesystem::path>& files)
 #else
 std::string Backend() { return {}; }
 bool FilesSupported() { return false; }
+std::uint64_t ChangeToken() { return 0; }
 bool GetText(std::string& out, std::size_t) { out.clear(); return false; }
 bool SetText(const std::string&) { return false; }
 bool GetFiles(std::vector<std::filesystem::path>& f) { f.clear(); SetNote("files are not supported on this platform"); return false; }

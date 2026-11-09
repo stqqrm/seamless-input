@@ -1,10 +1,18 @@
 #pragma once
 // Clipboard sharing between PCs: text, files and whole folders, across operating systems.
 //
-// A PC whose cursor just moved over to a peer calls SendTo(): it reads its own clipboard and, if there
-// is something there, streams it to the peer over the encrypted control connection. The peer stores
-// what it receives in its own "incoming" folder (names made valid for ITS operating system) and puts
-// it on its clipboard as "copied", so a normal paste in the file manager copies it.
+// A PC whose clipboard just changed (the user copied something) calls SendToAll(): it reads its own
+// clipboard and streams it, at once, to every PC it shares its clipboard with, over the encrypted control
+// connection. The peer stores what it receives in its own "incoming" folder (names made valid for ITS
+// operating system) and puts it on its clipboard as "copied", so a normal paste in the file manager
+// copies it.
+//
+// The newest copy wins everywhere. Every copy gets a stamp (milliseconds since 1970, never going back,
+// plus the id of the PC that made it). A new copy on this PC cancels every upload and download that is
+// still running here (the other PCs are told), and a PC that receives an offer with a newer stamp
+// cancels its own uploads and downloads as well, then takes the newer clipboard. An offer older than the
+// clipboard a PC already holds is refused (OLDER), so two PCs that copy at the same moment end up with
+// the same clipboard instead of swapping.
 //
 // Folders: the sender walks every folder on the clipboard (never following symbolic links to folders),
 // adding up the sizes while it goes. The walk stops as soon as the limit (Network tab) or the item
@@ -12,10 +20,12 @@
 // Several peers can be served at the same time; the folder walk is done once and shared.
 //
 // Wire protocol (inner lines; the Session encrypts every line):
-//   CLIPO <xfer> <items> <total bytes> <sig>     offer                       sender -> receiver
+//   CLIPO <xfer> <items> <total bytes> <sig> <stamp> <origin>
+//                                                offer                       sender -> receiver
 //   CLIPA <xfer>                                 accepted                    receiver -> sender
 //   CLIPS <xfer>                                 "my clipboard already holds exactly this"
-//   CLIPN <xfer> LIMIT <bytes>|DENIED|DISK|ERROR refused                     receiver -> sender
+//   CLIPN <xfer> LIMIT <bytes>|DENIED|DISK|OLDER|ERROR
+//                                                refused                     receiver -> sender
 //   CLIPI <xfer> <idx> <T|F|D> <size> <b64 name> next item: text, file or folder   sender -> receiver
 //         (name = path relative to the clipboard root, '/' separated; a folder is always sent
 //          before the things inside it)
@@ -25,10 +35,11 @@
 //   CLIPF <xfer>                                 everything sent             sender -> receiver
 //   CLIPR <xfer>                                 it is on my clipboard now   receiver -> sender (confirmation)
 //   CLIPX <xfer>                                 abort / could not use it    either way
+//                                                (also: "I copied something newer, stop")
 // The sender never has more than 64 chunks (2 MiB) or 256 items in flight, so input events on the same
 // connection are delayed by milliseconds at most and memory use stays small.
 //
-// Threading: SendTo / HandleLine / PeerLost / Forget* are called from ONE thread (the Core loop).
+// Threading: SendToAll / HandleLine / PeerLost / Forget* / Activity are called from ONE thread (the Core loop).
 // The hooks may be called from any thread. Every outgoing transfer has its own worker thread.
 #include <atomic>
 #include <chrono>
@@ -50,7 +61,7 @@ class ClipShare {
 public:
     // Bump when the clipboard wire protocol changes. Shown in the startup log so an old daemon that is
     // still running (it keeps running after an update) can be told apart from the new one.
-    static constexpr int kProtocol = 4;
+    static constexpr int kProtocol = 5;
     static constexpr std::uint64_t kDefaultLimit = 1ull << 30;     // 1 GiB
     static constexpr std::uint64_t kMinLimit     = 1ull << 10;     // 1 KiB
     static constexpr std::uint64_t kMaxLimit     = 1ull << 40;     // 1 TiB
@@ -64,6 +75,19 @@ public:
         std::function<bool(std::string&, std::size_t)> getText;
         std::function<bool(const std::vector<std::filesystem::path>&)> setFiles;
         std::function<bool(const std::string&)> setText;
+        // Called (Core thread) right after received data was put on this PC's clipboard, so the clipboard
+        // watcher does not take that write for a copy made by the user.
+        std::function<void()> applied;
+    };
+
+    struct Target { int peer = 0; std::string name; };
+
+    // What the progress popup shows ("Clipboard telemetry" in the settings).
+    struct Transfer {
+        bool upload = false;             // false: download
+        std::string peer;
+        std::uint64_t done = 0, total = 0;   // bytes (items when the transfer has no bytes); total 0: size not known yet
+        bool finished = false;           // just completed (shown for a moment at 100 %)
     };
 
     ClipShare(std::filesystem::path incomingDir, Hooks hooks);
@@ -72,9 +96,17 @@ public:
     void SetLimit(std::uint64_t bytes);                // clamped to [kMinLimit, kMaxLimit]
     std::uint64_t Limit() const { return limit_.load(); }
 
-    // The cursor moved over to 'peer': send the local clipboard to it (the peer says "already have it"
-    // when its own clipboard still holds exactly this).
-    void SendTo(int peer, const std::string& peerName);
+    // This PC's id in the stamps of its copies (the network instance id); call once before use.
+    void SetOrigin(std::uint32_t origin) { origin_ = origin; }
+
+    // The user copied something on this PC. Cancels every upload and download that is running (this
+    // clipboard is newer than all of them) and sends the new clipboard to 'targets' at once. The peer
+    // says "already have it" when its own clipboard still holds exactly this. With no targets it only
+    // does the cancelling.
+    void SendToAll(const std::vector<Target>& targets);
+
+    // Uploads and downloads that are running now, plus the ones that finished a moment ago.
+    std::vector<Transfer> Activity();
 
     // Handles every line starting with "CLIP". 'mayWrite': this peer may put data on our clipboard.
     // Returns true when the line was a clipboard line (even a malformed one).
@@ -123,7 +155,7 @@ private:
         int peer = 0;
         std::uint64_t xfer = 0;
         std::string peerName;
-        Raw raw;
+        std::shared_ptr<const Raw> raw;        // shared by the uploads to all peers
         std::atomic<bool> ok{false};     // everything was sent
         std::atomic<bool> delivered{false};   // the other PC confirmed (CLIPR)
         std::mutex m;
@@ -134,6 +166,13 @@ private:
         std::int64_t itemsAcked = 0;     // items the receiver has completed
         std::atomic<bool> cancel{false};
         std::atomic<bool> done{false};
+        std::atomic<bool> superseded{false};   // stopped because a newer clipboard exists: tell the receiver (CLIPX)
+        std::uint64_t stamp = 0;               // this copy's stamp (the same for every peer)
+        std::chrono::steady_clock::time_point started{};
+        // progress, for the popup
+        std::atomic<int> tel{0};               // 0 not shown, 1 sending, 2 sent / waiting for the confirmation, 3 over
+        std::atomic<std::uint64_t> sent{0}, totalUnits{0};
+        std::atomic<long long> sentAtMs{0};    // steady clock, when tel became 2
         std::thread th;
     };
     struct In {
@@ -155,7 +194,14 @@ private:
         std::uint32_t nFiles = 0, nDirs = 0;
         std::string peerName;
         std::string sig;                 // the sender's signature of this clipboard (see AlreadyHas)
+        std::chrono::steady_clock::time_point started{};
     };
+    struct Stamp {
+        std::uint64_t t = 0;
+        std::uint32_t origin = 0;
+        bool operator<(const Stamp& o) const { return t != o.t ? t < o.t : origin < o.origin; }
+    };
+    struct Recent { bool upload; std::string peer; std::uint64_t total; std::chrono::steady_clock::time_point at; };
     struct Got { std::string sig; std::vector<std::filesystem::path> files; };   // what we last put on the clipboard
     struct ScanEntry {
         std::string key;
@@ -164,10 +210,18 @@ private:
         bool finished = false;
     };
 
-    bool ReadClipboard(Raw& raw, std::string& info);               // Core thread
+    bool ReadClipboard(Raw& raw, std::string& info, bool* echo = nullptr);   // Core thread
     PlanPtr GetPlan(Out& o);                                       // worker thread: walks once, shared
     PlanPtr Scan(const Raw& raw, std::uint64_t limit, const std::atomic<bool>& cancel);
     void RunOut(std::shared_ptr<Out> o);
+    void StartOut(const Target& t, const Raw& raw, std::uint64_t stamp);
+    // Stops every upload (a newer clipboard exists). Core thread.
+    void CancelOuts(const std::string& why);
+    // Drops every download; 'except' keeps the one from that peer (-1: none).
+    void AbortAllIn(bool notify, const std::string& why, int except = -1);
+    void ReapOld();                                                // joins finished cancelled uploads
+    std::uint64_t NextStamp();
+    void AddRecent(bool upload, const std::string& peer, std::uint64_t total);
 
     void OnOffer(int peer, const std::string& peerName, bool mayWrite, std::uint64_t xfer, std::istream& is);
     void OnItem(int peer, std::uint64_t xfer, std::istream& is);
@@ -185,12 +239,18 @@ private:
 
     std::filesystem::path incoming_;
     Hooks h_;
+    std::uint32_t origin_ = 0;
+    std::uint64_t lastStamp_ = 0;                      // Core thread only
+    Stamp current_;                                    // stamp of the clipboard this PC holds (Core thread only)
+    std::string appliedSig_;                           // text we put on the clipboard ourselves (Core thread only)
     std::atomic<std::uint64_t> limit_{kDefaultLimit};
     std::atomic<std::uint64_t> nextXfer_;
     std::uint64_t dirSeq_ = 0;                         // Core thread only: short folder names keep paths short on Windows
 
     std::mutex mtx_;                                   // out_
     std::map<int, std::shared_ptr<Out>> out_;
+    std::vector<std::shared_ptr<Out>> old_;            // cancelled uploads whose thread is still ending
+    std::vector<Recent> recent_;
     std::mutex scanMtx_;                               // scans_
     std::vector<ScanEntry> scans_;
     std::map<int, std::unique_ptr<In>> in_;            // Core thread only

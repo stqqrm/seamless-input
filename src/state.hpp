@@ -50,6 +50,7 @@ struct Snapshot {
     std::string inputNote;               // why keyboard/mouse sharing is limited or unavailable ("" = fine)
     std::string group;                   // group password ("" = none)
     std::uint64_t clipLimit = 1ull << 30; // largest clipboard (text / files) copied to another PC, in bytes
+    bool clipTelemetry = false;          // show the progress popup while the clipboard is uploaded / downloaded
     std::vector<InputRect> mons;         // this PC's monitors
     bool masterMute = false;
     int  masterVol = 100;
@@ -72,6 +73,18 @@ struct PeerAudioStat {
 struct Stats {
     float input = 0;
     std::vector<PeerAudioStat> peers;
+};
+
+// One clipboard upload or download, for the progress popup ("Clipboard telemetry").
+struct ClipTransfer {
+    bool upload = false;                 // false: download
+    std::string peer;
+    std::uint64_t done = 0, total = 0;   // total 0: size not known yet
+    bool finished = false;               // completed a moment ago (shown at 100 %)
+};
+
+struct ClipActivity {
+    std::vector<ClipTransfer> items;     // empty: nothing is being transferred
 };
 
 } // namespace state

@@ -139,6 +139,8 @@ private:
             c.CmdControl((int)I(1), I(2) != 0);
         } else if (cmd == "CLIPBOARD" && t.size() >= 3) {
             c.CmdClipboard((int)I(1), I(2) != 0);
+        } else if (cmd == "CLIPTELEMETRY" && t.size() >= 2) {
+            c.CmdClipTelemetry(I(1) != 0);
         } else if (cmd == "CLIPLIMIT" && t.size() >= 2) {
             c.CmdClipLimit((std::uint64_t)std::strtoull(t[1].c_str(), nullptr, 10));
         } else if (cmd == "CLEARCACHE") {
@@ -230,6 +232,7 @@ void Server::Pump()
         if (ec || stopped_) return;
         if (dirty_) { dirty_ = false; BroadcastSnapshot(); }
         if (++pumpTicks_ % 5 == 0) BroadcastStats();
+        if (pumpTicks_ % 2 == 0) BroadcastClipActivity();
         Pump();
     });
 }
@@ -253,6 +256,19 @@ void Server::BroadcastStats()
 {
     if (AttachedCount() == 0) return;
     const std::string l = SerializeStats(core_.GetStats());
+    for (const auto& s : sessions_) if (s->attached) s->Send(l);
+}
+
+// Progress of clipboard uploads / downloads for the popup. Nothing is sent while the setting is off or
+// nothing is going on; when the last transfer ends one empty line tells the window to hide the popup.
+void Server::BroadcastClipActivity()
+{
+    if (AttachedCount() == 0) { telemetryShown_ = false; return; }
+    state::ClipActivity a;
+    if (core_.ClipTelemetryEnabled()) a = core_.GetClipActivity();
+    if (a.items.empty() && !telemetryShown_) return;
+    telemetryShown_ = !a.items.empty();
+    const std::string l = SerializeClipActivity(a);
     for (const auto& s : sessions_) if (s->attached) s->Send(l);
 }
 

@@ -44,6 +44,7 @@ Per user, in `%APPDATA%\seamless-input` or `~/.local/share/seamless-input`:
 - `daemon.log` (rotated at 1 MB)
 - `ipc.token` (owner-only; the window uses it to talk to the daemon)
 - `monitors.txt` (monitor layout learned from the window, used on Wayland)
+- `clipboard.txt` (clipboard size limit and the *Clipboard telemetry* switch)
 - the existing identity, configs, trust and group files
 
 Windows service supervisor log: `%ProgramData%\seamless-input-service.log`.
@@ -61,3 +62,22 @@ Windows and a Linux checkout of the same code agree). There is no number to bump
 new id. When two PCs report different ids a "versions do not match" message appears; only a different
 *clipboard protocol* (`ClipShare::kProtocol`, bump it by hand when the wire format changes) switches
 clipboard sharing off. Built without CMake the id is `dev`.
+
+## Clipboard sharing and telemetry
+
+- The clipboard is sent **when you copy**, not when the cursor crosses: a watcher thread notices the change
+  (Windows: clipboard sequence number; Linux: hash of the clipboard tool's output, polled every 0.7 s while
+  PCs are connected) and uploads straight to every PC that has *Share my clipboard* on.
+- **Newest copy wins.** A copy on one PC cancels every upload/download still running on that PC and on the
+  PCs that receive its offer; an offer older than what a PC already holds is refused (`OLDER`). Two PCs that
+  copy at the same moment end up with the same clipboard. Protocol version is now 5: update all PCs.
+- *Settings -> Clipboard telemetry*: a semi-transparent popup (progress bar, "Uploading" / "Downloading") in the
+  top right corner of the monitor under the mouse, only on PCs that are transferring. It is drawn by the
+  window, so keep the window open (minimized is fine). Finished transfers stay visible for ~1.5 s, and the
+  daemon log now shows how long each transfer took.
+
+## Monitor changes
+
+The daemon re-reads the monitors once a second (Windows, X11; the window reports them on Wayland). A change
+(plug, unplug, rotate, resolution) seen twice in a row updates the layout, restarts the input edges, and is
+sent to the other PCs without reconnecting; PCs that now overlap a new monitor are pushed aside.

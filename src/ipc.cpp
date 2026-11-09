@@ -69,7 +69,7 @@ std::vector<std::string> SerializeSnapshot(const state::Snapshot& s)
     for (const auto& m : s.mons)
         v.push_back("M " + std::to_string(m.x) + " " + std::to_string(m.y) + " " + std::to_string(m.w) + " " + std::to_string(m.h));
     v.push_back("G " + Enc(s.group));
-    v.push_back("Q " + std::to_string(s.clipLimit));
+    v.push_back("Q " + std::to_string(s.clipLimit) + " " + b(s.clipTelemetry));
     v.push_back(std::string("X ") + b(s.inputCanInject) + " " + Enc(s.inputNote));
     v.push_back(std::string("A ") + b(s.masterMute) + " " + std::to_string(s.masterVol) + " " + b(s.sysCapturing) + " " +
                 b(s.micCapturing) + " " + b(s.scanning));
@@ -111,6 +111,7 @@ bool ParseSnapshotLine(const std::vector<std::string>& t, state::Snapshot& s)
         s.inputNote = S(2);
     } else if (k == "Q") {
         s.clipLimit = t.size() > 1 ? (std::uint64_t)std::strtoull(t[1].c_str(), nullptr, 10) : (1ull << 30);
+        s.clipTelemetry = I(2) != 0;
     } else if (k == "A" && t.size() >= 6) {
         s.masterMute = I(1) != 0; s.masterVol = (int)I(2); s.sysCapturing = I(3) != 0; s.micCapturing = I(4) != 0; s.scanning = I(5) != 0;
     } else if (k == "I" && t.size() >= 3) {
@@ -163,6 +164,33 @@ bool ParseStats(const std::vector<std::string>& t, state::Stats& st)
         a.kbps = std::atof(t[o + 2].c_str());
         a.level = (float)std::atof(t[o + 3].c_str());
         st.peers.push_back(a);
+    }
+    return true;
+}
+
+std::string SerializeClipActivity(const state::ClipActivity& a)
+{
+    std::string l = "CT " + std::to_string(a.items.size());
+    for (const auto& t : a.items)
+        l += std::string(" ") + (t.upload ? "1" : "0") + " " + Enc(t.peer) + " " + std::to_string(t.done) + " " +
+             std::to_string(t.total) + " " + (t.finished ? "1" : "0");
+    return l;
+}
+
+bool ParseClipActivity(const std::vector<std::string>& t, state::ClipActivity& a)
+{
+    if (t.size() < 2 || t[0] != "CT") return false;
+    a = {};
+    const long long n = ToInt(t[1]);
+    for (long long i = 0; i < n && 2 + (size_t)i * 5 + 4 < t.size(); ++i) {
+        const size_t o = 2 + (size_t)i * 5;
+        state::ClipTransfer c;
+        c.upload = ToInt(t[o]) != 0;
+        c.peer = Dec(t[o + 1]);
+        c.done = (std::uint64_t)std::strtoull(t[o + 2].c_str(), nullptr, 10);
+        c.total = (std::uint64_t)std::strtoull(t[o + 3].c_str(), nullptr, 10);
+        c.finished = ToInt(t[o + 4]) != 0;
+        a.items.push_back(std::move(c));
     }
     return true;
 }
@@ -277,6 +305,7 @@ struct Client::Impl {
         if (t[0] == "SB") { cur = {}; inSnap = true; return; }
         if (t[0] == "SE") { if (inSnap && h.onSnapshot) h.onSnapshot(cur); inSnap = false; return; }
         if (t[0] == "ST") { state::Stats st; if (ParseStats(t, st) && h.onStats) h.onStats(st); return; }
+        if (t[0] == "CT") { state::ClipActivity ca; if (ParseClipActivity(t, ca) && h.onClipActivity) h.onClipActivity(ca); return; }
         if (inSnap) ParseSnapshotLine(t, cur);
     }
 

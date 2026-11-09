@@ -171,6 +171,18 @@ public:
         peers_.push_back(g);
         Refresh();
     }
+    // The peer's monitors changed (plugged, unplugged, rotated): same place, new shape.
+    void SetPeerMons(int id, const std::vector<wxRect>& mons)
+    {
+        Group* g = Find(id);
+        if (!g) return;
+        Group n = MakeGroup(id, g->name, g->addr, mons);
+        if (n.size == g->size && n.mons == g->mons) return;
+        n.ox = g->ox;
+        n.oy = g->oy;
+        *g = std::move(n);
+        Refresh();
+    }
     bool HasPeer(int id) const { for (const auto& g : peers_) if (g.id == id) return true; return false; }
     bool IsDragging(int id) const { return dragId_ == id; }
     std::vector<int> PeerIds() const { std::vector<int> v; for (const auto& g : peers_) v.push_back(g.id); return v; }
@@ -2183,6 +2195,195 @@ private:
 };
 
 // ============================================================================
+// Clipboard telemetry popup
+// ============================================================================
+// A small semi-transparent window with a progress bar ("Uploading" / "Downloading") that is shown while this
+// PC sends or receives the clipboard. It sits in the top right corner of the monitor the mouse cursor is on
+// and moves to another monitor when the cursor does. It never takes the focus (on Windows clicks go through it).
+class TelemetryPopup : public wxFrame {
+public:
+    explicit TelemetryPopup(const Theme& t)
+        : wxFrame(nullptr, wxID_ANY, "seamless-input clipboard", wxDefaultPosition, wxDefaultSize,
+                  wxFRAME_NO_TASKBAR | wxFRAME_TOOL_WINDOW | wxSTAY_ON_TOP | wxBORDER_NONE),
+          t_(t), timer_(this)
+    {
+        SetBackgroundStyle(wxBG_STYLE_PAINT);
+        SetBackgroundColour(t.card);
+#ifdef __WXMSW__
+        {   // no activation, mouse clicks go to whatever is below
+            const HWND h = (HWND)GetHWND();
+            const LONG_PTR ex = ::GetWindowLongPtr(h, GWL_EXSTYLE);
+            ::SetWindowLongPtr(h, GWL_EXSTYLE, ex | WS_EX_NOACTIVATE | WS_EX_TRANSPARENT | WS_EX_LAYERED);
+        }
+#endif
+        SetCanFocus(false);
+        if (CanSetTransparent()) SetTransparent(kAlpha);
+        Bind(wxEVT_PAINT, &TelemetryPopup::OnPaint, this);
+        Bind(wxEVT_TIMER, [this](wxTimerEvent&) { OnTick(); });
+        SetClientSize(FromDIP(kWidth), FromDIP(kRowHeight + 2 * kPad));
+    }
+
+    ~TelemetryPopup() override { timer_.Stop(); }
+
+    // The daemon's view of what is being transferred (empty: nothing).
+    void SetActivity(const state::ClipActivity& a)
+    {
+        lastUpdate_ = std::chrono::steady_clock::now();
+        rows_.clear();
+        for (const bool up : {true, false}) {
+            Row r;
+            r.up = up;
+            bool any = false, allDone = true;
+            for (const auto& it : a.items) {
+                if (it.upload != up) continue;
+                any = true;
+                r.done += it.done;
+                r.total += it.total;
+                if (!it.finished) allDone = false;
+                if (!it.finished && it.total == 0) r.unknown = true;
+                const wxString n = wxString::FromUTF8(it.peer);
+                if (r.peers.Find(n) == wxNOT_FOUND) r.peers += (r.peers.empty() ? "" : ", ") + n;
+            }
+            r.finished = allDone;
+            if (any) rows_.push_back(std::move(r));
+        }
+        if (rows_.empty()) { HideNow(); return; }
+        SetClientSize(FromDIP(kWidth), FromDIP(kRowHeight) * (int)rows_.size() + FromDIP(2 * kPad));
+        if (!IsShown()) {
+            Reposition(true);
+            ShowWithoutActivating();
+            timer_.Start(60);
+        } else {
+            Reposition(false);
+        }
+        Refresh();
+    }
+
+    void HideNow()
+    {
+        timer_.Stop();
+        rows_.clear();
+        if (IsShown()) Hide();
+    }
+
+private:
+    struct Row {
+        bool up = true;
+        wxString peers;
+        unsigned long long done = 0, total = 0;
+        bool unknown = false;           // size not known yet: moving bar instead of a percentage
+        bool finished = false;
+    };
+
+    static constexpr int kWidth = 300, kRowHeight = 62, kPad = 8, kMargin = 16, kAlpha = 215;
+
+    static wxString Size(unsigned long long b)
+    {
+        static const char* u[] = {"B", "KiB", "MiB", "GiB", "TiB"};
+        double v = (double)b;
+        int i = 0;
+        while (v >= 1024.0 && i < 4) { v /= 1024.0; ++i; }
+        return i == 0 ? wxString::Format("%llu B", b) : wxString::Format("%.1f %s", v, u[i]);
+    }
+
+    void OnTick()
+    {
+        ++step_;
+        // Safety net: the daemon sends an empty update when the last transfer ends. If those stop arriving
+        // (connection lost), do not leave the popup on the screen.
+        if (std::chrono::steady_clock::now() - lastUpdate_ > std::chrono::seconds(4)) { HideNow(); return; }
+        Reposition(false);
+        Refresh();
+    }
+
+    // Top right corner of the monitor under the mouse cursor. With one monitor it never moves.
+    void Reposition(bool force)
+    {
+        int idx = 0;
+        if (wxDisplay::GetCount() > 1) {
+            idx = wxDisplay::GetFromPoint(wxGetMousePosition());
+            if (idx == wxNOT_FOUND) idx = lastDisplay_ >= 0 ? lastDisplay_ : 0;     // in a gap between two monitors
+        }
+        const wxRect area = wxDisplay((unsigned)idx).GetClientArea();               // without the task bar
+        const wxSize sz = GetSize();
+        const wxPoint pos(area.x + area.width - sz.x - FromDIP(kMargin), area.y + FromDIP(kMargin));
+        if (force || idx != lastDisplay_ || pos != GetPosition()) SetSize(pos.x, pos.y, wxDefaultCoord, wxDefaultCoord, wxSIZE_USE_EXISTING);
+        lastDisplay_ = idx;
+    }
+
+    void OnPaint(wxPaintEvent&)
+    {
+        wxAutoBufferedPaintDC pdc(this);
+        pdc.SetBackground(wxBrush(t_.card));
+        pdc.Clear();
+        wxGCDC dc(pdc);
+        wxGraphicsContext* gc = dc.GetGraphicsContext();
+        if (!gc) return;
+        const wxSize s = GetClientSize();
+
+        gc->SetPen(wxPen(t_.border, 1));
+        gc->SetBrush(*wxTRANSPARENT_BRUSH);
+        gc->DrawRoundedRectangle(0.5, 0.5, s.x - 1, s.y - 1, FromDIP(8));
+
+        wxFont base = GetFont();
+        wxFont bold = base;
+        bold.SetWeight(wxFONTWEIGHT_BOLD);
+        wxFont small = base;
+        small.SetPointSize(std::max(7, base.GetPointSize() - 1));
+
+        const int pad = FromDIP(kPad), side = FromDIP(14), rowH = FromDIP(kRowHeight);
+        const double barH = FromDIP(8);
+        for (size_t i = 0; i < rows_.size(); ++i) {
+            const Row& r = rows_[i];
+            const double y = pad + (double)i * rowH;
+            const double w = s.x - 2.0 * side;
+            const wxColour col = r.up ? t_.accent : t_.ok;
+
+            gc->SetFont(bold, t_.text);
+            gc->DrawText(r.up ? "Uploading" : "Downloading", side, y + FromDIP(6));
+
+            wxString pct = r.unknown ? wxString("...") : r.total ? wxString::Format("%d%%", (int)std::min<unsigned long long>(100, r.done * 100 / r.total))
+                                                                 : wxString("100%");
+            double tw = 0, th = 0;
+            gc->SetFont(bold, t_.text);
+            gc->GetTextExtent(pct, &tw, &th);
+            gc->DrawText(pct, s.x - side - tw, y + FromDIP(6));
+
+            const double by = y + FromDIP(6) + th + FromDIP(6);
+            gc->SetPen(*wxTRANSPARENT_PEN);
+            gc->SetBrush(wxBrush(t_.track));
+            gc->DrawRoundedRectangle(side, by, w, barH, barH / 2);
+            gc->SetBrush(wxBrush(col));
+            if (r.unknown || (!r.total && !r.finished)) {           // moving segment
+                const double seg = w * 0.3;
+                const double pos = std::fmod((double)step_ * 6.0, w + seg) - seg;
+                const double x0 = std::max(0.0, pos), x1 = std::min(w, pos + seg);
+                if (x1 > x0) gc->DrawRoundedRectangle(side + x0, by, x1 - x0, barH, barH / 2);
+            } else {
+                const double f = r.total ? std::min(1.0, (double)r.done / (double)r.total) : 1.0;
+                if (f > 0) gc->DrawRoundedRectangle(side, by, std::max(barH, w * f), barH, barH / 2);
+            }
+
+            wxString info = (r.up ? "to " : "from ") + r.peers;
+            if (r.total >= 1024) info += "   " + Size(r.done) + " of " + Size(r.total);
+            gc->SetFont(small, t_.sub);
+            double iw = 0, ih = 0;
+            gc->GetTextExtent(info, &iw, &ih);
+            while (iw > w && info.length() > 4) { info.RemoveLast(); gc->GetTextExtent(info + "...", &iw, &ih); }
+            if (iw > w) info += "...";
+            gc->DrawText(info, side, by + barH + FromDIP(4));
+        }
+    }
+
+    const Theme& t_;                    // the frame's theme_: assigning to it re-colours the popup
+    wxTimer timer_;
+    std::vector<Row> rows_;
+    std::chrono::steady_clock::time_point lastUpdate_{};
+    int lastDisplay_ = -1;
+    unsigned step_ = 0;
+};
+
+// ============================================================================
 // Main window
 // ============================================================================
 class MainFrame : public wxFrame {
@@ -2213,11 +2414,15 @@ public:
         h.onStats = [post, this](const state::Stats& st) {
             post([st](MainFrame* f) { if (!f->daemonWanted_) return; f->stats_ = st; f->UpdateAudioStats(); }, this);
         };
+        h.onClipActivity = [post, this](const state::ClipActivity& a) {
+            post([a](MainFrame* f) { if (f->daemonWanted_) f->OnClipActivity(a); }, this);
+        };
         h.onDisconnected = [post, this]() { post([](MainFrame* f) { f->OnDisconnected(); }, this); };
         client_ = std::make_shared<ipc::Client>(std::move(h));
 
         SetBackgroundColour(theme_.page);
         SetForegroundColour(theme_.text);
+        popup_ = new TelemetryPopup(theme_);        // hidden until the daemon reports a clipboard transfer
         auto* root = new wxBoxSizer(wxVERTICAL);
 
         // ---- menu bar (custom drawn, filled in by BuildMenu)
@@ -2274,6 +2479,13 @@ public:
         clipLimitCtl_->Bind(wxEVT_TEXT_ENTER, [this](wxCommandEvent&) { ApplyClipLimit(); });
         clipUnit_->onChange = [this](int) { ApplyClipLimit(); };
         ShowClipLimit(clipLimit_);
+        clipTelCtl_->onToggle = [this](bool on) {
+            clipTelEdited_ = std::chrono::steady_clock::now();      // do not let an old snapshot flip it back
+            clipTelOn_ = on;
+            UpdateTelemetryLabel();
+            if (!on && popup_) popup_->HideNow();
+            client_->Send(std::string("CLIPTELEMETRY ") + (on ? "1" : "0"));
+        };
 
         masterMute_->onToggle = [this](bool) { SendMaster(); };
         volSlider_->Bind(wxEVT_SLIDER, [this](wxCommandEvent&) {
@@ -2451,6 +2663,7 @@ private:
     void OnDisconnected()
     {
         connected_ = false;
+        if (popup_) popup_->HideNow();
         Log(daemonWanted_ ? "Lost the connection to the background service - reconnecting"
                           : "Background service stopped");
         retry_ = 0;
@@ -2477,12 +2690,27 @@ private:
         UpdateAudioStats();
     }
 
+    // What this window sees of the monitors. The daemon asks the OS itself (Windows, X11) and only uses this
+    // where it cannot (Wayland); it is re-sent whenever it changes, so a monitor that is plugged in or
+    // rotated while the program runs shows up in the layout.
     void SendMonitorsHint()
     {
-        std::string l = "MONITORS " + std::to_string(GetLocalMonitors().size());
-        for (const auto& m : GetLocalMonitors())
+        const auto mons = GetLocalMonitors();
+        lastHintMons_ = mons;
+        std::string l = "MONITORS " + std::to_string(mons.size());
+        for (const auto& m : mons)
             l += " " + std::to_string(m.x) + " " + std::to_string(m.y) + " " + std::to_string(m.width) + " " + std::to_string(m.height);
         client_->Send(l);
+    }
+
+    void OnClipActivity(const state::ClipActivity& a)
+    {
+        if (popup_ && clipTelOn_) popup_->SetActivity(a);
+    }
+
+    void UpdateTelemetryLabel()
+    {
+        if (clipTelLbl_) clipTelLbl_->SetLabelText(clipTelOn_ ? "On" : "Off");
     }
 
     void UpdateHeader()
@@ -2900,6 +3128,7 @@ private:
         auto* root = new wxBoxSizer(wxHORIZONTAL);
         wxStaticText* groupDesc = nullptr;
         wxStaticText* clipDesc = nullptr;
+        wxStaticText* telDesc = nullptr;
 
         // --- group
         auto* groupCard = new CardPanel(p, theme_, false);
@@ -2951,7 +3180,27 @@ private:
         }
         
 
-        // The two cards sit side by side with equal width. Their description texts wrap to the card
+        // --- clipboard telemetry
+        auto* telCard = new CardPanel(p, theme_, false);
+        {
+            auto* tv = new wxBoxSizer(wxVERTICAL);
+            tv->Add(MakeHeader(telCard, "Clipboard telemetry"), 0, wxBOTTOM, 2);
+            telDesc = MakeLabel(telCard, "While this PC uploads or downloads the clipboard, show a small semi-transparent popup with a progress bar "
+                                         "in the top right corner of the monitor the mouse is on. The popup belongs to this window: keep it open (it can be minimized).", true);
+            tv->Add(telDesc, 0, wxBOTTOM, 8);
+            auto* tr = new wxBoxSizer(wxHORIZONTAL);
+            clipTelCtl_ = new ToggleSwitch(telCard, theme_);
+            clipTelLbl_ = MakeLabel(telCard, "Off", false);
+            tr->Add(clipTelCtl_, 0, wxALIGN_CENTER_VERTICAL | wxRIGHT, 10);
+            tr->Add(clipTelLbl_, 0, wxALIGN_CENTER_VERTICAL);
+            tv->Add(tr, 0);
+            auto* to = new wxBoxSizer(wxVERTICAL);
+            to->Add(tv, 1, wxEXPAND | wxALL, 14);
+            telCard->SetSizer(to);
+            ApplyBackground(telCard, theme_.card);
+        }
+
+        // The cards sit side by side with equal width. Their description texts wrap to the card
         // width, otherwise the long line would force one card wider than the other.
         auto wrapTo = [](wxPanel* card, wxStaticText* lbl) {
             // Wrap() rewrites the label with hard line breaks, so always start again from the original text.
@@ -2972,10 +3221,12 @@ private:
         };
         wrapTo(groupCard, groupDesc);
         wrapTo(clipCard, clipDesc);
+        wrapTo(telCard, telDesc);
 
         auto* row = new wxBoxSizer(wxHORIZONTAL);
         row->Add(groupCard, 1, wxEXPAND | wxRIGHT, 8);         // equal width and equal height
-        row->Add(clipCard, 1, wxEXPAND);
+        row->Add(clipCard, 1, wxEXPAND | wxRIGHT, 8);
+        row->Add(telCard, 1, wxEXPAND);
         root->Add(row, 1, wxALIGN_TOP | wxALL, 10);
         p->SetSizer(root);
         return p;
@@ -3095,7 +3346,8 @@ private:
         r.mic = new FlatCheck(c, theme_, "Share my microphone");
         r.mic->SetToolTip("Forward this PC's microphone to that device as a virtual microphone (it shows up as an input device there)");
         r.clip = new FlatCheck(c, theme_, "Share my clipboard");
-        r.clip->SetToolTip("Send this PC's clipboard (text, or one or more files) to this device when the cursor moves over to it.\n"
+        r.clip->SetToolTip("Send this PC's clipboard (text, or one or more files) to this device as soon as you copy something.\n"
+                           "The newest copy on any PC wins: it replaces the clipboards of the others and cancels transfers that are still running.\n"
                            "It is accepted there if this device may control that PC or shares its clipboard back.\n"
                            "On Linux, text needs xclip, xsel or wl-clipboard; copying files needs xclip or wl-clipboard.");
         r.allow = new FlatCheck(c, theme_, "Allow remote control");
@@ -3628,6 +3880,13 @@ private:
             clipInit_ = true;
         }
 
+        if (now - clipTelEdited_ > std::chrono::milliseconds(1500)) {
+            clipTelOn_ = s.clipTelemetry;
+            clipTelCtl_->SetValue(clipTelOn_);
+            UpdateTelemetryLabel();
+            if (!clipTelOn_ && popup_) popup_->HideNow();
+        }
+
         inputMode_ = s.inputMode;
         inputPeer_ = s.inputPeer;
 
@@ -3667,7 +3926,10 @@ private:
             const PeerInfo& p = kv.second;
             if (!p.placed) continue;
             if (!canvas_->HasPeer(kv.first)) canvas_->AddPeerAt(kv.first, p.name, wxString::FromUTF8(p.addr), p.mons, p.ox, p.oy);
-            else if (!canvas_->IsDragging(kv.first) && !recent(lastMove_, kv.first)) canvas_->SetPeerPos(kv.first, p.ox, p.oy);
+            else {
+                canvas_->SetPeerMons(kv.first, p.mons);                    // monitors plugged / unplugged / rotated on that PC
+                if (!canvas_->IsDragging(kv.first) && !recent(lastMove_, kv.first)) canvas_->SetPeerPos(kv.first, p.ox, p.oy);
+            }
         }
         for (int id : canvas_->PeerIds()) {
             auto it = peers_.find(id);
@@ -3780,6 +4042,7 @@ private:
             UpdateHeader();
             StartConnect();
         }
+        if (connected_ && GetLocalMonitors() != lastHintMons_) SendMonitorsHint();     // monitors changed while running
     }
 
     // Closing the window does NOT stop sharing: the daemon keeps running in the background.
@@ -3789,6 +4052,7 @@ private:
         animTimer_.Stop();
         *alive_ = false;
         client_->Close();
+        if (popup_) { popup_->Destroy(); popup_ = nullptr; }
         Destroy();
     }
 
@@ -3830,6 +4094,12 @@ private:
     std::map<std::string, OthRow> othRows_;
     wxTextCtrl* groupCtl_ = nullptr;
     wxTextCtrl* clipLimitCtl_ = nullptr;
+    ToggleSwitch* clipTelCtl_ = nullptr;            // Settings: Clipboard telemetry
+    wxStaticText* clipTelLbl_ = nullptr;
+    TelemetryPopup* popup_ = nullptr;
+    bool clipTelOn_ = false;
+    std::chrono::steady_clock::time_point clipTelEdited_{};
+    std::vector<wxRect> lastHintMons_;
     DropDown* clipUnit_ = nullptr;
     FlatButton* clipBtn_ = nullptr;
     wxStaticText* clipLbl_ = nullptr;

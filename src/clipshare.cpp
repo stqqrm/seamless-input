@@ -47,6 +47,21 @@ std::string Lower(std::string s)
     return s;
 }
 
+long long SteadyMs()
+{
+    return std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now().time_since_epoch()).count();
+}
+
+std::string Secs(std::chrono::steady_clock::time_point since)
+{
+    const double s = std::chrono::duration<double>(std::chrono::steady_clock::now() - since).count();
+    char b[32];
+    std::snprintf(b, sizeof b, "%.1f s", s);
+    return b;
+}
+
+constexpr auto kRecentHold = std::chrono::milliseconds(1500);   // a finished transfer stays in the popup this long
+
 std::string Plural(std::uint64_t n, const char* one, const char* many)
 {
     return std::to_string(n) + " " + (n == 1 ? one : many);
@@ -234,9 +249,13 @@ void ClipShare::Shutdown()
     {
         std::lock_guard<std::mutex> lk(mtx_);
         for (auto& kv : out_) outs.push_back(kv.second);
+        for (auto& o : old_) outs.push_back(o);
         out_.clear();
+        old_.clear();
+        recent_.clear();
     }
     for (auto& o : outs) {
+        o->tel = 3;
         o->cancel = true;
         { std::lock_guard<std::mutex> lk(o->m); o->state = 2; }
         o->cv.notify_all();
@@ -257,9 +276,10 @@ void ClipShare::PeerLost(int peer)
     {
         std::lock_guard<std::mutex> lk(mtx_);
         auto it = out_.find(peer);
-        if (it != out_.end()) o = it->second;           // joined later by SendTo / Shutdown
+        if (it != out_.end()) { o = it->second; old_.push_back(o); out_.erase(it); }   // joined later by ReapOld / Shutdown
     }
     if (o) {
+        o->tel = 3;
         o->cancel = true;
         { std::lock_guard<std::mutex> lk(o->m); o->state = 2; if (o->reason.empty()) o->reason = "connection lost"; }
         o->cv.notify_all();
@@ -268,8 +288,9 @@ void ClipShare::PeerLost(int peer)
 
 // ------------------------------------------------------------------ sending
 // Core thread: only reads WHAT is on the clipboard (a list of paths, or text). Nothing is walked here.
-bool ClipShare::ReadClipboard(Raw& raw, std::string& info)
+bool ClipShare::ReadClipboard(Raw& raw, std::string& info, bool* echo)
 {
+    if (echo) *echo = false;
     const std::uint64_t limit = limit_.load();
     std::vector<fs::path> files;
     if (h_.getFiles(files) && !files.empty()) {
@@ -280,7 +301,11 @@ bool ClipShare::ReadClipboard(Raw& raw, std::string& info)
             key += '\n';
             key += U8(f);
         }
-        if (raw.paths.empty()) { info = "these files came from another PC and are not sent back"; return false; }
+        if (raw.paths.empty()) {
+            info = "these files came from another PC and are not sent back";
+            if (echo) *echo = true;                             // our own write coming back: not worth a log line
+            return false;
+        }
         raw.files = true;
         raw.key = std::move(key);
         return true;
@@ -446,7 +471,7 @@ ClipShare::PlanPtr ClipShare::Scan(const Raw& raw, std::uint64_t limit, const st
 ClipShare::PlanPtr ClipShare::GetPlan(Out& o)
 {
     const std::uint64_t limit = limit_.load();
-    const std::string key = std::to_string(limit) + "|" + o.raw.key;
+    const std::string key = std::to_string(limit) + "|" + o.raw->key;
 
     for (int attempt = 0; attempt < 3; ++attempt) {
         std::shared_future<PlanPtr> fut;
@@ -469,7 +494,7 @@ ClipShare::PlanPtr ClipShare::GetPlan(Out& o)
         if (prom) {                                             // we are the one who walks
             PlanPtr plan;
             try {
-                plan = Scan(o.raw, limit, o.cancel);
+                plan = Scan(*o.raw, limit, o.cancel);
             } catch (const std::exception& ex) {
                 auto p = std::make_shared<Plan>();
                 p->status = Status::Nothing;
@@ -503,54 +528,113 @@ ClipShare::PlanPtr ClipShare::GetPlan(Out& o)
     return nullptr;
 }
 
-void ClipShare::SendTo(int peer, const std::string& peerName)
+std::uint64_t ClipShare::NextStamp()
 {
-    std::shared_ptr<Out> finished;
+    const auto now = (std::uint64_t)std::chrono::duration_cast<std::chrono::milliseconds>(
+                         std::chrono::system_clock::now().time_since_epoch()).count();
+    lastStamp_ = std::max(now, lastStamp_ + 1);         // never goes back, even when a peer's clock runs ahead
+    return lastStamp_;
+}
+
+void ClipShare::ReapOld()
+{
+    std::vector<std::shared_ptr<Out>> finished;
     {
         std::lock_guard<std::mutex> lk(mtx_);
-        auto it = out_.find(peer);
-        if (it != out_.end()) {
-            if (!it->second->done) {                    // still sending the previous clipboard
-                Log("Clipboard not sent to " + peerName + " yet: the previous clipboard is still being sent");
-                return;
-            }
-            finished = it->second;
-            out_.erase(it);
+        for (auto it = old_.begin(); it != old_.end();) {
+            if ((*it)->done) { finished.push_back(*it); it = old_.erase(it); }
+            else ++it;
         }
     }
-    if (finished && finished->th.joinable()) finished->th.join();
+    for (auto& o : finished) if (o->th.joinable()) o->th.join();
+}
 
-    Raw raw;
-    std::string info;
-    if (!ReadClipboard(raw, info)) { if (!info.empty()) Log("Clipboard: " + info); return; }
-
-    auto o = std::make_shared<Out>();
-    o->peer = peer;
-    o->peerName = peerName;
-    o->xfer = nextXfer_++;
-    o->raw = std::move(raw);
+// A newer clipboard exists: every upload that is still running carries an outdated one.
+void ClipShare::CancelOuts(const std::string& why)
+{
+    std::vector<std::shared_ptr<Out>> outs;
     {
         std::lock_guard<std::mutex> lk(mtx_);
-        out_[peer] = o;
+        for (auto& kv : out_) { outs.push_back(kv.second); old_.push_back(kv.second); }
+        out_.clear();
+    }
+    for (auto& o : outs) {
+        o->tel = 3;                                     // gone from the popup
+        if (o->done) continue;                          // everything was sent; the receiver has it all
+        o->superseded = true;
+        o->cancel = true;
+        { std::lock_guard<std::mutex> lk(o->m); o->state = 2; o->reason = why; }
+        o->cv.notify_all();
+    }
+}
+
+void ClipShare::AbortAllIn(bool notify, const std::string& why, int except)
+{
+    std::vector<int> ids;
+    for (const auto& kv : in_) if (kv.first != except) ids.push_back(kv.first);
+    for (int id : ids) AbortIn(id, notify, why);
+}
+
+void ClipShare::StartOut(const Target& t, const Raw& raw, std::uint64_t stamp)
+{
+    auto o = std::make_shared<Out>();
+    o->peer = t.peer;
+    o->peerName = t.name;
+    o->xfer = nextXfer_++;
+    o->raw = std::make_shared<const Raw>(raw);
+    o->stamp = stamp;
+    o->started = std::chrono::steady_clock::now();
+    {
+        std::lock_guard<std::mutex> lk(mtx_);
+        out_[t.peer] = o;
     }
     try {
         o->th = std::thread([this, o] { RunOut(o); });
     } catch (const std::exception& ex) {
         std::lock_guard<std::mutex> lk(mtx_);
-        out_.erase(peer);
-        Log(std::string("Clipboard not sent to ") + peerName + ": could not start the transfer (" + ex.what() + ")");
+        out_.erase(t.peer);
+        Log(std::string("Clipboard not sent to ") + t.name + ": could not start the transfer (" + ex.what() + ")");
     }
+}
+
+void ClipShare::SendToAll(const std::vector<Target>& targets)
+{
+    ReapOld();
+
+    Raw raw;
+    std::string info;
+    bool echo = false;
+    if (!ReadClipboard(raw, info, &echo)) {
+        if (!echo && !info.empty()) Log("Clipboard: " + info);
+        return;
+    }
+    // Text we put on this clipboard ourselves comes back as a "change": it is not a copy by the user.
+    if (!raw.files && !appliedSig_.empty() && raw.key == appliedSig_) return;
+    appliedSig_.clear();
+
+    const std::uint64_t stamp = NextStamp();
+    current_ = Stamp{stamp, origin_};
+    // This is the newest clipboard: whatever is still being uploaded or downloaded here is outdated.
+    CancelOuts("a newer clipboard was copied on this PC");
+    AbortAllIn(true, "a newer clipboard was copied on this PC");
+    for (const auto& t : targets) StartOut(t, raw, stamp);
 }
 
 void ClipShare::RunOut(std::shared_ptr<Out> o)
 {
     struct Done {
         std::shared_ptr<Out> o;
-        ~Done() { o->done = true; }
+        ~Done()
+        {
+            int one = 1;
+            o->tel.compare_exchange_strong(one, 3);             // stopped half way: no longer shown (2 = sent, stays until confirmed)
+            o->done = true;
+        }
     } done{o};
 
     const PlanPtr plan = GetPlan(*o);
     if (!plan) return;                                          // cancelled while walking
+    o->totalUnits = plan->total ? plan->total : plan->items.size();
     if (plan->status == Status::Nothing) { Log("Clipboard: " + plan->message); return; }
     if (plan->status != Status::Ready) { Log("Clipboard not sent to " + o->peerName + ": " + plan->message); return; }
 
@@ -566,6 +650,13 @@ void ClipShare::RunOut(std::shared_ptr<Out> o)
     };
     // a wait ended because the transfer was stopped (by the other PC, a lost connection) or stalled
     auto stopLog = [&] {
+        if (o->superseded.load()) {                              // a newer clipboard exists: the receiver drops what it has
+            std::string why;
+            { std::lock_guard<std::mutex> lk(o->m); why = o->reason; }
+            Send(o->peer, "CLIPX " + x);
+            Log("Clipboard upload to " + o->peerName + " cancelled: " + why);
+            return;
+        }
         if (stalled) { fail("receiver stopped answering", true); return; }
         std::string why;
         { std::lock_guard<std::mutex> lk(o->m); why = o->reason; }
@@ -573,14 +664,23 @@ void ClipShare::RunOut(std::shared_ptr<Out> o)
         else fail("transfer stopped", true);
     };
 
-    Send(o->peer, "CLIPO " + x + " " + std::to_string(plan->items.size()) + " " + std::to_string(plan->total) + " " + plan->sig);
+    Send(o->peer, "CLIPO " + x + " " + std::to_string(plan->items.size()) + " " + std::to_string(plan->total) + " " + plan->sig +
+                  " " + std::to_string(o->stamp) + " " + std::to_string(origin_));
     {
         std::unique_lock<std::mutex> lk(o->m);
         o->cv.wait_for(lk, std::chrono::seconds(10), [&] { return o->state != 0 || o->cancel.load(); });
         if (o->state == 0) { lk.unlock(); fail("no answer (is the other PC running the same version?)", true); return; }
         if (o->state == 3) { o->ok = true; return; }          // the other PC's clipboard already holds exactly this
-        if (o->state == 2) { const std::string why = o->reason.empty() ? "refused" : o->reason; lk.unlock(); Log("Clipboard not sent to " + o->peerName + ": " + why); return; }
+        if (o->state == 2) {
+            const std::string why = o->reason.empty() ? "refused" : o->reason;
+            const bool newer = o->superseded.load();
+            lk.unlock();
+            if (newer) Send(o->peer, "CLIPX " + x);             // it may have accepted already: it must not wait for data
+            Log((newer ? "Clipboard upload to " + o->peerName + " cancelled: " : "Clipboard not sent to " + o->peerName + ": ") + why);
+            return;
+        }
     }
+    o->tel = 1;                                                 // accepted: this is a real transfer, show it
     if (plan->total >= (16ull << 20) || plan->items.size() > 500)
         Log("Sending " + plan->what + " (" + FormatBytes(plan->total) + ") to " + o->peerName + " ...");
 
@@ -629,13 +729,18 @@ void ClipShare::RunOut(std::shared_ptr<Out> o)
                           clipboard::Base64Encode(std::string(buf.data(), want)));
             ++seq;
             sent += want;
+            if (plan->total) o->sent += want;
         }
         // a file that grew meanwhile would arrive cut off: refuse instead
         if (it.kind == Kind::File && in.peek() != std::ifstream::traits_type::eof()) { fail(it.rel + " changed while it was copied", true); return; }
         Send(o->peer, "CLIPE " + x + " " + std::to_string(idx));
+        if (!plan->total) o->sent = idx + 1;
         if (stopped()) { stopLog(); return; }
     }
-    Log("Clipboard sent to " + o->peerName + " (" + plan->what + ", " + FormatBytes(plan->total) + "); waiting for it to confirm");
+    Log("Clipboard sent to " + o->peerName + " (" + plan->what + ", " + FormatBytes(plan->total) + ", " + Secs(o->started) +
+        "); waiting for it to confirm");
+    o->sentAtMs = SteadyMs();
+    o->tel = 2;                                                 // before CLIPF: the confirmation may arrive at once
     Send(o->peer, "CLIPF " + x);
     o->ok = true;
 }
@@ -668,7 +773,8 @@ bool ClipShare::HandleLine(int peer, const std::string& peerName, bool mayWrite,
         if (it != in_.end() && it->second->xfer == xfer) AbortIn(peer, false);   // the sender gave up
         if (o && o->done && o->ok) {
             // The transfer had finished, but the other PC could not put it on its clipboard.
-            Log("Clipboard sent to " + o->peerName + " arrived, but that PC could not put it on its clipboard - it is sent again at the next crossing");
+            o->tel = 3;
+            Log("Clipboard sent to " + o->peerName + " arrived, but that PC could not put it on its clipboard - copy again to send it again");
             return true;
         }
     }
@@ -680,7 +786,9 @@ bool ClipShare::HandleLine(int peer, const std::string& peerName, bool mayWrite,
         { std::lock_guard<std::mutex> lk(o->m); if (o->state == 0) o->state = 3; }
     } else if (cmd == "CLIPR") {
         o->delivered = true;
-        Log("Clipboard delivered to " + o->peerName + ": it is on that PC's clipboard, paste it there");
+        o->tel = 3;
+        AddRecent(true, o->peerName, o->totalUnits.load());
+        Log("Clipboard delivered to " + o->peerName + " after " + Secs(o->started) + ": it is on that PC's clipboard, paste it there");
         return true;
     } else if (cmd == "CLIPN") {
         std::string why;
@@ -689,6 +797,7 @@ bool ClipShare::HandleLine(int peer, const std::string& peerName, bool mayWrite,
         if (why == "LIMIT") { is >> lim; why = "larger than the limit set on that PC (" + FormatBytes(lim) + ")"; }
         else if (why == "DENIED") why = "that PC does not accept clipboard data from this one";
         else if (why == "DISK") why = "not enough free disk space on that PC";
+        else if (why == "OLDER") why = "that PC already holds a newer clipboard";
         else why = "refused";
         std::lock_guard<std::mutex> lk(o->m);
         o->state = 2;
@@ -703,7 +812,7 @@ bool ClipShare::HandleLine(int peer, const std::string& peerName, bool mayWrite,
     } else if (cmd == "CLIPX") {
         std::lock_guard<std::mutex> lk(o->m);
         o->state = 2;
-        if (o->reason.empty()) o->reason = "the other PC cancelled (an older version cannot receive folders: update both PCs)";
+        if (o->reason.empty()) o->reason = "the other PC stopped the transfer (it copied something newer, or could not use this)";
     }
     o->cv.notify_all();
     return true;
@@ -754,7 +863,12 @@ void ClipShare::OnOffer(int peer, const std::string& peerName, bool mayWrite, st
     is >> nItems >> total;
     const bool parsed = static_cast<bool>(is);
     std::string sig;
-    if (parsed) is >> sig;                              // older versions send no signature: that is fine
+    std::uint64_t stampT = 0;
+    std::uint32_t origin = 0;
+    if (parsed) {
+        is >> sig;                                      // older versions send no signature: that is fine
+        if (!(is >> stampT >> origin)) { stampT = 0; origin = 0; }
+    }
     AbortIn(peer, false);                               // a new offer replaces an unfinished one
     const std::string x = std::to_string(xfer);
     if (!parsed || nItems == 0 || nItems > kMaxItems) {
@@ -773,7 +887,14 @@ void ClipShare::OnOffer(int peer, const std::string& peerName, bool mayWrite, st
         Log("Clipboard from " + peerName + " refused: " + FormatBytes(total) + " is more than the limit of " + FormatBytes(limit));
         return;
     }
+    lastStamp_ = std::max(lastStamp_, stampT);          // our next copy is always later than everything we have seen
     if (!sig.empty() && AlreadyHas(peer, sig)) { Send(peer, "CLIPS " + x); return; }
+    const Stamp offer{stampT, origin};
+    if (stampT != 0 && offer < current_) {              // this PC holds a newer clipboard than the one being offered
+        Send(peer, "CLIPN " + x + " OLDER");
+        Log("Clipboard from " + peerName + " refused: this PC already holds a newer clipboard");
+        return;
+    }
     std::error_code ec;
     fs::create_directories(incoming_, ec);
     const auto sp = fs::space(incoming_, ec);
@@ -782,7 +903,13 @@ void ClipShare::OnOffer(int peer, const std::string& peerName, bool mayWrite, st
         Log("Clipboard from " + peerName + " refused: not enough free disk space for " + FormatBytes(total));
         return;
     }
+    // Accepted: this is the newest clipboard now. Uploads and downloads of older ones stop.
+    current_ = offer;
+    CancelOuts("the clipboard of " + peerName + " is newer");
+    AbortAllIn(true, "the clipboard of " + peerName + " is newer", peer);
+    ReapOld();
     auto in = std::make_unique<In>();
+    in->started = std::chrono::steady_clock::now();
     in->xfer = xfer;
     in->total = total;
     in->nItems = nItems;
@@ -926,16 +1053,21 @@ void ClipShare::OnFinish(int peer, std::uint64_t xfer)
         what = Describe(in.nFiles, in.nDirs);
         if (ok) got_[peer] = Got{in.sig, in.tops};
     } else if (in.anyText) {
+        appliedSig_ = TextSig(in.text);                 // before writing: the watcher may see the write at once
         ok = h_.setText(in.text);
         what = "text";
     }
+    if (ok && h_.applied) h_.applied();
     const std::uint64_t got = in.got;
+    const std::uint64_t units = in.total ? in.total : in.nItems;
+    const std::string took = Secs(in.started);
     const std::string from = in.peerName;
     const fs::path keep = in.dir;
     in_.erase(it);                                      // files stay on disk, only the bookkeeping goes
 
     if (ok) {
-        Log("Clipboard received from " + from + " (" + what + ", " + FormatBytes(got) + ")");
+        AddRecent(false, from, units);
+        Log("Clipboard received from " + from + " (" + what + ", " + FormatBytes(got) + ", " + took + ")");
         Send(peer, "CLIPR " + std::to_string(xfer));    // so the sender can say it was delivered
         CleanupOldIncoming(keep);
     } else {
@@ -943,6 +1075,57 @@ void ClipShare::OnFinish(int peer, std::uint64_t xfer)
         Log("Could not put the received clipboard on this PC's clipboard" + (why.empty() ? std::string(" (Linux: install xclip or wl-clipboard)") : ": " + why));
         Send(peer, "CLIPX " + std::to_string(xfer));        // so the sender offers it again
     }
+}
+
+void ClipShare::AddRecent(bool upload, const std::string& peer, std::uint64_t total)
+{
+    std::lock_guard<std::mutex> lk(mtx_);
+    recent_.push_back(Recent{upload, peer, total, std::chrono::steady_clock::now()});
+    if (recent_.size() > 16) recent_.erase(recent_.begin());
+}
+
+std::vector<ClipShare::Transfer> ClipShare::Activity()
+{
+    std::vector<Transfer> v;
+    const auto now = std::chrono::steady_clock::now();
+    const long long nowMs = SteadyMs();
+    {
+        std::lock_guard<std::mutex> lk(mtx_);
+        for (const auto& kv : out_) {
+            const Out& o = *kv.second;
+            const int tel = o.tel.load();
+            // 2: everything is sent, the receiver is still putting it on its clipboard (never longer than 20 s)
+            if (tel == 1 || (tel == 2 && nowMs - o.sentAtMs.load() < 20000)) {
+                Transfer t;
+                t.upload = true;
+                t.peer = o.peerName;
+                t.total = o.totalUnits.load();
+                t.done = tel == 2 ? t.total : std::min(o.sent.load(), t.total);
+                v.push_back(std::move(t));
+            }
+        }
+        recent_.erase(std::remove_if(recent_.begin(), recent_.end(),
+                                     [&](const Recent& r) { return now - r.at > kRecentHold; }),
+                      recent_.end());
+        for (const auto& r : recent_) {
+            Transfer t;
+            t.upload = r.upload;
+            t.peer = r.peer;
+            t.total = t.done = r.total;
+            t.finished = true;
+            v.push_back(std::move(t));
+        }
+    }
+    for (const auto& kv : in_) {
+        const In& in = *kv.second;
+        Transfer t;
+        t.upload = false;
+        t.peer = in.peerName;
+        if (in.total) { t.total = in.total; t.done = std::min(in.got, in.total); }
+        else          { t.total = in.nItems; t.done = in.nextItem; }
+        v.push_back(std::move(t));
+    }
+    return v;
 }
 
 // Only the newest received set is needed: it is what the clipboard points to.
