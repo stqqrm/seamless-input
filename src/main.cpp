@@ -2328,8 +2328,8 @@ private:
         wxFont base = GetFont();
         wxFont bold = base;
         bold.SetWeight(wxFONTWEIGHT_BOLD);
-        wxFont small = base;
-        small.SetPointSize(std::max(7, base.GetPointSize() - 1));
+        wxFont smallFont = base;
+        smallFont.SetPointSize(std::max(7, base.GetPointSize() - 1));
 
         const int pad = FromDIP(kPad), side = FromDIP(14), rowH = FromDIP(kRowHeight);
         const double barH = FromDIP(8);
@@ -2366,7 +2366,7 @@ private:
 
             wxString info = (r.up ? "to " : "from ") + r.peers;
             if (r.total >= 1024) info += "   " + Size(r.done) + " of " + Size(r.total);
-            gc->SetFont(small, t_.sub);
+            gc->SetFont(smallFont, t_.sub);
             double iw = 0, ih = 0;
             gc->GetTextExtent(info, &iw, &ih);
             while (iw > w && info.length() > 4) { info.RemoveLast(); gc->GetTextExtent(info + "...", &iw, &ih); }
