@@ -3157,7 +3157,6 @@ private:
             if (peers_.find(id) == peers_.end()) return;
             if (e.IsChecked() && !snap_.inputCanInject) {      // cannot work: do not even try
                 if (auto it = devRows_.find(id); it != devRows_.end()) it->second.allow->SetValue(false);
-                ShowInputProblem(false);
                 return;
             }
             client_->Send("CONTROL " + std::to_string(id) + (e.IsChecked() ? " 1" : " 0"));
@@ -3230,29 +3229,6 @@ private:
             : wxString::FromUTF8("\xE2\x97\x8F  Password active"));
         groupLbl_->SetForegroundColour(groupPwd_.empty() ? theme_.warn : theme_.ok);
         groupLbl_->Refresh();
-    }
-
-    // ------------------------------------------------------------ input problems
-    // Shown at start when this PC cannot be controlled (or cannot share input at all).
-    void ShowInputProblem(bool atStart)
-    {
-        const bool none = snap_.backend == "none";
-        wxString msg;
-        if (none) msg = "Keyboard and mouse sharing could not start on this PC.\n\n";
-        else      msg = "This PC can control other PCs, but it cannot be controlled.\n\n";
-        if (!snap_.inputNote.empty()) msg += wxString::FromUTF8(snap_.inputNote.c_str()) + "\n\n";
-        msg += "Remote control of this PC is switched off until this works, so the other PC does not "
-               "lose its keyboard and mouse while trying.\n\n";
-#if defined(__WXGTK__)
-        msg += "How to fix it (Linux):\n"
-               "1. Run linux-input-setup.sh (it asks for sudo).\n"
-               "2. Log out and back in.\n\n"
-               "Being in the 'input' group is not enough by itself: the group must be active in this login "
-               "session, the 'uinput' kernel module must be loaded, and /dev/uinput must be writable for the "
-               "group (the script sets up the udev rule).";
-#endif
-        wxMessageBox(msg, atStart ? "Keyboard and mouse sharing" : "Remote control not possible",
-                     wxOK | wxICON_WARNING, this);
     }
 
     // ------------------------------------------------------------ clipboard limit (Settings tab)
@@ -3614,11 +3590,6 @@ private:
         snapLines_ = lines;
         const bool keyChanged = snap_.pubKey != s.pubKey;
         snap_ = s;
-        if (!inputChecked_) {                           // once per start, with the first real answer from the daemon
-            inputChecked_ = true;
-            if (!s.inputCanInject || s.backend == "none")
-                wxTheApp->CallAfter([this] { ShowInputProblem(true); });
-        }
         if (keyChanged) UpdateHeader();
         UpdateTitle();                                  // the daemon's version arrives with the first snapshot
         if (daemonWanted_ && connected_ && !mismatchAsked_ && s.version != appver::Full()) {
@@ -3858,7 +3829,6 @@ private:
     DropDown* clipUnit_ = nullptr;
     FlatButton* clipBtn_ = nullptr;
     wxStaticText* clipLbl_ = nullptr;
-    bool inputChecked_ = false;                     // the start-up check for input problems was done
     unsigned long long clipLimit_ = 1ull << 30;     // 1 GiB until the daemon tells us otherwise
     bool clipInit_ = false;
     std::chrono::steady_clock::time_point clipEdited_;

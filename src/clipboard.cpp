@@ -19,7 +19,6 @@
     #define NOMINMAX
   #endif
   #include <windows.h>
-  #include <shlobj.h>
 #endif
 
 namespace clipboard {
@@ -135,7 +134,7 @@ std::string ToUtf8(const wchar_t* w, size_t len)
     return s;
 }
 
-struct DropFilesHeader {                    // DROPFILES (shlobj.h) without the include
+struct DropFilesHeader {                    // DROPFILES
     DWORD pFiles;
     POINT pt;
     BOOL fNC;
@@ -250,49 +249,59 @@ bool GetFiles(std::vector<std::filesystem::path>& files)
     return !files.empty();
 }
 
-// Explorer's own copies carry "Shell IDList Array" next to CF_HDROP; its Paste menu entry needs it.
-static HGLOBAL BuildShellIdList(const std::vector<std::filesystem::path>& files)
+// Lets PowerShell's Set-Clipboard put the files on the clipboard: Explorer then offers Paste for them.
+static bool SetFilesPowerShell(const std::vector<std::filesystem::path>& files, std::string& err)
 {
-    if (files.empty()) return nullptr;
-    const auto parentPath = files.front().parent_path();
-    for (const auto& f : files) if (f.parent_path() != parentPath) return nullptr;   // one parent folder only
-    PIDLIST_ABSOLUTE parent = ILCreateFromPathW(parentPath.c_str());
-    if (!parent) return nullptr;
-    std::vector<PIDLIST_ABSOLUTE> full;
-    bool ok = true;
-    for (const auto& f : files) {
-        PIDLIST_ABSOLUTE p = ILCreateFromPathW(f.c_str());
-        if (!p) { ok = false; break; }
-        full.push_back(p);
-    }
-    HGLOBAL mem = nullptr;
-    if (ok) {
-        const UINT n = (UINT)files.size();
-        const UINT head = (UINT)(sizeof(UINT) * (2 + n));
-        UINT total = head + ILGetSize(parent);
-        for (auto* p : full) total += ILGetSize(ILFindLastID(p));
-        mem = GlobalAlloc(GMEM_MOVEABLE | GMEM_ZEROINIT, total);
-        if (mem) {
-            if (auto* base = static_cast<BYTE*>(GlobalLock(mem))) {
-                auto* cida = reinterpret_cast<CIDA*>(base);
-                cida->cidl = n;
-                UINT off = head;
-                cida->aoffset[0] = off;
-                std::memcpy(base + off, parent, ILGetSize(parent));
-                off += ILGetSize(parent);
-                for (UINT i = 0; i < n; ++i) {
-                    PCUIDLIST_RELATIVE c = ILFindLastID(full[i]);
-                    cida->aoffset[i + 1] = off;
-                    std::memcpy(base + off, c, ILGetSize(c));
-                    off += ILGetSize(c);
-                }
-                GlobalUnlock(mem);
-            } else { GlobalFree(mem); mem = nullptr; }
+    wchar_t sysDir[MAX_PATH] = {};
+    if (!GetSystemDirectoryW(sysDir, MAX_PATH)) { err = "no system directory"; return false; }
+    const std::wstring exe = std::wstring(sysDir) + L"\\WindowsPowerShell\\v1.0\\powershell.exe";
+
+    wchar_t tmpDir[MAX_PATH] = {};
+    const DWORD tl = GetTempPathW(MAX_PATH, tmpDir);
+    if (!tl || tl >= MAX_PATH) { err = "no temp directory"; return false; }
+    const std::wstring listFile = std::wstring(tmpDir) + L"seamless-input-clip-" + std::to_wstring(GetCurrentProcessId()) + L".txt";
+    {
+        FILE* f = _wfopen(listFile.c_str(), L"wb");
+        if (!f) { err = "cannot write the file list for PowerShell"; return false; }
+        const unsigned char bom[3] = {0xEF, 0xBB, 0xBF};
+        std::fwrite(bom, 1, 3, f);
+        for (const auto& p : files) {
+            const std::wstring w = p.wstring();
+            const std::string u = ToUtf8(w.data(), w.size()) + "\r\n";
+            std::fwrite(u.data(), 1, u.size(), f);
         }
+        std::fclose(f);
     }
-    for (auto* p : full) ILFree(p);
-    ILFree(parent);
-    return mem;
+    std::wstring lf = listFile;                       // single-quote escaping for PowerShell
+    for (std::size_t i = 0; i < lf.size(); ++i) if (lf[i] == L'\'') { lf.insert(i, 1, L'\''); ++i; }
+    const std::wstring script =
+        L"$ErrorActionPreference='Stop'; $p=@(Get-Content -LiteralPath '" + lf + L"' -Encoding UTF8 | Where-Object { $_ }); "
+        L"Set-Clipboard -LiteralPath $p";
+    std::wstring cmd = L"\"" + exe + L"\" -NoProfile -NonInteractive -STA -ExecutionPolicy Bypass -Command \"" + script + L"\"";
+
+    STARTUPINFOW si{};
+    si.cb = sizeof(si);
+    si.dwFlags = STARTF_USESHOWWINDOW;
+    si.wShowWindow = SW_HIDE;
+    PROCESS_INFORMATION pi{};
+    bool ok = false;
+    if (!CreateProcessW(exe.c_str(), &cmd[0], nullptr, nullptr, FALSE, CREATE_NO_WINDOW, nullptr, nullptr, &si, &pi)) {
+        err = "could not start PowerShell (error " + std::to_string(GetLastError()) + ")";
+    } else {
+        if (WaitForSingleObject(pi.hProcess, 20000) != WAIT_OBJECT_0) {
+            TerminateProcess(pi.hProcess, 1);
+            err = "PowerShell did not finish in time";
+        } else {
+            DWORD code = 1;
+            GetExitCodeProcess(pi.hProcess, &code);
+            ok = code == 0;
+            if (!ok) err = "PowerShell Set-Clipboard failed (exit code " + std::to_string(code) + ")";
+        }
+        CloseHandle(pi.hProcess);
+        CloseHandle(pi.hThread);
+    }
+    DeleteFileW(listFile.c_str());
+    return ok;
 }
 
 bool SetFiles(const std::vector<std::filesystem::path>& filesIn)
@@ -301,6 +310,15 @@ bool SetFiles(const std::vector<std::filesystem::path>& filesIn)
     if (filesIn.empty()) return false;
     std::vector<std::filesystem::path> files;        // backslashes only: Explorer rejects mixed separators
     for (auto f : filesIn) { f = f.lexically_normal(); f.make_preferred(); files.push_back(std::move(f)); }
+    std::string psErr;
+    if (SetFilesPowerShell(files, psErr)) {
+        std::vector<std::filesystem::path> back;
+        const bool readable = GetFiles(back);
+        SetNote(readable && back.size() == files.size() ? std::string()
+                : "file list set through PowerShell, but read back " + std::to_string(back.size()) + " of " + std::to_string(files.size()) + " entries");
+        return true;
+    }
+    // PowerShell route failed: fall back to the plain clipboard formats below
     std::wstring list;                       // path\0path\0...\0\0
     for (const auto& f : files) {
         list += f.wstring();
@@ -323,10 +341,9 @@ bool SetFiles(const std::vector<std::filesystem::path>& filesIn)
     if (effect) {
         if (auto* e = static_cast<DWORD*>(GlobalLock(effect))) { *e = 1; GlobalUnlock(effect); }
     }
-    HGLOBAL idl = BuildShellIdList(files);
     HWND owner = Owner();
     if (!owner || !OpenRetry(owner)) {
-        GlobalFree(mem); if (effect) GlobalFree(effect); if (idl) GlobalFree(idl);
+        GlobalFree(mem); if (effect) GlobalFree(effect);
         SetNote("the Windows clipboard is in use by another program");
         return false;
     }
@@ -335,9 +352,6 @@ bool SetFiles(const std::vector<std::filesystem::path>& filesIn)
     if (!ok) { GlobalFree(mem); SetNote("Windows refused the file list (error " + std::to_string(GetLastError()) + ")"); }
     if (effect) {
         if (!(ok && SetClipboardData(RegisterClipboardFormatW(L"Preferred DropEffect"), effect))) GlobalFree(effect);
-    }
-    if (idl) {
-        if (!(ok && SetClipboardData(RegisterClipboardFormatW(L"Shell IDList Array"), idl))) GlobalFree(idl);
     }
     CloseClipboard();
     // read back what Windows now holds, so the log shows whether the list survived
