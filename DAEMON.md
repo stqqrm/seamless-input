@@ -52,3 +52,12 @@ Windows service supervisor log: `%ProgramData%\seamless-input-service.log`.
 
 - The daemon listens only on `127.0.0.1:45457` (local IPC, token-authenticated). One daemon per user.
 - Dev builds without downloading dependencies: `cmake -DSI_SYSTEM_DEPS=ON ..` (needs `libwxgtk3.2-dev libboost-dev`).
+
+## Build id
+
+The build id shown in the window title, the log and the version handshake between PCs is the hash of
+everything under `src/` (`cmake/BuildId.cmake`, run on every build; line endings are normalised, so a
+Windows and a Linux checkout of the same code agree). There is no number to bump: any code change gives a
+new id. When two PCs report different ids a "versions do not match" message appears; only a different
+*clipboard protocol* (`ClipShare::kProtocol`, bump it by hand when the wire format changes) switches
+clipboard sharing off. Built without CMake the id is `dev`.

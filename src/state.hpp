@@ -26,7 +26,7 @@ struct Peer {
     // Version handshake (VER line, sent by both sides right after the connection is ready). An old
     // daemon never sends one: gotVer stays false.
     bool gotVer = false;
-    int build = 0;                       // its appver::kBuild
+    std::string build;                   // its appver::kBuildId
     int clipProto = 0;                   // its ClipShare::kProtocol
     std::string version;                 // its appver::kVersion
     std::chrono::steady_clock::time_point readyAt{};

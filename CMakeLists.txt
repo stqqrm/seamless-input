@@ -171,7 +171,21 @@ set(DAEMON_MAIN "${CMAKE_CURRENT_SOURCE_DIR}/src/daemon_main.cpp")
 set(CORE_SOURCES ${PROJECT_SOURCES})
 list(REMOVE_ITEM CORE_SOURCES "${GUI_MAIN}" "${DAEMON_MAIN}")
 
+# Build id: the hash of everything under src/ (cmake/BuildId.cmake). Regenerated on EVERY build, so it
+# changes whenever the code does; the header is rewritten only when the id changed.
+set(SI_BUILD_ID_HEADER "${CMAKE_BINARY_DIR}/generated/seamless_build_id.hpp")
+set(SI_BUILD_ID_ARGS -DSRC_DIR=${CMAKE_CURRENT_SOURCE_DIR}/src -DOUT=${SI_BUILD_ID_HEADER}
+                     -P ${CMAKE_CURRENT_SOURCE_DIR}/cmake/BuildId.cmake)
+execute_process(COMMAND ${CMAKE_COMMAND} ${SI_BUILD_ID_ARGS})      # exists from the first configure (IDEs)
+add_custom_target(si_build_id
+    COMMAND ${CMAKE_COMMAND} ${SI_BUILD_ID_ARGS}
+    BYPRODUCTS "${SI_BUILD_ID_HEADER}"
+    COMMENT "Computing the build id"
+    VERBATIM)
+
 add_library(si_core STATIC ${CORE_SOURCES} ${PROJECT_HEADERS})
+add_dependencies(si_core si_build_id)
+target_include_directories(si_core PUBLIC "${CMAKE_BINARY_DIR}/generated")
 
 target_include_directories(si_core PUBLIC "${CMAKE_CURRENT_SOURCE_DIR}/src")
 # SYSTEM: keeps miniaudio.h's own warnings out of our build output
@@ -218,10 +232,12 @@ endif()
 # --- daemon (console subsystem: run it in a terminal to see its log; always started hidden otherwise)
 add_executable(seamless-input-daemon "${DAEMON_MAIN}")
 target_link_libraries(seamless-input-daemon PRIVATE si_core)
+add_dependencies(seamless-input-daemon si_build_id)
 
 # --- GUI
 add_executable(${PROJECT_NAME} "${GUI_MAIN}")
 target_link_libraries(${PROJECT_NAME} PRIVATE si_core ${WX_TARGET})
+add_dependencies(${PROJECT_NAME} si_build_id)
 add_dependencies(${PROJECT_NAME} seamless-input-daemon)   # the GUI starts the daemon: build both
 
 if(WIN32)

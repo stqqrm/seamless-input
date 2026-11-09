@@ -552,7 +552,7 @@ void Core::OnPeerReady(int id, std::uint32_t inst, const std::string& key, const
     p.incoming = incoming;
     p.placed = false;
     p.gotVer = false;                   // the peer tells us with a VER line (see OnMessage)
-    p.build = 0;
+    p.build.clear();
     p.clipProto = 0;
     p.version.clear();
     p.readyAt = std::chrono::steady_clock::now();
@@ -875,7 +875,7 @@ void Core::UpdateCapture(AudioSource src, bool want, bool& capturing, const char
 // ignores ours, so a missing VER line is how a stale daemon on the other PC is recognised.
 std::string Core::VerLine() const
 {
-    return "VER " + std::to_string(appver::kBuild) + " " + std::to_string(ClipShare::kProtocol) + " " + appver::kVersion;
+    return std::string("VER ") + appver::kBuildId + " " + std::to_string(ClipShare::kProtocol) + " " + appver::kVersion;
 }
 
 void Core::OnVersion(int id, const std::string& line)
@@ -884,9 +884,9 @@ void Core::OnVersion(int id, const std::string& line)
     if (it == peers_.end()) return;
     state::Peer& p = it->second;
     std::istringstream is(line.substr(4));
-    int build = 0, proto = 0;
-    std::string version;
-    if (!(is >> build >> proto) || build <= 0 || proto <= 0) return;      // malformed: treated as "no version"
+    std::string build, version;
+    int proto = 0;
+    if (!(is >> build >> proto) || build.empty() || build.size() > 32 || proto <= 0) return;   // malformed: treated as "no version"
     is >> version;
     if (version.size() > 32) version.resize(32);
     p.gotVer = true;
@@ -894,13 +894,13 @@ void Core::OnVersion(int id, const std::string& line)
     p.clipProto = proto;
     p.version = version;
 
-    Log(p.name + " runs seamless-input " + (version.empty() ? std::string("?") : version) + " (build " + std::to_string(build) +
+    Log(p.name + " runs seamless-input " + (version.empty() ? std::string("?") : version) + " (build " + build +
         ", clipboard protocol " + std::to_string(proto) + ")");
     if (proto != ClipShare::kProtocol)
         Log("WARNING: " + p.name + " speaks clipboard protocol " + std::to_string(proto) + ", this PC speaks " +
             std::to_string(ClipShare::kProtocol) + ": clipboard sharing with it is off until both PCs run the same build (restart the daemon after updating)");
-    else if (build != appver::kBuild)
-        Log(p.name + " runs build " + std::to_string(build) + ", this PC runs build " + std::to_string(appver::kBuild) +
+    else if (build != appver::kBuildId)
+        Log(p.name + " runs build " + build + ", this PC runs build " + appver::kBuildId +
             ": the clipboard still works, but update both PCs to the same build");
     Changed();
 }
@@ -910,13 +910,13 @@ std::string Core::ClipBlocker(const state::Peer& p) const
 {
     if (p.gotVer && p.clipProto == ClipShare::kProtocol) return std::string();
     if (p.gotVer)
-        return p.name + " runs build " + std::to_string(p.build) + " (clipboard protocol " + std::to_string(p.clipProto) +
-               "), this PC runs build " + std::to_string(appver::kBuild) + " (protocol " + std::to_string(ClipShare::kProtocol) +
+        return p.name + " runs build " + p.build + " (clipboard protocol " + std::to_string(p.clipProto) +
+               "), this PC runs build " + appver::kBuildId + " (protocol " + std::to_string(ClipShare::kProtocol) +
                "): restart the daemon on the PC with the older build";
     if (std::chrono::steady_clock::now() - p.readyAt < std::chrono::seconds(3))
         return "still waiting for " + p.name + " to report its version, it works at the next crossing";
     return p.name + " did not report a version: it runs an old build, or an old daemon is still running there. "
-           "Stop it (seamless-input-daemon --stop) and start build " + std::to_string(appver::kBuild);
+           "Stop it (seamless-input-daemon --stop) and start build " + appver::kBuildId;
 }
 
 // ------------------------------------------------------------------ clipboard sharing
