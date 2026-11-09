@@ -337,7 +337,7 @@ bool SetFiles(const std::vector<std::filesystem::path>& filesIn)
         if (!(ok && SetClipboardData(RegisterClipboardFormatW(L"Preferred DropEffect"), effect))) GlobalFree(effect);
     }
     if (idl) {
-        if (!(ok && SetClipboardData(RegisterClipboardFormatW(CFSTR_SHELLIDLIST), idl))) GlobalFree(idl);
+        if (!(ok && SetClipboardData(RegisterClipboardFormatW(L"Shell IDList Array"), idl))) GlobalFree(idl);
     }
     CloseClipboard();
     // read back what Windows now holds, so the log shows whether the list survived
