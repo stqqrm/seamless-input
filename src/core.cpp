@@ -214,6 +214,7 @@ bool Core::Start(std::string* err)
     StartClipWatch();
 
     ScheduleTick();
+    ScheduleTelemetry();
     return true;
 }
 
@@ -235,6 +236,7 @@ void Core::Stop()
     work_.reset();
     ctx_.stop();
     if (loop_.joinable()) loop_.join();
+    popup_.reset();               // closes the popup window and joins its thread
 }
 
 void Core::ScheduleTick()
@@ -357,6 +359,7 @@ void Core::ApplyLocalMonitors(const std::vector<InputRect>& mons, const char* so
         for (const auto& r : mons_) out << r.x << " " << r.y << " " << r.w << " " << r.h << "\n";
     }
     layout_.SetLocal(mons_);
+    if (popup_) popup_->SetMonitors(mons_);
     if (input_) {                                       // the backends read the geometry when they start
         input_->Stop();
         input_->SetLocalMonitors(mons_);
@@ -1053,12 +1056,60 @@ void Core::OnLocalClipboardChanged()
     clip_->SendToAll(targets);          // also cancels uploads / downloads of older clipboards when there is nobody to send to
 }
 
-state::ClipActivity Core::GetClipActivity()
+void Core::ScheduleTelemetry()
 {
-    state::ClipActivity a;
-    if (!clip_) return a;
-    for (const auto& t : clip_->Activity()) a.items.push_back({t.upload, t.peer, t.done, t.total, t.finished});
-    return a;
+    telTimer_ = std::make_unique<boost::asio::steady_timer>(ctx_);
+    auto arm = std::make_shared<std::function<void()>>();
+    *arm = [this, arm] {
+        if (!running_ || !telTimer_) return;
+        telTimer_->expires_after(std::chrono::milliseconds(100));
+        telTimer_->async_wait([this, arm](const boost::system::error_code& ec) {
+            if (ec || !running_) return;
+            UpdatePopup();
+            (*arm)();
+        });
+    };
+    Post([arm] { (*arm)(); });
+}
+
+// Hands the transfers that are running (and the ones that just finished) to the popup. One row per
+// direction: when several PCs are involved their progress is added up.
+void Core::UpdatePopup()
+{
+    if (!clip_) return;
+    if (!clipTelemetry_) {
+        if (popup_ && popupShown_) { popup_->Set({}); popupShown_ = false; }
+        return;
+    }
+    const auto act = clip_->Activity();
+    if (act.empty() && !popupShown_) return;
+    if (!popup_) {                                      // first transfer since start: create the window thread
+        popup_ = std::make_unique<overlay::Popup>();
+        popup_->SetMonitors(mons_);
+    }
+    std::vector<overlay::Row> rows;
+    for (const bool up : {true, false}) {
+        overlay::Row r;
+        r.upload = up;
+        bool any = false, allDone = true;
+        for (const auto& t : act) {
+            if (t.upload != up) continue;
+            any = true;
+            r.done += t.done;
+            r.total += t.total;
+            if (!t.finished) allDone = false;
+            if (!t.finished && t.total == 0) r.unknown = true;
+            if (r.peers.find(t.peer) == std::string::npos) r.peers += (r.peers.empty() ? "" : ", ") + t.peer;
+        }
+        r.finished = allDone;
+        if (any) rows.push_back(std::move(r));
+    }
+    popup_->Set(rows);
+    popupShown_ = !rows.empty();
+    if (!popupErrorLogged_) {                           // the window thread reports a problem (Wayland, no display) once
+        const std::string e = popup_->Error();
+        if (!e.empty()) { popupErrorLogged_ = true; Log("Clipboard telemetry popup: " + e); }
+    }
 }
 
 void Core::SaveClipSettings()
@@ -1082,8 +1133,9 @@ void Core::CmdClipTelemetry(bool on)
 {
     if (on == clipTelemetry_) return;
     clipTelemetry_ = on;
+    if (!on && popup_ && popupShown_) { popup_->Set({}); popupShown_ = false; }
     SaveClipSettings();
-    Log(on ? "Clipboard telemetry on: a popup shows the progress of clipboard uploads and downloads"
+    Log(on ? "Clipboard telemetry on: a popup on this PC shows the progress of clipboard uploads and downloads"
            : "Clipboard telemetry off");
     Changed();
 }

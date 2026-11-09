@@ -72,9 +72,11 @@ clipboard sharing off. Built without CMake the id is `dev`.
   PCs that receive its offer; an offer older than what a PC already holds is refused (`OLDER`). Two PCs that
   copy at the same moment end up with the same clipboard. Protocol version is now 5: update all PCs.
 - *Settings -> Clipboard telemetry*: a semi-transparent popup (progress bar, "Uploading" / "Downloading") in the
-  top right corner of the monitor under the mouse, only on PCs that are transferring. It is drawn by the
-  window, so keep the window open (minimized is fine). Finished transfers stay visible for ~1.5 s, and the
-  daemon log now shows how long each transfer took.
+  top right corner of the monitor under the mouse, only on PCs that are transferring. **The daemon draws it
+  itself** (`overlay.cpp`), so it also appears when the window is closed. Windows: a layered Win32 window in the
+  worker's user session (clicks go through it). Linux: an X11 override-redirect window (translucent when a
+  compositing window manager runs). Pure Wayland sessions have no way to show an always-on-top window; the
+  daemon logs that once. Finished transfers stay visible for ~1.5 s, and the log shows how long each transfer took.
 
 ## Monitor changes
 

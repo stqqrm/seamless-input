@@ -27,6 +27,7 @@
 #include "layout.hpp"
 #include "localinfo.hpp"
 #include "network.hpp"
+#include "overlay.hpp"
 #include "state.hpp"
 
 class Core {
@@ -67,7 +68,6 @@ public:
     void CmdClipboard(int id, bool share);                  // send my clipboard to this PC whenever I copy something
     void CmdClipTelemetry(bool on);                         // progress popup while the clipboard is uploaded / downloaded
     bool ClipTelemetryEnabled() const { return clipTelemetry_; }
-    state::ClipActivity GetClipActivity();                  // uploads / downloads running now
     void CmdMonitorsHint(const std::vector<InputRect>& mons);
     void CmdClearCache();                                   // forget remembered permissions and the monitor cache
     void CmdRegenKeys();                                    // new identity key pair, then restart the daemon
@@ -105,6 +105,9 @@ private:
     // clipboard sharing (Core thread)
     void OnLocalClipboardChanged();                                // the user copied something here: send it to every PC we share with
     void SaveClipSettings();
+    // The telemetry popup (overlay.hpp) is drawn by this daemon; it is refreshed 10 times a second.
+    void ScheduleTelemetry();
+    void UpdatePopup();
     // The watcher thread polls the clipboard's change token; changes are posted to the Core thread.
     void StartClipWatch();
     void StopClipWatch();
@@ -166,6 +169,10 @@ private:
     std::string inputNote_;                       // why not / what is limited
     std::unique_ptr<ClipShare> clip_;             // clipboard text / files shared with peers
     bool clipTelemetry_ = false;                  // progress popup on (saved in clipboard.txt)
+    std::unique_ptr<overlay::Popup> popup_;       // created at the first transfer
+    std::unique_ptr<boost::asio::steady_timer> telTimer_;
+    bool popupShown_ = false;
+    bool popupErrorLogged_ = false;
     std::thread clipWatch_;
     std::atomic<bool> clipWatchRun_{false};
     std::atomic<bool> clipWatchActive_{false};    // somebody to share with: poll

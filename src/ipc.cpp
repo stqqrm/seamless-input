@@ -168,33 +168,6 @@ bool ParseStats(const std::vector<std::string>& t, state::Stats& st)
     return true;
 }
 
-std::string SerializeClipActivity(const state::ClipActivity& a)
-{
-    std::string l = "CT " + std::to_string(a.items.size());
-    for (const auto& t : a.items)
-        l += std::string(" ") + (t.upload ? "1" : "0") + " " + Enc(t.peer) + " " + std::to_string(t.done) + " " +
-             std::to_string(t.total) + " " + (t.finished ? "1" : "0");
-    return l;
-}
-
-bool ParseClipActivity(const std::vector<std::string>& t, state::ClipActivity& a)
-{
-    if (t.size() < 2 || t[0] != "CT") return false;
-    a = {};
-    const long long n = ToInt(t[1]);
-    for (long long i = 0; i < n && 2 + (size_t)i * 5 + 4 < t.size(); ++i) {
-        const size_t o = 2 + (size_t)i * 5;
-        state::ClipTransfer c;
-        c.upload = ToInt(t[o]) != 0;
-        c.peer = Dec(t[o + 1]);
-        c.done = (std::uint64_t)std::strtoull(t[o + 2].c_str(), nullptr, 10);
-        c.total = (std::uint64_t)std::strtoull(t[o + 3].c_str(), nullptr, 10);
-        c.finished = ToInt(t[o + 4]) != 0;
-        a.items.push_back(std::move(c));
-    }
-    return true;
-}
-
 // ---------------------------------------------------------------- token
 std::filesystem::path TokenPath(const std::filesystem::path& dataDir) { return dataDir / "ipc.token"; }
 
@@ -305,7 +278,6 @@ struct Client::Impl {
         if (t[0] == "SB") { cur = {}; inSnap = true; return; }
         if (t[0] == "SE") { if (inSnap && h.onSnapshot) h.onSnapshot(cur); inSnap = false; return; }
         if (t[0] == "ST") { state::Stats st; if (ParseStats(t, st) && h.onStats) h.onStats(st); return; }
-        if (t[0] == "CT") { state::ClipActivity ca; if (ParseClipActivity(t, ca) && h.onClipActivity) h.onClipActivity(ca); return; }
         if (inSnap) ParseSnapshotLine(t, cur);
     }
 

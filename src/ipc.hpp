@@ -8,9 +8,7 @@
 //     (one full state snapshot)                    MONITORS <n> <x y w h>...
 //   L <text>            activity log line          SCAN | SELECT <ip> | GROUP <pwd>
 //   ST <...>            audio levels (4 Hz)        MOVE <id> <x> <y> | AUDIO <id> <s> <m> <mute> <vol>
-//   CT <n> {<up> <peer> <done> <total> <fin>}*     CLIPTELEMETRY <0|1>
-//     clipboard transfers (10 Hz while there are any, and once more when there are none), only sent while
-//     "Clipboard telemetry" is on
+//                                              CLIPTELEMETRY <0|1>   (the popup is drawn by the daemon)
 //                                                  MASTER <mute> <vol> | CONTROL <id> <0|1>
 //                                                  CLIPBOARD <id> <0|1> | CLIPLIMIT <bytes>
 //                                                  CLEARCACHE | REGENKEYS
@@ -39,8 +37,6 @@ std::vector<std::string> SerializeSnapshot(const state::Snapshot& s);   // "SB" 
 bool ParseSnapshotLine(const std::vector<std::string>& t, state::Snapshot& s);
 std::string SerializeStats(const state::Stats& st);
 bool ParseStats(const std::vector<std::string>& t, state::Stats& st);
-std::string SerializeClipActivity(const state::ClipActivity& a);       // "CT ..."
-bool ParseClipActivity(const std::vector<std::string>& t, state::ClipActivity& a);
 
 std::filesystem::path TokenPath(const std::filesystem::path& dataDir);
 std::string ReadToken(const std::filesystem::path& dataDir);
@@ -56,7 +52,6 @@ public:
         std::function<void(const state::Snapshot&)> onSnapshot;
         std::function<void(const std::string& line)> onLog;
         std::function<void(const state::Stats&)> onStats;
-        std::function<void(const state::ClipActivity&)> onClipActivity;
         std::function<void()> onDisconnected;
     };
 

@@ -75,16 +75,4 @@ struct Stats {
     std::vector<PeerAudioStat> peers;
 };
 
-// One clipboard upload or download, for the progress popup ("Clipboard telemetry").
-struct ClipTransfer {
-    bool upload = false;                 // false: download
-    std::string peer;
-    std::uint64_t done = 0, total = 0;   // total 0: size not known yet
-    bool finished = false;               // completed a moment ago (shown at 100 %)
-};
-
-struct ClipActivity {
-    std::vector<ClipTransfer> items;     // empty: nothing is being transferred
-};
-
 } // namespace state

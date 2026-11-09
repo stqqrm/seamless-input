@@ -28,7 +28,6 @@ private:
     void Pump();
     void BroadcastSnapshot();
     void BroadcastStats();
-    void BroadcastClipActivity();
     void Attach(const std::shared_ptr<Session>& s);
     void Remove(const std::shared_ptr<Session>& s);
     int AttachedCount() const;
@@ -40,7 +39,6 @@ private:
     bool started_ = false;
     bool dirty_ = false;
     int pumpTicks_ = 0;
-    bool telemetryShown_ = false;        // the last CT line sent had transfers in it
     boost::asio::ip::tcp::acceptor acceptor_;
     boost::asio::steady_timer pump_;
     std::set<std::shared_ptr<Session>> sessions_;
