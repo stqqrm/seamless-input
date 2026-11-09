@@ -2390,7 +2390,7 @@ private:
             lastConnErr_ = err;
             UpdateHeader();
             // A few failures in a row: whatever sits on the daemon's port is old or stuck - offer to restart it.
-            if (daemonWanted_ && ++connFails_ >= 3 && !restartAsked_) AskRestartDaemon();
+            if (daemonWanted_ && ++connFails_ >= 3 && !restartAsked_) AskRestartDaemon(std::string());
             return;
         }
         connFails_ = 0;
@@ -2405,14 +2405,22 @@ private:
         UpdateHeader();
     }
 
-    void AskRestartDaemon()
+    // A background service that runs a different version than this window (an old one that is still
+    // running after an update, or one that no longer understands this window): offer to restart it.
+    // svcVersion: what the service reported; empty when it reports nothing (an older build).
+    void AskRestartDaemon(const std::string& svcVersion)
     {
         restartAsked_ = true;                       // ask once; asks again only after a restart attempt failed
+        mismatchAsked_ = true;
         busy_ = true;                               // pauses the automatic retries while the question is open
+        const wxString theirs = svcVersion.empty() ? wxString("an older version (it does not report one)")
+                                                   : wxString::FromUTF8(svcVersion);
         const int r = wxMessageBox(
-            "The background service does not respond.\n\n"
-            "It may be an older version that is still running, or a stuck process. Restart it?",
-            "Background service", wxYES_NO | wxYES_DEFAULT | wxICON_QUESTION, this);
+            "Versions do not match.\n\n"
+            "This window:  " + wxString::FromUTF8(appver::Full()) + "\n"
+            "Background service:  " + theirs + "\n\n"
+            "Restart the background service so both run the same version?",
+            "Version mismatch", wxYES_NO | wxYES_DEFAULT | wxICON_QUESTION, this);
         if (r != wxYES) { busy_ = false; return; }
 
         Log("Restarting the background service ...");
@@ -2433,6 +2441,7 @@ private:
     {
         busy_ = false;
         connFails_ = 0;
+        mismatchAsked_ = false;                     // the new service is checked again with its first snapshot
         retry_ = 3;                                 // reconnect right away
         if (ok) { Log("Background service restarted"); return; }
         restartAsked_ = false;                      // may ask again after the next failures
@@ -3612,6 +3621,11 @@ private:
         }
         if (keyChanged) UpdateHeader();
         UpdateTitle();                                  // the daemon's version arrives with the first snapshot
+        if (daemonWanted_ && connected_ && !mismatchAsked_ && s.version != appver::Full()) {
+            mismatchAsked_ = true;                      // once; a failed restart or a restart that still mismatches asks again
+            const std::string theirs = s.version;
+            wxTheApp->CallAfter([this, theirs] { if (daemonWanted_ && connected_) AskRestartDaemon(theirs); });
+        }
 
         using clock = std::chrono::steady_clock;
         const auto now = clock::now();
@@ -3815,6 +3829,7 @@ private:
     int retry_ = 0;
     int connFails_ = 0;             // consecutive failed attempts to reach the daemon
     bool restartAsked_ = false;     // the restart question was shown (until success or a failed restart)
+    bool mismatchAsked_ = false;    // the "versions do not match" question was shown for this service
     std::string lastConnErr_;
     std::map<int, std::chrono::steady_clock::time_point> lastMove_, lastAudio_;
     std::chrono::steady_clock::time_point masterSent_;

@@ -1,4 +1,5 @@
 #pragma once
+#include <chrono>
 // Plain data that travels between the daemon (Core) and the GUI. No wx, no asio.
 #include <cstdint>
 #include <string>
@@ -22,6 +23,13 @@ struct Peer {
     int  vol = 100;                      // 0..100, what I hear from it
     bool allowed = false;                // may it control this PC? (saved per device, off by default)
     bool clip = false;                   // share my clipboard with it when the cursor moves over to it
+    // Version handshake (VER line, sent by both sides right after the connection is ready). An old
+    // daemon never sends one: gotVer stays false.
+    bool gotVer = false;
+    int build = 0;                       // its appver::kBuild
+    int clipProto = 0;                   // its ClipShare::kProtocol
+    std::string version;                 // its appver::kVersion
+    std::chrono::steady_clock::time_point readyAt{};
 };
 
 struct Beacon {                          // another instance seen on the LAN (UDP discovery)

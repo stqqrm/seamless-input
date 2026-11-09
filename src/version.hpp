@@ -7,7 +7,7 @@
 namespace appver {
 
 inline constexpr const char* kVersion = "1.0.0";
-inline constexpr int kBuild = 4;
+inline constexpr int kBuild = 6;
 
 inline std::string Full() { return std::string(kVersion) + " (build " + std::to_string(kBuild) + ")"; }
 

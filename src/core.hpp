@@ -83,6 +83,9 @@ private:
 
     void LoadMonitors();
     std::string ScreensLine() const;
+    std::string VerLine() const;                                // version handshake line
+    void OnVersion(int id, const std::string& line);
+    std::string ClipBlocker(const state::Peer& p) const;        // empty: the peer can receive our clipboard
     void StartScan();
 
     // network events (already on the Core thread)
