@@ -14,6 +14,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <condition_variable>
+#include <deque>
 #include <functional>
 #include <mutex>
 #include <string>
@@ -27,6 +28,7 @@ namespace {
 constexpr ULONG_PTR kTag = 0x53454D4CUL;
 constexpr UINT kMsgKbdOn  = WM_APP + 1;
 constexpr UINT kMsgKbdOff = WM_APP + 2;
+constexpr UINT kMsgDrain  = WM_APP + 4;   // run the queued injected input (see QueueInput)
 constexpr UINT kMsgTask   = WM_APP + 3;   // lParam: heap-allocated std::function<void()> to run on the hook thread
 constexpr unsigned kDeskCheckTicks = 4;   // check for a desktop switch every 4th edge poll (~120 ms)
 constexpr UINT kPollMs    = 30;           // edge polling while input is local (see PollEdge)
@@ -146,10 +148,16 @@ public:
     // ------------------------------------------------------------ injection (any thread)
     // Everything that touches the input stream runs on the hook thread: it is the one thread that follows the
     // input desktop (see FollowInputDesktop), so the input also reaches the UAC prompt and the lock screen.
-    void InjectMoveTo(int x, int y) override { RunOnHookThread([this, x, y] { DoMoveTo(x, y); }); }
-    void InjectButton(int button, bool down) override { RunOnHookThread([this, button, down] { DoButton(button, down); }); }
-    void InjectWheel(int dx, int dy) override { RunOnHookThread([this, dx, dy] { DoWheel(dx, dy); }); }
-    void InjectKey(int code, bool down) override { RunOnHookThread([this, code, down] { DoKey(code, down); }); }
+    //
+    // Moves and wheel ticks arrive faster than Windows (and the apps behind it) can digest them, e.g. a
+    // held Ctrl+scroll. They are therefore not posted one by one: they go into a small ordered queue where
+    // consecutive moves collapse into the latest position and consecutive wheel ticks add up, and the hook
+    // thread is woken at most once per batch. The backlog can never grow beyond what one batch holds, so
+    // the lag stops the moment the sender stops. Buttons and keys keep their exact order.
+    void InjectMoveTo(int x, int y) override { QueueInput(QOp::Move, x, y); }
+    void InjectButton(int button, bool down) override { QueueInput(QOp::Button, button, down ? 1 : 0); }
+    void InjectWheel(int dx, int dy) override { QueueInput(QOp::Wheel, dx, dy); }
+    void InjectKey(int code, bool down) override { QueueInput(QOp::Key, code, down ? 1 : 0); }
 
     void DoMoveTo(int x, int y)
     {
@@ -256,6 +264,50 @@ private:
         std::string o;
         for (wchar_t c : w) o += c < 128 ? (char)c : '?';
         return o;
+    }
+
+    // ------------------------------------------------------------ coalescing injection queue
+    enum class QOp : unsigned char { Move, Button, Wheel, Key };
+    struct QItem { QOp op; int a, b; };
+
+    void QueueInput(QOp op, int a, int b)
+    {
+        bool wake = false;
+        {
+            std::lock_guard<std::mutex> lk(qMu_);
+            if (!q_.empty() && q_.back().op == op) {
+                QItem& t = q_.back();
+                if (op == QOp::Move)  { t.a = a; t.b = b; return; }        // absolute target: latest wins
+                if (op == QOp::Wheel) { t.a += a; t.b += b; return; }      // a drain is already pending
+            }
+            q_.push_back({op, a, b});
+            if (!drainPosted_) { drainPosted_ = true; wake = true; }
+        }
+        if (!wake) return;
+        if (tid_ == 0 || !PostThreadMessageW(tid_, kMsgDrain, 0, 0)) {
+            if (tid_ == 0) { DrainInput(); return; }        // hook thread is gone (shutting down)
+            std::lock_guard<std::mutex> lk(qMu_);           // message queue full: try again on the next event
+            drainPosted_ = false;
+        }
+    }
+
+    // Hook thread only.
+    void DrainInput()
+    {
+        std::deque<QItem> batch;
+        {
+            std::lock_guard<std::mutex> lk(qMu_);
+            batch.swap(q_);
+            drainPosted_ = false;                           // anything queued from now on posts a new drain
+        }
+        for (const QItem& i : batch) {
+            switch (i.op) {
+            case QOp::Move:   DoMoveTo(i.a, i.b); break;
+            case QOp::Button: DoButton(i.a, i.b != 0); break;
+            case QOp::Wheel:  DoWheel(i.a, i.b); break;
+            case QOp::Key:    DoKey(i.a, i.b != 0); break;
+            }
+        }
     }
 
     // ------------------------------------------------------------ hook-thread plumbing
@@ -448,6 +500,8 @@ private:
                 } else {
                     Reassert();
                 }
+            } else if (msg.message == kMsgDrain && msg.hwnd == nullptr) {
+                DrainInput();
             } else if (msg.message == kMsgTask && msg.hwnd == nullptr) {
                 auto* task = reinterpret_cast<std::function<void()>*>(msg.lParam);
                 if (task) { (*task)(); delete task; }
@@ -613,6 +667,10 @@ private:
     std::condition_variable initCv_;
     bool initDone_ = false, hookOk_ = false;
     DWORD initErr_ = 0;
+
+    std::mutex qMu_;                     // guards q_ and drainPosted_
+    std::deque<QItem> q_;
+    bool drainPosted_ = false;
 
     std::atomic<bool> fwd_{false};
     std::atomic<bool> hidden_{false};
