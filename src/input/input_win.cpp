@@ -31,10 +31,12 @@ constexpr UINT kPollMs    = 30;           // edge polling while input is local (
 // Plain (non-extended) set-1 scancodes 0x01..0x58 are numerically identical to evdev codes.
 struct ExtEntry { unsigned char scan; unsigned short code; };
 constexpr ExtEntry kExt[] = {
-    {0x1C, 96},  {0x1D, 97},  {0x35, 98},  {0x37, 99},  {0x38, 100}, {0x47, 102},
+    {0x1C, 96},  {0x1D, 97},  {0x35, 98},  {0x36, 54},  {0x37, 99},  {0x38, 100}, {0x47, 102},
     {0x48, 103}, {0x49, 104}, {0x4B, 105}, {0x4D, 106}, {0x4F, 107}, {0x50, 108},
     {0x51, 109}, {0x52, 110}, {0x53, 111}, {0x5B, 125}, {0x5C, 126}, {0x5D, 127},
 };
+// Note 0x36 = Right Shift: the low-level hook reports it WITH LLKHF_EXTENDED on many systems,
+// so it must be in this table or it is dropped (the fake 0x2A Shift around numpad keys stays dropped).
 // Keys whose scancodes are unreliable in the hook: identified by virtual-key.
 struct VkEntry { unsigned char vk; unsigned short code; };
 constexpr VkEntry kVk[] = {
