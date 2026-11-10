@@ -19,6 +19,12 @@
 
 namespace overlay {
 
+// Colours of the popup, 0..255 each: card, border, text, sub, track, upload bar, download bar.
+// The window sends its theme's palette to the daemon, which hands it to the popup (SetColors).
+struct Colors { int c[7][3]; };
+Colors DefaultColors();                  // the dark card used before any theme arrived
+void SetColors(const Colors& c);         // thread-safe; takes effect at the next repaint
+
 struct Row {
     bool upload = true;              // false: download
     std::string peers;               // UTF-8, comma separated

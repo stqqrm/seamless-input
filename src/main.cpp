@@ -405,6 +405,7 @@ private:
         wxColour fill = local ? wxColour(48, 108, 226) : wxColour(66, 54, 38);
         wxColour edge = local ? wxColour(132, 180, 255) : wxColour(255, 176, 72);
         wxColour text = local ? wxColour(246, 249, 255) : wxColour(255, 218, 160);
+        wxColour labelCol = text;          // the name above the monitors sits on the canvas, not on the monitor fill
         if (th_) {
             // this PC: solid accent; other PCs: a pale tint of the warning colour, dashed outline
             auto mix = [](const wxColour& a, const wxColour& b, int pct) {
@@ -423,6 +424,7 @@ private:
                 edge = th_->warn;
                 text = th_->dark ? mix(th_->warn, white, 35) : mix(th_->warn, black, 45);
             }
+            labelCol = local ? th_->text : text;
         }
 
         int minX = INT_MAX, minY = INT_MAX;
@@ -439,7 +441,7 @@ private:
 
         wxString label = g.name;
         if (!g.addr.empty()) label += "   " + g.addr;
-        dc.SetTextForeground(text);
+        dc.SetTextForeground(labelCol);
         wxFont f = dc.GetFont();
         f.SetWeight(wxFONTWEIGHT_BOLD);
         dc.SetFont(f);
@@ -1235,7 +1237,7 @@ private:
 };
 
 // Speaker icon that toggles between "sound on" and "muted" (drawn, no bitmaps needed).
-// Small on/off switch (green when on).
+// Small on/off switch (theme accent colour when on).
 class ToggleSwitch : public wxControl {
 public:
     std::function<void(bool on)> onToggle;
@@ -1270,13 +1272,15 @@ private:
         if (!gc) return;
         const wxSize s = GetClientSize();
         const double h = s.y - 4;
-        wxColour track = on_ ? t_.ok : t_.track;
+        wxColour track = on_ ? t_.accent : t_.track;
         if (hover_ && !on_) track = t_.border;
         gc->SetPen(*wxTRANSPARENT_PEN);
         gc->SetBrush(wxBrush(track));
         gc->DrawRoundedRectangle(0, 2, s.x, h, h / 2);
         const double d = h - 6;
-        gc->SetBrush(wxBrush(wxColour(255, 255, 255)));
+        // knob: white, unless the accent is so light that white would vanish on it
+        const int lum = (t_.accent.Red() * 299 + t_.accent.Green() * 587 + t_.accent.Blue() * 114) / 1000;
+        gc->SetBrush(wxBrush(on_ && lum > 190 ? wxColour(30, 32, 38) : wxColour(255, 255, 255)));
         gc->DrawEllipse(on_ ? s.x - 3 - d : 3, 2 + 3, d, d);
     }
 
@@ -2418,6 +2422,7 @@ private:
         connected_ = true;
         client_->Send("ATTACH");
         UpdateTitle();
+        SendPopupTheme();
         SendMonitorsHint();
         client_->Send("SCAN");
         UpdateHeader();
@@ -2498,6 +2503,17 @@ private:
     // What this window sees of the monitors. The daemon asks the OS itself (Windows, X11) and only uses this
     // where it cannot (Wayland); it is re-sent whenever it changes, so a monitor that is plugged in or
     // rotated while the program runs shows up in the layout.
+    // The clipboard progress popup is drawn by the background service: give it this window's palette.
+    void SendPopupTheme()
+    {
+        if (!connected_ || !client_) return;
+        const wxColour cols[] = {theme_.card, theme_.border, theme_.text, theme_.sub, theme_.track, theme_.accent, theme_.ok};
+        std::string l = "POPUPTHEME";
+        for (const wxColour& c : cols)
+            l += " " + std::to_string((int)c.Red()) + " " + std::to_string((int)c.Green()) + " " + std::to_string((int)c.Blue());
+        client_->Send(l);
+    }
+
     void SendMonitorsHint()
     {
         const auto mons = GetLocalMonitors();
@@ -2687,8 +2703,28 @@ private:
         theme_ = nt;                                     // widgets hold a reference to this: custom-drawn ones follow at once
         themeName_ = nt.name;
         ReThemeTree(this, old, nt);
-        for (auto& kv : cliRows_) kv.second.card->SetFill(ClientTint());     // derived from the palette: recompute
+        {
+            // The client cards use a tint DERIVED from the palette, so ReThemeTree cannot remap it:
+            // repaint the card and every label on it with the new tint.
+            const wxColour tint = ClientTint();
+            for (auto& kv : cliRows_) {
+                kv.second.card->SetFill(tint);
+                ApplyBackground(kv.second.card, tint);
+                kv.second.card->Refresh();
+            }
+        }
+        if (log_) {
+            // Text already in the activity log carries the colours it was appended with: rebuild it.
+            const wxString txt = log_->GetValue();
+            log_->Clear();
+            log_->SetBackgroundColour(nt.page);
+            log_->SetForegroundColour(nt.text);
+            log_->SetDefaultStyle(wxTextAttr(nt.text, nt.page));
+            log_->AppendText(txt);
+            log_->ShowPosition(log_->GetLastPosition());
+        }
         if (canvas_) canvas_->Refresh();
+        SendPopupTheme();                                // the service's progress popup follows the theme too
         SetTitleBarDark(this, nt.dark);
         NativeLookTree(this, nt.dark);
         Thaw();

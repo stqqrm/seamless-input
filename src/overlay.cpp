@@ -27,6 +27,11 @@
 
 namespace overlay {
 
+Colors DefaultColors()
+{
+    return Colors{{{30, 32, 36}, {74, 78, 88}, {236, 238, 242}, {154, 160, 172}, {62, 66, 76}, {86, 142, 255}, {72, 200, 132}}};
+}
+
 namespace {
 
 constexpr int kWidth = 300;          // design pixels (scaled by the monitor's DPI on Windows)
@@ -37,10 +42,24 @@ constexpr int kMargin = 16;
 constexpr int kBar = 8;
 constexpr auto kStale = std::chrono::seconds(4);   // no update from the daemon for this long: hide
 
-// Colours (R, G, B): a dark card that reads well on any desktop, translucent through the window opacity.
+// Colours (R, G, B): by default a dark card that reads well on any desktop, translucent through the window
+// opacity. The window's theme replaces them (SetColors), so the popup matches the GUI.
 struct Rgb { int r, g, b; };
-constexpr Rgb kCard{30, 32, 36}, kBorder{74, 78, 88}, kText{236, 238, 242}, kSub{154, 160, 172}, kTrack{62, 66, 76};
-constexpr Rgb kUpload{86, 142, 255}, kDownload{72, 200, 132};
+struct Pal { Rgb card, border, text, sub, track, upload, download; unsigned ver = 0; };
+
+std::mutex g_palMu;
+Colors g_cols = DefaultColors();
+unsigned g_palVer = 1;
+
+Pal GetPal()
+{
+    std::lock_guard<std::mutex> l(g_palMu);
+    auto at = [&](int i) { return Rgb{g_cols.c[i][0], g_cols.c[i][1], g_cols.c[i][2]}; };
+    Pal p;
+    p.card = at(0); p.border = at(1); p.text = at(2); p.sub = at(3); p.track = at(4); p.upload = at(5); p.download = at(6);
+    p.ver = g_palVer;
+    return p;
+}
 
 std::string Size(std::uint64_t b)
 {
@@ -214,13 +233,14 @@ void Paint(Win& w, HDC target, int W, int H)
     HGDIOBJ ob = SelectObject(dc, bmp);
     SetBkMode(dc, TRANSPARENT);
 
-    HBRUSH bg = CreateSolidBrush(Cr(kCard));
+    const Pal P = GetPal();
+    HBRUSH bg = CreateSolidBrush(Cr(P.card));
     RECT all{0, 0, W, H};
     FillRect(dc, &all, bg);
     DeleteObject(bg);
 
     const double s = w.scale;
-    HPEN pen = CreatePen(PS_SOLID, 1, Cr(kBorder));
+    HPEN pen = CreatePen(PS_SOLID, 1, Cr(P.border));
     HGDIOBJ op = SelectObject(dc, pen);
     HGDIOBJ obr = SelectObject(dc, GetStockObject(NULL_BRUSH));
     const int rad = (int)std::lround(10 * s);
@@ -239,15 +259,15 @@ void Paint(Win& w, HDC target, int W, int H)
     for (size_t i = 0; i < w.rows.size(); ++i) {
         const Row& r = w.rows[i];
         const double y = kPad * s + (double)i * rowH;
-        const Rgb& col = r.upload ? kUpload : kDownload;
+        const Rgb& col = r.upload ? P.upload : P.download;
 
         const int titleTop = (int)std::lround(y + 6 * s);
         const int titleH = (int)std::lround(18 * s);
-        Text(dc, r.upload ? "Uploading" : "Downloading", bold, kText, RECT{(int)side, titleTop, W, titleTop + titleH}, DT_LEFT | DT_VCENTER);
-        Text(dc, Percent(r), bold, kText, RECT{0, titleTop, (int)(W - side), titleTop + titleH}, DT_RIGHT | DT_VCENTER);
+        Text(dc, r.upload ? "Uploading" : "Downloading", bold, P.text, RECT{(int)side, titleTop, W, titleTop + titleH}, DT_LEFT | DT_VCENTER);
+        Text(dc, Percent(r), bold, P.text, RECT{0, titleTop, (int)(W - side), titleTop + titleH}, DT_RIGHT | DT_VCENTER);
 
         const double by = y + 6 * s + titleH + 6 * s;
-        FillRound(dc, kTrack, side, by, inner, barH, barH);
+        FillRound(dc, P.track, side, by, inner, barH, barH);
         const double f = Fraction(r);
         if (f < 0) {                                         // moving segment
             const double seg = inner * 0.3;
@@ -259,7 +279,7 @@ void Paint(Win& w, HDC target, int W, int H)
         }
 
         const int infoTop = (int)std::lround(by + barH + 4 * s);
-        Text(dc, Info(r), small, kSub, RECT{(int)side, infoTop, (int)(W - side), infoTop + (int)std::lround(16 * s)},
+        Text(dc, Info(r), small, P.sub, RECT{(int)side, infoTop, (int)(W - side), infoTop + (int)std::lround(16 * s)},
              DT_LEFT | DT_VCENTER | DT_END_ELLIPSIS);
     }
     DeleteObject(bold);
@@ -379,6 +399,7 @@ struct X {
     XFontStruct* bold = nullptr;
     XFontStruct* plain = nullptr;
     unsigned long px[8]{};          // card, border, text, sub, track, upload, download
+    unsigned palVer = 0;            // version of the palette px[] was allocated from
     int w = 0, h = 0, x = 0, y = 0;
     bool visible = false;
     unsigned step = 0;
@@ -429,6 +450,16 @@ std::string Latin(const std::string& s)
     return o;
 }
 
+// Re-allocates the pixel values when the window's theme changed.
+void RefreshColors(X& x)
+{
+    const Pal p = GetPal();
+    if (p.ver == x.palVer) return;
+    const Rgb cols[] = {p.card, p.border, p.text, p.sub, p.track, p.upload, p.download};
+    for (int i = 0; i < 7; ++i) x.px[i] = Alloc(x.dpy, cols[i]);
+    x.palVer = p.ver;
+}
+
 void FillRound(X& x, Drawable dr, unsigned long col, int px, int py, int w, int h)
 {
     XSetForeground(x.dpy, x.gc, col);
@@ -455,6 +486,7 @@ void DrawStr(X& x, Drawable dr, XFontStruct* f, unsigned long col, int px, int b
 
 void Paint(X& x)
 {
+    RefreshColors(x);
     Pixmap pm = XCreatePixmap(x.dpy, x.win, (unsigned)x.w, (unsigned)x.h, (unsigned)DefaultDepth(x.dpy, DefaultScreen(x.dpy)));
     XSetForeground(x.dpy, x.gc, x.px[CCard]);
     XFillRectangle(x.dpy, pm, x.gc, 0, 0, (unsigned)x.w, (unsigned)x.h);
@@ -557,8 +589,7 @@ void Popup::Impl::Run()
     x.win = XCreateWindow(x.dpy, RootWindow(x.dpy, scr), 0, 0, (unsigned)x.w, (unsigned)x.h, 0, CopyFromParent, InputOutput,
                           CopyFromParent, CWOverrideRedirect | CWBackPixel | CWBorderPixel | CWEventMask, &at);
     x.gc = XCreateGC(x.dpy, x.win, 0, nullptr);
-    const Rgb cols[] = {kCard, kBorder, kText, kSub, kTrack, kUpload, kDownload};
-    for (int i = 0; i < 7; ++i) x.px[i] = Alloc(x.dpy, cols[i]);
+    RefreshColors(x);
     x.bold = LoadFont(x.dpy, true);
     x.plain = LoadFont(x.dpy, false);
 
@@ -637,6 +668,13 @@ void Popup::Set(const std::vector<Row>& rows)
         d_->lastSet = std::chrono::steady_clock::now();
     }
     d_->Wake();
+}
+
+void SetColors(const Colors& c)
+{
+    std::lock_guard<std::mutex> l(g_palMu);
+    g_cols = c;
+    ++g_palVer;
 }
 
 void Popup::SetMonitors(const std::vector<InputRect>& mons)

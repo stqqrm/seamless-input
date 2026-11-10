@@ -193,6 +193,11 @@ bool Core::Start(std::string* err)
             if (k == "limit") clip_->SetLimit(v);
             else if (k == "telemetry") clipTelemetry_ = v != 0;
         }
+        std::ifstream tf(dir_ / "popup-theme.txt");          // the popup's colours = the window's last theme
+        std::vector<int> rgb;
+        int n = 0;
+        while (tf >> n) rgb.push_back(n);
+        if (rgb.size() == 21) CmdPopupTheme(rgb);
     }
 
     Post([this] {
@@ -1127,6 +1132,17 @@ void Core::CmdClipLimit(std::uint64_t bytes)
     SaveClipSettings();
     Log("Clipboard limit: " + ClipShare::FormatBytes(clip_->Limit()));    // clamped
     Changed();
+}
+
+void Core::CmdPopupTheme(const std::vector<int>& rgb)
+{
+    if (rgb.size() != 21) return;
+    overlay::Colors c{};
+    for (int i = 0; i < 7; ++i)
+        for (int k = 0; k < 3; ++k) c.c[i][k] = std::clamp(rgb[(size_t)i * 3 + (size_t)k], 0, 255);
+    overlay::SetColors(c);
+    std::ofstream f(dir_ / "popup-theme.txt", std::ios::trunc);    // so the popup keeps the colours when no window is open
+    for (size_t i = 0; i < rgb.size(); ++i) f << std::clamp(rgb[i], 0, 255) << (i + 1 < rgb.size() ? " " : "\n");
 }
 
 void Core::CmdClipTelemetry(bool on)

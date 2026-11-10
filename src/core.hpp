@@ -66,6 +66,7 @@ public:
     void CmdControl(int id, bool allow);                    // may this PC control ours?
     void CmdClipLimit(std::uint64_t bytes);                 // largest clipboard (text / files) that is copied to another PC
     void CmdClipboard(int id, bool share);                  // send my clipboard to this PC whenever I copy something
+    void CmdPopupTheme(const std::vector<int>& rgb21);      // the window's palette for the progress popup (7 colours x RGB)
     void CmdClipTelemetry(bool on);                         // progress popup while the clipboard is uploaded / downloaded
     bool ClipTelemetryEnabled() const { return clipTelemetry_; }
     void CmdMonitorsHint(const std::vector<InputRect>& mons);

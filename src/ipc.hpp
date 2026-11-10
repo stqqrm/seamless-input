@@ -11,6 +11,7 @@
 //                                              CLIPTELEMETRY <0|1>   (the popup is drawn by the daemon)
 //                                                  MASTER <mute> <vol> | CONTROL <id> <0|1>
 //                                                  CLIPBOARD <id> <0|1> | CLIPLIMIT <bytes>
+//                                                  POPUPTHEME <21 numbers>  (popup colours: card border text sub track upload download, RGB each)
 //                                                  CLEARCACHE | REGENKEYS
 //                                                  STOP | PING
 // Text fields are percent-encoded (see Enc); the empty string is "~".
