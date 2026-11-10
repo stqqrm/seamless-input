@@ -10,6 +10,7 @@
 #include <fstream>
 #include <vector>
 
+#include "ipc.hpp"
 #include "paths.hpp"
 
 namespace svc {
@@ -164,6 +165,24 @@ bool StartManaged(std::string* err)
         if (err) *err = "systemctl --user start failed";
         return false;
     }
+    return true;
+}
+
+bool StopManaged(const std::filesystem::path& dataDir, std::string* err)
+{
+    if (SystemdUser() && std::filesystem::exists(UnitPath()) &&
+        RunCmd({"systemctl", "--user", "is-active", kUnit}) == 0) {
+        if (RunCmd({"systemctl", "--user", "stop", kUnit}) != 0) {
+            if (err) *err = "systemctl --user stop failed";
+            return false;
+        }
+        WaitGone(dataDir, 5000);
+        return true;
+    }
+    // started directly (no unit, or the unit is off): ask politely, then force
+    if (ipc::Ping(dataDir)) { ipc::RequestStop(dataDir); WaitGone(dataDir, 3000); }
+    KillDaemons();
+    if (!WaitGone(dataDir, 3000)) { if (err) *err = "the daemon did not stop"; return false; }
     return true;
 }
 

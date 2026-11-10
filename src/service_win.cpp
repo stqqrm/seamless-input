@@ -398,9 +398,19 @@ void ClearStrayDaemons(const std::filesystem::path& dataDir)
 std::atomic<bool> g_installTried{false};
 } // namespace
 
+namespace {
+std::filesystem::path DeclinedMarker(const std::filesystem::path& dataDir) { return dataDir / "service-uninstalled"; }
+bool Declined(const std::filesystem::path& dataDir)
+{
+    std::error_code ec;
+    return std::filesystem::exists(DeclinedMarker(dataDir), ec);
+}
+} // namespace
+
 bool PrepareManaged(const std::filesystem::path& dataDir, std::string* err)
 {
     AutostartInfo a = QueryAutostart();
+    if (!a.installed && Declined(dataDir)) return false;            // the user removed it on purpose: do not nag
     if (!a.installed || !a.current) {
         if (g_installTried.exchange(true)) return a.installed;      // declined or failed once: do not nag again
         ClearStrayDaemons(dataDir);
@@ -408,6 +418,32 @@ bool PrepareManaged(const std::filesystem::path& dataDir, std::string* err)
         return true;
     }
     if (!a.managerRunning && ipc::Ping(dataDir, 500)) ClearStrayDaemons(dataDir);
+    return true;
+}
+
+bool InstallServiceNow(const std::filesystem::path& dataDir, std::string* err)
+{
+    std::error_code ec;
+    std::filesystem::remove(DeclinedMarker(dataDir), ec);
+    ClearStrayDaemons(dataDir);                                     // a user-level daemon would hold the port
+    return RunElevated(L"--install-service --keep", err);
+}
+
+bool UninstallServiceNow(const std::filesystem::path& dataDir, std::string* err)
+{
+    if (!RunElevated(L"--uninstall-service", err)) return false;
+    std::error_code ec;
+    std::filesystem::create_directories(dataDir, ec);
+    std::ofstream(DeclinedMarker(dataDir)) << "the service was removed from the Service menu\n";
+    return true;
+}
+
+bool StopManaged(const std::filesystem::path&, std::string* err)
+{
+    ScHandle scm(OpenSCManagerW(nullptr, nullptr, SC_MANAGER_CONNECT));
+    ScHandle sv(scm ? OpenServiceW(scm.h, kName, SERVICE_STOP | SERVICE_QUERY_STATUS) : nullptr);
+    if (!sv) { if (err) *err = "the service is not installed or not accessible"; return false; }
+    if (!StopServiceAndWait(sv.h, 15000)) { if (err) *err = "the service did not stop in time"; return false; }
     return true;
 }
 

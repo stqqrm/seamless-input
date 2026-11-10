@@ -9,9 +9,19 @@ seamless-input is two programs:
 
 Starting the window starts the daemon if it is not running. Keep both executables in the same folder.
 
-## Autostart (Service menu)
+## Service / Daemon menu
 
-*Service menu -> Autostart at login* (Windows: *Start service with Windows*).
+The menu is called **Service** on Windows and **Daemon** on Linux.
+
+| Item | Windows (*Service* menu) | Linux (*Daemon* menu) |
+|---|---|---|
+| Install / Uninstall | installs or removes the Windows service (one UAC prompt) | - |
+| Enable / Disable | *Start service with Windows* (greyed out while the service is not installed) | *Autostart at login* |
+| Stop / Start | stops or starts the service (greyed out while not installed) | stops or starts the daemon |
+
+Stopping keeps the daemon stopped until you press Start. On Linux nothing is ever greyed out. After *Uninstall* on
+Windows the window runs a plain daemon without administrator rights (no control of elevated windows or UAC) and does not
+install the service again by itself; *Install* turns that back on.
 
 | OS | What it does |
 |---|---|

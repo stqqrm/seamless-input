@@ -32,6 +32,9 @@ bool DisableAutostart(std::string* err);    // Windows: same
 bool StartManaged(std::string* err);
 // Starts the daemon directly, detached from the caller (it survives the caller).
 bool SpawnDetached(std::string* err);
+// Stops the daemon and keeps it stopped until the next start: Windows stops the service (no UAC prompt),
+// Linux stops the systemd unit, or asks the daemon to quit / kills it when there is no unit.
+bool StopManaged(const std::filesystem::path& dataDir, std::string* err);
 
 // Makes sure a daemon answers on the IPC port: managed start when autostart is on, else a direct
 // spawn. Blocks up to waitMs. Safe to call when one already runs.
@@ -54,6 +57,10 @@ bool PrepareManaged(const std::filesystem::path& dataDir, std::string* err);
 // Windows: re-points the service at this build's daemon exe and restarts it (one UAC prompt): the answer to
 // "versions do not match".
 bool ReplaceService(std::string* err);
+// Windows: install / remove the service on request (Service menu, one UAC prompt each). Uninstalling leaves a
+// marker so the window does not install the service again by itself; installing removes it.
+bool InstallServiceNow(const std::filesystem::path& dataDir, std::string* err);
+bool UninstallServiceNow(const std::filesystem::path& dataDir, std::string* err);
 // Windows: true when the daemon exe sits where ordinary users can write (the service runs it as SYSTEM).
 bool InstallLocationUnsafe();
 

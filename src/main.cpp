@@ -2344,7 +2344,7 @@ public:
 private:
     static constexpr int kTimerId     = 9000;
     static constexpr int kAnimTimerId = 9001;
-    enum { kIdAutostart = 9100, kIdSvcInfo, kIdOpenSettingsMenu,
+    enum { kIdAutostart = 9100, kIdSvcInfo, kIdOpenSettingsMenu, kIdSvcInstall, kIdSvcRun,
            kIdClearCache, kIdRegenKeys, kIdViewKeys,
            kIdThemeSystem = 9400, kIdThemeReload, kIdThemeFolder, kIdThemeBase = 9500 };   // kIdThemeBase + n: the n-th theme
 
@@ -2570,10 +2570,18 @@ private:
         auto item = [](int id, const wxString& label) { MenuItemDef d; d.id = id; d.label = label; return d; };
         auto sep = [] { MenuItemDef d; d.separator = true; return d; };
 
-        MenuItemDef autostart = item(kIdAutostart, "Autostart");   // label and dot are set in RefreshServiceMenu
+        // Labels, dots and hints are set in RefreshServiceMenu.
+        MenuItemDef autostart = item(kIdAutostart, "Autostart");
+        MenuItemDef run = item(kIdSvcRun, "Running");
         MenuItemDef info = item(kIdSvcInfo, "Background service: ...");
         info.enabled = false;
-        menuBar_->AddMenu("Service", { autostart, sep(), info });
+#if defined(__WXMSW__)
+        // Windows: a real Windows service that can be installed and removed.
+        menuBar_->AddMenu("Service", { item(kIdSvcInstall, "Installed"), autostart, run, sep(), info });
+#else
+        // Linux (and others): there is no service to install, only the daemon to enable and to run.
+        menuBar_->AddMenu("Daemon", { autostart, run, sep(), info });
+#endif
 
         menuBar_->AddMenu("Security", { item(kIdClearCache, "Clear cache"),
                                         item(kIdRegenKeys, "Regenerate keys"),
@@ -2597,6 +2605,8 @@ private:
 
         Bind(wxEVT_MENU, [this](wxCommandEvent&) { Close(); }, wxID_CLOSE);
         Bind(wxEVT_MENU, &MainFrame::OnAutostart, this, kIdAutostart);
+        Bind(wxEVT_MENU, &MainFrame::OnSvcInstall, this, kIdSvcInstall);
+        Bind(wxEVT_MENU, &MainFrame::OnSvcRun, this, kIdSvcRun);
         Bind(wxEVT_MENU, [this](wxCommandEvent&) { OnClearCache(); }, kIdClearCache);
         Bind(wxEVT_MENU, [this](wxCommandEvent&) { OnRegenKeys(); }, kIdRegenKeys);
         Bind(wxEVT_MENU, [this](wxCommandEvent&) { OnViewKeys(); }, kIdViewKeys);
@@ -2607,7 +2617,7 @@ private:
             const size_t i = (size_t)(e.GetId() - kIdThemeBase);
             if (i < themes_.size()) ApplyTheme(themes_[i].theme, true);
         }, kIdThemeBase, kIdThemeBase + 299);
-        Bind(wxEVT_MENU, [this](wxCommandEvent&) { menuBar_->OpenMenu(0); }, kIdOpenSettingsMenu);   // the Service menu
+        Bind(wxEVT_MENU, [this](wxCommandEvent&) { menuBar_->OpenMenu(0); }, kIdOpenSettingsMenu);   // the Service (Daemon) menu
 
         // keyboard shortcuts (a native menu bar used to provide these)
         std::vector<wxAcceleratorEntry> keys;
@@ -2734,31 +2744,54 @@ private:
         if (save) SaveThemeChoice(nt.name);
     }
 
-    // Service menu. Left: a dot with the name of the setting = its CURRENT state (green on / red off).
-    // Right (dim): what a click does. The items are never greyed out: the open list is a snapshot and
-    // cannot change by itself, so a greyed item would stay greyed until the menu is opened again.
-    // While a change is being applied the hint says "Working..." and clicks are ignored.
-    //   Autostart : the daemon starts by itself at boot / login.
-    //   Service   : the daemon is running right now.
+    // Service menu (Windows) / Daemon menu (Linux). Left: a dot with the name of the setting = its CURRENT
+    // state (green on / red off). Right (dim): what a click does. While a change is being applied the hint
+    // says "Working..." and clicks are ignored.
+    //   Windows:  Installed  (Install / Uninstall)   the Windows service exists. Always available.
+    //             Autostart  (Enable / Disable)      Windows starts it at boot.      Greyed out: not installed.
+    //             Running    (Stop / Start)          the service is running now.     Greyed out: not installed.
+    //   Linux:    Autostart  (Enable / Disable)      the daemon starts at login.
+    //             Running    (Stop / Start)          the daemon is running now.
+    //             Never greyed out. (The open list is a snapshot: it is refreshed every time the menu opens,
+    //             and every click closes it, so a greyed item cannot go stale.)
     void RefreshServiceMenu()
     {
         if (!menuBar_) return;
         const svc::AutostartInfo a = svc::QueryAutostart();
         autostartOn_ = a.enabled;
+        const bool running = connected_ && daemonWanted_;
+        const wxString work = "Working...";
 #if defined(__WXMSW__)
-        // The service is always installed; this only decides whether Windows starts it at boot (otherwise the
-        // window starts it when it opens).
-        const wxString autoName = "Start service with Windows";
+        const bool usable = a.installed;            // Autostart and Stop/Start need the service to exist
+        const wxString what = "Service";
+        if (MenuItemDef* m = menuBar_->Item(kIdSvcInstall)) {
+            m->dot = a.installed ? 1 : 2;
+            m->label = a.installed ? "Service installed" : "Service not installed";
+            m->accel = busy_ ? work : wxString(a.installed ? "Uninstall" : "Install");
+            m->enabled = true;
+        }
+        if (MenuItemDef* m = menuBar_->Item(kIdAutostart)) {
+            m->dot = usable ? (a.enabled ? 1 : 2) : 0;
+            m->label = "Start service with Windows";
+            m->accel = !usable ? wxString() : busy_ ? work : wxString(a.enabled ? "Disable" : "Enable");
+            m->enabled = usable;
+        }
 #else
-        const wxString autoName = "Autostart at login";
-#endif
+        const bool usable = true;
+        const wxString what = "Daemon";
         if (MenuItemDef* m = menuBar_->Item(kIdAutostart)) {
             m->dot = a.supported ? (a.enabled ? 1 : 2) : 0;
-            m->label = a.supported ? autoName : autoName + " (not supported here)";
-            m->accel = !a.supported ? wxString() : busy_ ? wxString("Working...") : wxString(a.enabled ? "Disable" : "Enable");
-            m->enabled = a.supported;
+            m->label = a.supported ? wxString("Autostart at login") : wxString("Autostart at login (not supported here)");
+            m->accel = !a.supported ? wxString() : busy_ ? work : wxString(a.enabled ? "Disable" : "Enable");
+            m->enabled = true;                      // Linux: never greyed out
         }
-        const bool running = connected_ && daemonWanted_;
+#endif
+        if (MenuItemDef* m = menuBar_->Item(kIdSvcRun)) {
+            m->dot = usable ? (running ? 1 : 2) : 0;
+            m->label = what + (running ? " running" : " stopped");
+            m->accel = !usable ? wxString() : busy_ ? work : wxString(running ? "Stop" : "Start");
+            m->enabled = usable;
+        }
         if (MenuItemDef* m = menuBar_->Item(kIdSvcInfo)) {
             const wxString st = running ? "running" : (daemonWanted_ && !connected_) ? "not reachable" : "stopped";
             wxString ver;
@@ -2773,7 +2806,6 @@ private:
         busy_ = true;
         (void)e;
         const bool on = !autostartOn_;                  // the item is an action, not a check box
-        daemonWanted_ = true;
         Log(on ? "Enabling autostart of the background service..." : "Disabling autostart of the background service...");
         auto alive = alive_;
         const auto dir = dataDir_;
@@ -2781,9 +2813,10 @@ private:
             std::string err, err2;
             bool ok = on ? svc::EnableAutostart(&err) : svc::DisableAutostart(&err);
 #if !defined(_WIN32)
-            if (ok) {
-                // hand the daemon over to its new owner, or keep one running for this window
-                if (ipc::Ping(dir)) { ipc::RequestStop(dir); svc::WaitGone(dir, 5000); }
+            if (ok && ipc::Ping(dir)) {
+                // a running daemon is handed over to its new owner (a stopped one stays stopped)
+                ipc::RequestStop(dir);
+                svc::WaitGone(dir, 5000);
                 svc::EnsureDaemon(dir, &err2);
             }
 #else
@@ -2800,6 +2833,61 @@ private:
                        : "Autostart is off");
         else    wxMessageBox(wxString::FromUTF8(err), "Autostart", wxOK | wxICON_WARNING, this);
         retry_ = 3;     // reconnect right away
+    }
+
+    // Install / Uninstall (Windows only: Linux has no service to install). One UAC prompt each.
+    void OnSvcInstall(wxCommandEvent&)
+    {
+#if defined(_WIN32)
+        if (busy_) { Log("Still applying the last change, please wait..."); return; }
+        const bool install = !svc::QueryAutostart().installed;
+        busy_ = true;
+        daemonWanted_ = true;
+        Log(install ? "Installing the Windows service..." : "Uninstalling the Windows service...");
+        auto alive = alive_;
+        const auto dir = dataDir_;
+        std::thread([this, alive, dir, install] {
+            std::string err;
+            const bool ok = install ? svc::InstallServiceNow(dir, &err) : svc::UninstallServiceNow(dir, &err);
+            wxTheApp->CallAfter([this, alive, ok, install, err] {
+                if (!*alive) return;
+                busy_ = false;
+                if (ok) Log(install ? "Service installed: it can control elevated windows and the UAC prompt"
+                                    : "Service uninstalled: the daemon now runs without administrator rights");
+                else    wxMessageBox(wxString::FromUTF8(err), "Service", wxOK | wxICON_WARNING, this);
+                connFails_ = 0;
+                retry_ = 3;                         // reconnect right away
+            });
+        }).detach();
+#endif
+    }
+
+    // Stop / Start the daemon. Stopping keeps it stopped (the window does not bring it back) until Start.
+    void OnSvcRun(wxCommandEvent&)
+    {
+        if (busy_) { Log("Still applying the last change, please wait..."); return; }
+        const bool start = !(connected_ && daemonWanted_);
+        busy_ = true;
+        daemonWanted_ = start;                      // before stopping: the lost connection must not be "repaired"
+        Log(start ? "Starting the background service..." : "Stopping the background service...");
+        auto alive = alive_;
+        const auto dir = dataDir_;
+        std::thread([this, alive, dir, start] {
+            std::string err;
+            const bool ok = start ? svc::EnsureDaemon(dir, &err) : svc::StopManaged(dir, &err);
+            wxTheApp->CallAfter([this, alive, ok, start, err] {
+                if (!*alive) return;
+                busy_ = false;
+                if (!ok) {
+                    daemonWanted_ = !start;         // it did not change: go back to what it was
+                    wxMessageBox(wxString::FromUTF8(err), start ? "Start" : "Stop", wxOK | wxICON_WARNING, this);
+                } else {
+                    Log(start ? "Background service started" : "Background service stopped");
+                }
+                connFails_ = 0;
+                retry_ = 3;                         // reconnect right away (only when it is wanted)
+            });
+        }).detach();
     }
 
     // ------------------------------------------------------------ security menu
