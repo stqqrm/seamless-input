@@ -1273,10 +1273,12 @@ private:
         const wxSize s = GetClientSize();
         const double h = s.y - 4;
         wxColour track = on_ ? t_.accent : t_.track;
-        if (hover_ && !on_) track = t_.border;
-        gc->SetPen(*wxTRANSPARENT_PEN);
+        if (!on_ && !t_.dark) track = MixColour(t_.track, t_.sub, hover_ ? 70 : 55);   // light themes: the pale track vanishes on a white card
+        else if (!on_ && hover_) track = t_.border;
+        if (on_) gc->SetPen(*wxTRANSPARENT_PEN);
+        else     gc->SetPen(wxPen(MixColour(t_.track, t_.sub, t_.dark ? 40 : 80), 1));   // thin outline so the off switch is always visible
         gc->SetBrush(wxBrush(track));
-        gc->DrawRoundedRectangle(0, 2, s.x, h, h / 2);
+        gc->DrawRoundedRectangle(0.5, 2.5, s.x - 1, h - 1, (h - 1) / 2);
         const double d = h - 6;
         // knob: white, unless the accent is so light that white would vanish on it
         const int lum = (t_.accent.Red() * 299 + t_.accent.Green() * 587 + t_.accent.Blue() * 114) / 1000;
