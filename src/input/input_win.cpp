@@ -14,7 +14,9 @@
 #include <cstdlib>
 #include <cstring>
 #include <condition_variable>
+#include <functional>
 #include <mutex>
+#include <string>
 #include <thread>
 
 #include "input/input_backend.hpp"
@@ -25,6 +27,8 @@ namespace {
 constexpr ULONG_PTR kTag = 0x53454D4CUL;
 constexpr UINT kMsgKbdOn  = WM_APP + 1;
 constexpr UINT kMsgKbdOff = WM_APP + 2;
+constexpr UINT kMsgTask   = WM_APP + 3;   // lParam: heap-allocated std::function<void()> to run on the hook thread
+constexpr unsigned kDeskCheckTicks = 4;   // check for a desktop switch every 4th edge poll (~120 ms)
 constexpr UINT kPollMs    = 30;           // edge polling while input is local (see PollEdge)
 
 // ---- key translation: Windows hook (vk / scancode+extended)  <->  Linux evdev code
@@ -58,6 +62,26 @@ int ToEvdev(const KBDLLHOOKSTRUCT& k)
     return (k.scanCode >= 1 && k.scanCode <= 0x58) ? (int)k.scanCode : 0;
 }
 
+// Administrator (elevated) or SYSTEM: only then do hooks and SendInput reach elevated windows.
+bool IsPrivileged()
+{
+    HANDLE tok = nullptr;
+    if (!OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &tok)) return false;
+    TOKEN_ELEVATION el{};
+    DWORD n = 0;
+    const bool ok = GetTokenInformation(tok, TokenElevation, &el, sizeof el, &n) && el.TokenIsElevated;
+    CloseHandle(tok);
+    return ok;
+}
+
+std::wstring DesktopName(HDESK d)
+{
+    wchar_t buf[256] = {};
+    DWORD need = 0;
+    if (!d || !GetUserObjectInformationW(d, UOI_NAME, buf, sizeof buf, &need)) return {};
+    return buf;
+}
+
 class WindowsBackend : public InputBackend {
 public:
     const char* Name() const override { return "Windows (SetWindowsHookEx / SendInput)"; }
@@ -79,6 +103,10 @@ public:
             if (err) *err = "SetWindowsHookEx(WH_MOUSE_LL) failed, error " + std::to_string(initErr_);
             return false;
         }
+        if (err && !IsPrivileged())
+            *err = "running without administrator rights: Task Manager, other elevated windows and UAC prompts cannot be "
+                   "controlled. Turn on Settings -> Start the background daemon with Windows (the service runs it with "
+                   "the rights it needs).";
         return true;
     }
 
@@ -111,12 +139,19 @@ public:
     {
         fwd_ = false;
         PostThreadMessageW(tid_, kMsgKbdOff, 0, 0);
-        SetCursorPos(x, y);
-        ShowCursorAgain();
+        // cursor and cursor scheme belong to the desktop the hook thread is on (it follows the UAC desktop)
+        RunOnHookThread([this, x, y] { SetCursorPos(x, y); ShowCursorAgain(); });
     }
 
-    // ------------------------------------------------------------ injection
-    void InjectMoveTo(int x, int y) override
+    // ------------------------------------------------------------ injection (any thread)
+    // Everything that touches the input stream runs on the hook thread: it is the one thread that follows the
+    // input desktop (see FollowInputDesktop), so the input also reaches the UAC prompt and the lock screen.
+    void InjectMoveTo(int x, int y) override { RunOnHookThread([this, x, y] { DoMoveTo(x, y); }); }
+    void InjectButton(int button, bool down) override { RunOnHookThread([this, button, down] { DoButton(button, down); }); }
+    void InjectWheel(int dx, int dy) override { RunOnHookThread([this, dx, dy] { DoWheel(dx, dy); }); }
+    void InjectKey(int code, bool down) override { RunOnHookThread([this, code, down] { DoKey(code, down); }); }
+
+    void DoMoveTo(int x, int y)
     {
         const int vx = GetSystemMetrics(SM_XVIRTUALSCREEN), vy = GetSystemMetrics(SM_YVIRTUALSCREEN);
         const int vw = std::max(2, (int)GetSystemMetrics(SM_CXVIRTUALSCREEN));
@@ -130,7 +165,7 @@ public:
         SendInput(1, &in, sizeof in);
     }
 
-    void InjectButton(int button, bool down) override
+    void DoButton(int button, bool down)
     {
         INPUT in{};
         in.type = INPUT_MOUSE;
@@ -146,7 +181,7 @@ public:
         SendInput(1, &in, sizeof in);
     }
 
-    void InjectWheel(int dx, int dy) override
+    void DoWheel(int dx, int dy)
     {
         INPUT in[2] = {};
         UINT n = 0;
@@ -167,7 +202,7 @@ public:
         if (n) SendInput(n, in, sizeof(INPUT));
     }
 
-    void InjectKey(int code, bool down) override
+    void DoKey(int code, bool down)
     {
         INPUT in{};
         in.type = INPUT_KEYBOARD;
@@ -200,6 +235,63 @@ public:
     }
 
 private:
+    // ------------------------------------------------------------ hook-thread plumbing
+    void RunOnHookThread(std::function<void()> fn)
+    {
+        if (GetCurrentThreadId() == tid_) { fn(); return; }
+        auto* task = new std::function<void()>(std::move(fn));
+        if (tid_ == 0 || !PostThreadMessageW(tid_, kMsgTask, 0, reinterpret_cast<LPARAM>(task))) {
+            (*task)();                      // hook thread is gone (shutting down): do it here
+            delete task;
+        }
+    }
+
+    void InstallHooks()
+    {
+        if (!mouse_) mouse_ = SetWindowsHookExW(WH_MOUSE_LL, &MouseThunk, GetModuleHandleW(nullptr), 0);
+        if (!kbd_)   kbd_   = SetWindowsHookExW(WH_KEYBOARD_LL, &KbdThunk, GetModuleHandleW(nullptr), 0);
+    }
+
+    void RemoveHooks()
+    {
+        if (kbd_)   { UnhookWindowsHookEx(kbd_);   kbd_ = nullptr; }
+        if (mouse_) { UnhookWindowsHookEx(mouse_); mouse_ = nullptr; }
+    }
+
+    // Hook thread only. Hooks, windows, the cursor and injected input belong to the DESKTOP of the thread that
+    // made them. The UAC prompt, Ctrl+Alt+Del and the lock screen are shown on another desktop ("Winlogon"),
+    // which a normal user process cannot even open. So: watch which desktop receives input, and when it changes,
+    // move this thread (hooks + cursor overlay) there. Needs SYSTEM (the service worker); without it
+    // OpenInputDesktop simply fails on the secure desktop and nothing changes.
+    bool FollowInputDesktop()
+    {
+        HDESK in = OpenInputDesktop(0, FALSE, GENERIC_ALL);
+        if (!in) in = OpenInputDesktop(0, FALSE, DESKTOP_CREATEWINDOW | DESKTOP_HOOKCONTROL | DESKTOP_READOBJECTS |
+                                                     DESKTOP_WRITEOBJECTS | DESKTOP_SWITCHDESKTOP);
+        if (!in) return false;              // not allowed, or the desktop is switching right now
+        const std::wstring name = DesktopName(in);
+        if (name.empty() || name == deskName_ || name == deskFailed_) { CloseDesktop(in); return false; }
+
+        // SetThreadDesktop fails while the thread still owns hooks or windows on the old desktop
+        RemoveHooks();
+        HideOverlay();
+        if (overlay_) { DestroyWindow(overlay_); overlay_ = nullptr; }
+        if (!SetThreadDesktop(in)) {
+            deskFailed_ = name;             // do not retry every 120 ms
+            CloseDesktop(in);
+            InstallHooks();
+            if (fwd_) ShowOverlay();
+            return false;
+        }
+        if (deskOwned_) CloseDesktop(deskOwned_);
+        deskOwned_ = in;
+        deskName_ = name;
+        deskFailed_.clear();
+        InstallHooks();
+        if (fwd_) ShowOverlay();
+        return true;
+    }
+
     // ------------------------------------------------------------ cursor visibility
     // ShowCursor() only affects the calling thread's windows. The reliable way to hide the
     // pointer everywhere is to replace every system cursor with a fully transparent one and
@@ -301,7 +393,9 @@ private:
         MSG msg;
         PeekMessageW(&msg, nullptr, WM_USER, WM_USER, PM_NOREMOVE);   // create the message queue
         tid_ = GetCurrentThreadId();
-        mouse_ = SetWindowsHookExW(WH_MOUSE_LL, &MouseThunk, GetModuleHandleW(nullptr), 0);
+        deskName_ = DesktopName(GetThreadDesktop(tid_));
+        FollowInputDesktop();               // start on whichever desktop has the input (not always "Default")
+        InstallHooks();
         {
             std::lock_guard<std::mutex> lk(initMu_);
             hookOk_ = mouse_ != nullptr;
@@ -312,7 +406,6 @@ private:
         if (!mouse_) return;
         // The keyboard hook stays installed: while input is local it only reports that the owner is typing
         // (owner priority), while forwarding it swallows and forwards the keys.
-        kbd_ = SetWindowsHookExW(WH_KEYBOARD_LL, &KbdThunk, GetModuleHandleW(nullptr), 0);
 
         // A touchpad stops delivering mouse events the moment the finger rests: if the one event
         // that reached the screen edge was not enough to switch (or the driver reported a point the
@@ -326,17 +419,24 @@ private:
             } else if (msg.message == kMsgKbdOff) {
                 HideOverlay();
             } else if (msg.message == WM_TIMER && msg.hwnd == nullptr) {
-                if (msg.wParam == pollTimer_) PollEdge();
-                else                          Reassert();
+                if (msg.wParam == pollTimer_) {
+                    if (++deskTick_ % kDeskCheckTicks == 0) FollowInputDesktop();
+                    PollEdge();
+                } else {
+                    Reassert();
+                }
+            } else if (msg.message == kMsgTask && msg.hwnd == nullptr) {
+                auto* task = reinterpret_cast<std::function<void()>*>(msg.lParam);
+                if (task) { (*task)(); delete task; }
             } else {
                 TranslateMessage(&msg);
                 DispatchMessageW(&msg);
             }
         }
         if (pollTimer_) { KillTimer(nullptr, pollTimer_); pollTimer_ = 0; }
-        if (kbd_)   { UnhookWindowsHookEx(kbd_);   kbd_ = nullptr; }
-        if (mouse_) { UnhookWindowsHookEx(mouse_); mouse_ = nullptr; }
+        RemoveHooks();
         if (overlay_) { DestroyWindow(overlay_); overlay_ = nullptr; }
+        if (deskOwned_) { CloseDesktop(deskOwned_); deskOwned_ = nullptr; }
     }
 
     // Real state of the mouse buttons (also those of a touchpad). The hook's own bookkeeping can get
@@ -481,6 +581,9 @@ private:
     bool cursorCounted_ = false;         // hook thread only: ShowCursor(FALSE) is in effect
     UINT_PTR overlayTimer_ = 0;          // hook thread only
     UINT_PTR pollTimer_ = 0;             // hook thread only
+    HDESK deskOwned_ = nullptr;          // hook thread only: the input desktop handle this thread is attached to
+    std::wstring deskName_, deskFailed_; // hook thread only
+    unsigned deskTick_ = 0;              // hook thread only
     std::vector<InputRect> mons_;        // set before Start(), read on the hook thread
     std::mutex initMu_;
     std::condition_variable initCv_;

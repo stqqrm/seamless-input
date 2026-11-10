@@ -26,6 +26,19 @@ On Windows a service lives in Session 0 and cannot see the desktop, so the servi
 If your window manager never activates `graphical-session.target` (some minimal WMs), use the XDG entry or
 start the unit from your session startup script.
 
+## Elevated windows and UAC prompts (Windows)
+
+A normal user process cannot see input going to elevated windows (Task Manager, admin consoles) and cannot
+touch the UAC prompt, which is shown on the secure desktop. So with *Start the background daemon with Windows*
+on, the service starts the worker with its own **SYSTEM** token inside your session (still using your profile
+folder) and the worker follows the input desktop, so mouse/keyboard also work over elevated windows, the UAC
+prompt, Ctrl+Alt+Del and the lock screen. Started any other way (window button, `--run` in a terminal) the worker
+has your normal rights and logs a warning at start.
+
+Because the service runs as SYSTEM, install the program in a folder only administrators can write to
+(e.g. `C:\Program Files\seamless-input`); `--install-service` warns when it is not. Stop the service before
+rebuilding (the running exe is locked): `net stop SeamlessInputService`.
+
 ## Command line (headless machines)
 
 ```

@@ -32,8 +32,9 @@ constexpr wchar_t kStopEvent[] = L"Global\\SeamlessInputWorkerStop";
 constexpr DWORD   kCtlWake     = 128;      // user-defined control: "start the worker now"
 
 // Local users may query/start/stop the service and send kCtlWake (so the GUI needs no UAC prompt
-// for that); only administrators may change or delete it. The service just starts the worker
-// as the logged-in user, so this grants nobody anything they could not do already.
+// for that); only administrators may change or delete it. kCtlWake only makes the service (re)start
+// the one worker executable it was installed with. The worker runs as SYSTEM, so that executable MUST
+// sit in a folder ordinary users cannot write to (InstallService warns when it does not).
 constexpr wchar_t kServiceSddl[] =
     L"D:(A;;CCLCSWRPWPDTLOCRRC;;;SY)(A;;CCDCLCSWRPWPDTLOCRSDRCWDWO;;;BA)"
     L"(A;;CCLCSWRPWPLOCRRC;;;IU)(A;;CCLCSWLOCRRC;;;SU)";
@@ -104,6 +105,32 @@ bool RunElevated(const wchar_t* arg, std::string* err)
     return true;
 }
 
+// The service and its worker run as SYSTEM. If a normal user can replace the executable (for example it sits
+// in Downloads or on the Desktop), that user could run code as SYSTEM through it. Warn about that.
+void WarnIfUserWritable(const std::filesystem::path& exe)
+{
+    PWSTR pf = nullptr;
+    std::error_code ec;
+    std::filesystem::path root;
+    if (SUCCEEDED(SHGetKnownFolderPath(FOLDERID_ProgramFiles, 0, nullptr, &pf)) && pf) root = pf;
+    if (pf) CoTaskMemFree(pf);
+    PWSTR pfx = nullptr;
+    std::filesystem::path root86;
+    if (SUCCEEDED(SHGetKnownFolderPath(FOLDERID_ProgramFilesX86, 0, nullptr, &pfx)) && pfx) root86 = pfx;
+    if (pfx) CoTaskMemFree(pfx);
+    const std::wstring e = std::filesystem::weakly_canonical(exe, ec).wstring();
+    auto under = [&](const std::filesystem::path& r) {
+        if (r.empty()) return false;
+        const std::wstring rs = r.wstring();
+        return e.size() > rs.size() && _wcsnicmp(e.c_str(), rs.c_str(), rs.size()) == 0;
+    };
+    if (under(root) || under(root86)) return;
+    std::fprintf(stderr,
+        "WARNING: the service runs as SYSTEM, but %ls is not under Program Files. Any user who can write to its\n"
+        "folder could run code as SYSTEM through it. Put the program in a folder only administrators can write to.\n",
+        e.c_str());
+}
+
 // ------------------------------------------------------------------ supervisor
 SERVICE_STATUS_HANDLE g_status = nullptr;
 HANDLE g_stop = nullptr;       // service is stopping
@@ -149,17 +176,45 @@ struct Worker {
     ULONGLONG started = 0;
 };
 
+// Why SYSTEM and not the user's own token: a hook and SendInput of a normal-integrity process are blocked by
+// UIPI whenever an elevated window (Task Manager, an admin console, ...) is under the pointer or has the focus,
+// and the UAC prompt lives on the secure desktop, which only SYSTEM may open. So the worker gets this service's
+// own (SYSTEM) token, moved into the user's session, together with the user's environment block (profile paths).
+HANDLE MakeSystemTokenForSession(DWORD sid)
+{
+    HANDLE self = nullptr;
+    if (!OpenProcessToken(GetCurrentProcess(), TOKEN_DUPLICATE | TOKEN_QUERY | TOKEN_ASSIGN_PRIMARY | TOKEN_ADJUST_DEFAULT | TOKEN_ADJUST_SESSIONID, &self))
+        return nullptr;
+    HANDLE prim = nullptr;
+    const BOOL dup = DuplicateTokenEx(self, MAXIMUM_ALLOWED, nullptr, SecurityImpersonation, TokenPrimary, &prim);
+    CloseHandle(self);
+    if (!dup) return nullptr;
+    if (!SetTokenInformation(prim, TokenSessionId, &sid, sizeof(sid))) {
+        SvcLog("SetTokenInformation(TokenSessionId) failed: " + ErrText(GetLastError()));
+        CloseHandle(prim);
+        return nullptr;
+    }
+    return prim;
+}
+
 bool LaunchWorker(DWORD sid, Worker& w)
 {
-    HANDLE tok = nullptr;
-    if (!WTSQueryUserToken(sid, &tok)) return false;       // nobody logged on yet
-    HANDLE prim = nullptr;
-    const BOOL dup = DuplicateTokenEx(tok, MAXIMUM_ALLOWED, nullptr, SecurityIdentification, TokenPrimary, &prim);
-    CloseHandle(tok);
-    if (!dup) return false;
+    HANDLE userTok = nullptr;
+    if (!WTSQueryUserToken(sid, &userTok)) return false;   // nobody logged on yet
 
     LPVOID env = nullptr;
-    if (!CreateEnvironmentBlock(&env, prim, FALSE)) env = nullptr;
+    if (!CreateEnvironmentBlock(&env, userTok, FALSE)) env = nullptr;
+
+    // 1st choice: SYSTEM in the user's session. Fallback: the user's own token (then elevated windows and UAC
+    // cannot be controlled, but everything else works).
+    HANDLE prim = MakeSystemTokenForSession(sid);
+    bool asSystem = prim != nullptr;
+    if (!prim) {
+        SvcLog("could not build a SYSTEM token for the worker - falling back to the user token");
+        if (!DuplicateTokenEx(userTok, MAXIMUM_ALLOWED, nullptr, SecurityIdentification, TokenPrimary, &prim)) prim = nullptr;
+    }
+    CloseHandle(userTok);
+    if (!prim) { if (env) DestroyEnvironmentBlock(env); return false; }
 
     const std::wstring exe = paths::DaemonExe().wstring();
     std::wstring cmd = L"\"" + exe + L"\" --run --worker";
@@ -169,17 +224,33 @@ bool LaunchWorker(DWORD sid, Worker& w)
     si.cb = sizeof(si);
     si.lpDesktop = desktop;
     PROCESS_INFORMATION pi{};
-    const BOOL ok = CreateProcessAsUserW(prim, exe.c_str(), cmd.data(), nullptr, nullptr, FALSE,
-                                         CREATE_UNICODE_ENVIRONMENT | CREATE_NO_WINDOW, env, dir.c_str(), &si, &pi);
-    const DWORD err = ok ? 0 : GetLastError();
-    if (env) DestroyEnvironmentBlock(env);
+    BOOL ok = CreateProcessAsUserW(prim, exe.c_str(), cmd.data(), nullptr, nullptr, FALSE,
+                                   CREATE_UNICODE_ENVIRONMENT | CREATE_NO_WINDOW, env, dir.c_str(), &si, &pi);
+    DWORD err = ok ? 0 : GetLastError();
     CloseHandle(prim);
+    if (!ok && asSystem) {
+        SvcLog("CreateProcessAsUser (SYSTEM) failed: " + ErrText(err) + " - falling back to the user token");
+        asSystem = false;
+        HANDLE ut = nullptr;
+        HANDLE up = nullptr;
+        if (WTSQueryUserToken(sid, &ut)) {
+            if (DuplicateTokenEx(ut, MAXIMUM_ALLOWED, nullptr, SecurityIdentification, TokenPrimary, &up)) {
+                ok = CreateProcessAsUserW(up, exe.c_str(), cmd.data(), nullptr, nullptr, FALSE,
+                                          CREATE_UNICODE_ENVIRONMENT | CREATE_NO_WINDOW, env, dir.c_str(), &si, &pi);
+                err = ok ? 0 : GetLastError();
+                CloseHandle(up);
+            }
+            CloseHandle(ut);
+        }
+    }
+    if (env) DestroyEnvironmentBlock(env);
     if (!ok) { SvcLog("CreateProcessAsUser failed: " + ErrText(err)); return false; }
     CloseHandle(pi.hThread);
     w.proc = pi.hProcess;
     w.session = sid;
     w.started = GetTickCount64();
-    SvcLog("worker started in session " + std::to_string(sid) + " (pid " + std::to_string(pi.dwProcessId) + ")");
+    SvcLog("worker started in session " + std::to_string(sid) + " (pid " + std::to_string(pi.dwProcessId) + ", " +
+           (asSystem ? "SYSTEM: elevated windows and UAC can be controlled" : "user rights: elevated windows and UAC cannot be controlled") + ")");
     return true;
 }
 
@@ -370,6 +441,7 @@ int InstallService()
     if (!scm) { std::fprintf(stderr, "Cannot open the service manager (run as administrator): %lu\n", GetLastError()); return 1; }
 
     const std::wstring bin = L"\"" + paths::DaemonExe().wstring() + L"\" --service";
+    WarnIfUserWritable(paths::DaemonExe());
     ScHandle sv(OpenServiceW(scm.h, kName, SERVICE_ALL_ACCESS));
     if (sv) {
         if (!ChangeServiceConfigW(sv.h, SERVICE_WIN32_OWN_PROCESS, SERVICE_AUTO_START, SERVICE_ERROR_NORMAL, bin.c_str(),
