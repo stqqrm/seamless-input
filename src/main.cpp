@@ -2344,7 +2344,7 @@ public:
 private:
     static constexpr int kTimerId     = 9000;
     static constexpr int kAnimTimerId = 9001;
-    enum { kIdAutostart = 9100, kIdSvcInfo, kIdToggleSvc, kIdQuitAll, kIdOpenFileMenu, kIdOpenSettingsMenu,
+    enum { kIdAutostart = 9100, kIdSvcInfo, kIdOpenSettingsMenu,
            kIdClearCache, kIdRegenKeys, kIdViewKeys,
            kIdThemeSystem = 9400, kIdThemeReload, kIdThemeFolder, kIdThemeBase = 9500 };   // kIdThemeBase + n: the n-th theme
 
@@ -2399,9 +2399,9 @@ private:
         wxString t = "seamless-input " + wxString::FromUTF8(appver::Full()) + " - " + host_;
         if (connected_ && daemonWanted_) {
             if (snap_.version.empty())
-                t += "  |  background service is an OLDER version - restart it (Service menu > Stop, then Start)";
+                t += "  |  background service is an OLDER version - restart this window to update it";
             else if (snap_.version != appver::Full())
-                t += "  |  background service: " + wxString::FromUTF8(snap_.version) + " - restart it";
+                t += "  |  background service: " + wxString::FromUTF8(snap_.version) + " - restart this window to update it";
         }
         SetTitle(t);
     }
@@ -2420,6 +2420,14 @@ private:
         connFails_ = 0;
         restartAsked_ = false;
         lastConnErr_.clear();
+#if defined(_WIN32)
+        if (!unsafeWarned_ && svc::InstallLocationUnsafe()) {
+            unsafeWarned_ = true;
+            Log("WARNING: the background service runs as SYSTEM, but this program is not in a folder that only administrators "
+                "can write to (for example C:\\Program Files\\seamless-input). Any program running as you could replace it and "
+                "gain SYSTEM rights. Move the program there and start the window again.");
+        }
+#endif
         log_->Clear();                                  // the daemon replays its log history on attach
         connected_ = true;
         client_->Send("ATTACH");
@@ -2453,11 +2461,16 @@ private:
         const auto dir = dataDir_;
         std::thread([this, alive, dir] {
             std::string err;
+#if defined(_WIN32)
+            // The service is the one daemon there is: replace it (point it at THIS build's exe and restart it).
+            const bool ok = svc::ReplaceService(&err) && svc::EnsureDaemon(dir, &err);
+#else
             ipc::RequestStop(dir);                  // politely first: works when it still answers
             svc::WaitGone(dir, 1500);
             svc::KillDaemons();                     // then force: an old or hung daemon never answers
             svc::WaitGone(dir, 2000);
             const bool ok = svc::EnsureDaemon(dir, &err);
+#endif
             wxTheApp->CallAfter([this, alive, ok, err] { if (*alive) RestartDaemonDone(ok, err); });
         }).detach();
     }
@@ -2554,23 +2567,13 @@ private:
     // The menus are drawn by MenuStrip (not a native wxMenuBar) so they look the same on every OS.
     void BuildMenu()
     {
-#if defined(__WXOSX__)
-        const wxString closeKey = "Cmd+W";
-#else
-        const wxString closeKey = "Ctrl+W";
-#endif
         auto item = [](int id, const wxString& label) { MenuItemDef d; d.id = id; d.label = label; return d; };
         auto sep = [] { MenuItemDef d; d.separator = true; return d; };
 
-        MenuItemDef close = item(wxID_CLOSE, "Close window");
-        close.accel = closeKey;
-        menuBar_->AddMenu("File", { close, item(kIdQuitAll, "Quit and stop the background service") });
-
-        MenuItemDef autostart = item(kIdAutostart, "Autostart");     // label and dot are set in RefreshServiceMenu
-        MenuItemDef startStop = item(kIdToggleSvc, "Background service");
+        MenuItemDef autostart = item(kIdAutostart, "Autostart");   // label and dot are set in RefreshServiceMenu
         MenuItemDef info = item(kIdSvcInfo, "Background service: ...");
         info.enabled = false;
-        menuBar_->AddMenu("Service", { autostart, startStop, sep(), info });
+        menuBar_->AddMenu("Service", { autostart, sep(), info });
 
         menuBar_->AddMenu("Security", { item(kIdClearCache, "Clear cache"),
                                         item(kIdRegenKeys, "Regenerate keys"),
@@ -2593,9 +2596,7 @@ private:
         };
 
         Bind(wxEVT_MENU, [this](wxCommandEvent&) { Close(); }, wxID_CLOSE);
-        Bind(wxEVT_MENU, [this](wxCommandEvent&) { QuitAll(); }, kIdQuitAll);
         Bind(wxEVT_MENU, &MainFrame::OnAutostart, this, kIdAutostart);
-        Bind(wxEVT_MENU, [this](wxCommandEvent&) { ToggleService(); }, kIdToggleSvc);
         Bind(wxEVT_MENU, [this](wxCommandEvent&) { OnClearCache(); }, kIdClearCache);
         Bind(wxEVT_MENU, [this](wxCommandEvent&) { OnRegenKeys(); }, kIdRegenKeys);
         Bind(wxEVT_MENU, [this](wxCommandEvent&) { OnViewKeys(); }, kIdViewKeys);
@@ -2606,14 +2607,12 @@ private:
             const size_t i = (size_t)(e.GetId() - kIdThemeBase);
             if (i < themes_.size()) ApplyTheme(themes_[i].theme, true);
         }, kIdThemeBase, kIdThemeBase + 299);
-        Bind(wxEVT_MENU, [this](wxCommandEvent&) { menuBar_->OpenMenu(0); }, kIdOpenFileMenu);
-        Bind(wxEVT_MENU, [this](wxCommandEvent&) { menuBar_->OpenMenu(1); }, kIdOpenSettingsMenu);
+        Bind(wxEVT_MENU, [this](wxCommandEvent&) { menuBar_->OpenMenu(0); }, kIdOpenSettingsMenu);   // the Service menu
 
         // keyboard shortcuts (a native menu bar used to provide these)
         std::vector<wxAcceleratorEntry> keys;
         keys.emplace_back(wxACCEL_CTRL, (int)'W', wxID_CLOSE);
 #if !defined(__WXOSX__)
-        keys.emplace_back(wxACCEL_ALT, (int)'F', kIdOpenFileMenu);
         keys.emplace_back(wxACCEL_ALT, (int)'S', kIdOpenSettingsMenu);
 #endif
         SetAcceleratorTable(wxAcceleratorTable((int)keys.size(), keys.data()));
@@ -2747,7 +2746,9 @@ private:
         const svc::AutostartInfo a = svc::QueryAutostart();
         autostartOn_ = a.enabled;
 #if defined(__WXMSW__)
-        const wxString autoName = "Autostart with Windows";
+        // The service is always installed; this only decides whether Windows starts it at boot (otherwise the
+        // window starts it when it opens).
+        const wxString autoName = "Start service with Windows";
 #else
         const wxString autoName = "Autostart at login";
 #endif
@@ -2758,12 +2759,6 @@ private:
             m->enabled = a.supported;
         }
         const bool running = connected_ && daemonWanted_;
-        if (MenuItemDef* m = menuBar_->Item(kIdToggleSvc)) {
-            m->dot = running ? 1 : 2;
-            m->label = "Background service";
-            m->accel = busy_ ? wxString("Working...") : running ? wxString("Stop") : wxString("Start");
-            m->enabled = true;
-        }
         if (MenuItemDef* m = menuBar_->Item(kIdSvcInfo)) {
             const wxString st = running ? "running" : (daemonWanted_ && !connected_) ? "not reachable" : "stopped";
             wxString ver;
@@ -2785,11 +2780,15 @@ private:
         std::thread([this, alive, dir, on] {
             std::string err, err2;
             bool ok = on ? svc::EnableAutostart(&err) : svc::DisableAutostart(&err);
+#if !defined(_WIN32)
             if (ok) {
                 // hand the daemon over to its new owner, or keep one running for this window
                 if (ipc::Ping(dir)) { ipc::RequestStop(dir); svc::WaitGone(dir, 5000); }
                 svc::EnsureDaemon(dir, &err2);
             }
+#else
+            (void)dir;      // Windows: the service keeps running, only its start type changed
+#endif
             wxTheApp->CallAfter([this, alive, ok, on, err] { if (*alive) AutostartDone(ok, on, err); });
         }).detach();
     }
@@ -2848,29 +2847,6 @@ private:
 #endif
         if (!wxLaunchDefaultApplication(dir))
             wxMessageBox("Could not open the folder:\n" + dir, "View keys", wxOK | wxICON_WARNING, this);
-    }
-
-    void ToggleService()
-    {
-        if (busy_) { Log("Still applying the last autostart change, please wait..."); return; }
-        if (connected_ && daemonWanted_) {
-            daemonWanted_ = false;
-            ipc::RequestStop(dataDir_);
-            ShowOffline();
-            Log("Stopping the background service (it starts again with the next window, or at login if autostart is on)");
-        } else {
-            daemonWanted_ = true;
-            retry_ = 3;
-            Log("Starting the background service...");
-        }
-        UpdateHeader();
-    }
-
-    void QuitAll()
-    {
-        daemonWanted_ = false;
-        ipc::RequestStop(dataDir_);
-        Close();
     }
 
     // ---------------------------------------------------------------- pages
@@ -3905,6 +3881,7 @@ private:
     int retry_ = 0;
     int connFails_ = 0;             // consecutive failed attempts to reach the daemon
     bool restartAsked_ = false;     // the restart question was shown (until success or a failed restart)
+    bool unsafeWarned_ = false;     // Windows: the unsafe-install-folder warning was logged
     bool mismatchAsked_ = false;    // the "versions do not match" question was shown for this service
     std::string lastConnErr_;
     std::map<int, std::chrono::steady_clock::time_point> lastMove_, lastAudio_;

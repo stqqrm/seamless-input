@@ -14,11 +14,13 @@
 #include <wtsapi32.h>
 
 #include <algorithm>
+#include <atomic>
 #include <cstdio>
 #include <fstream>
 #include <thread>
 #include <vector>
 
+#include "ipc.hpp"
 #include "paths.hpp"
 #include "service.hpp"
 
@@ -106,30 +108,31 @@ bool RunElevated(const wchar_t* arg, std::string* err)
 }
 
 // The service and its worker run as SYSTEM. If a normal user can replace the executable (for example it sits
-// in Downloads or on the Desktop), that user could run code as SYSTEM through it. Warn about that.
+// in Downloads or on the Desktop), that user could run code as SYSTEM through it.
+bool UnderProgramFiles(const std::filesystem::path& exe)
+{
+    std::error_code ec;
+    const std::wstring e = std::filesystem::weakly_canonical(exe, ec).wstring();
+    for (const KNOWNFOLDERID* id : {&FOLDERID_ProgramFiles, &FOLDERID_ProgramFilesX86}) {
+        PWSTR pf = nullptr;
+        std::wstring rs;
+        if (SUCCEEDED(SHGetKnownFolderPath(*id, 0, nullptr, &pf)) && pf) rs = pf;
+        if (pf) CoTaskMemFree(pf);
+        if (!rs.empty() && e.size() > rs.size() && _wcsnicmp(e.c_str(), rs.c_str(), rs.size()) == 0) return true;
+    }
+    return false;
+}
+
 void WarnIfUserWritable(const std::filesystem::path& exe)
 {
-    PWSTR pf = nullptr;
-    std::error_code ec;
-    std::filesystem::path root;
-    if (SUCCEEDED(SHGetKnownFolderPath(FOLDERID_ProgramFiles, 0, nullptr, &pf)) && pf) root = pf;
-    if (pf) CoTaskMemFree(pf);
-    PWSTR pfx = nullptr;
-    std::filesystem::path root86;
-    if (SUCCEEDED(SHGetKnownFolderPath(FOLDERID_ProgramFilesX86, 0, nullptr, &pfx)) && pfx) root86 = pfx;
-    if (pfx) CoTaskMemFree(pfx);
-    const std::wstring e = std::filesystem::weakly_canonical(exe, ec).wstring();
-    auto under = [&](const std::filesystem::path& r) {
-        if (r.empty()) return false;
-        const std::wstring rs = r.wstring();
-        return e.size() > rs.size() && _wcsnicmp(e.c_str(), rs.c_str(), rs.size()) == 0;
-    };
-    if (under(root) || under(root86)) return;
+    if (UnderProgramFiles(exe)) return;
     std::fprintf(stderr,
         "WARNING: the service runs as SYSTEM, but %ls is not under Program Files. Any user who can write to its\n"
         "folder could run code as SYSTEM through it. Put the program in a folder only administrators can write to.\n",
-        e.c_str());
+        exe.c_str());
 }
+
+std::wstring ServiceBinPath() { return L"\"" + paths::DaemonExe().wstring() + L"\" --service"; }
 
 // ------------------------------------------------------------------ supervisor
 SERVICE_STATUS_HANDLE g_status = nullptr;
@@ -358,6 +361,7 @@ AutostartInfo QueryAutostart()
     if (!scm) return i;
     ScHandle sv(OpenServiceW(scm.h, kName, SERVICE_QUERY_STATUS | SERVICE_QUERY_CONFIG));
     if (!sv) return i;
+    i.installed = true;
 
     SERVICE_STATUS_PROCESS ssp{};
     DWORD need = 0;
@@ -367,12 +371,51 @@ AutostartInfo QueryAutostart()
     QueryServiceConfigW(sv.h, nullptr, 0, &need);
     std::vector<BYTE> buf(need ? need : 1);
     auto* cfg = reinterpret_cast<QUERY_SERVICE_CONFIGW*>(buf.data());
-    if (QueryServiceConfigW(sv.h, cfg, (DWORD)buf.size(), &need)) i.enabled = cfg->dwStartType == SERVICE_AUTO_START;
+    if (QueryServiceConfigW(sv.h, cfg, (DWORD)buf.size(), &need)) {
+        i.enabled = cfg->dwStartType == SERVICE_AUTO_START;
+        i.current = cfg->lpBinaryPathName && _wcsicmp(cfg->lpBinaryPathName, ServiceBinPath().c_str()) == 0;
+    }
     return i;
 }
 
-bool EnableAutostart(std::string* err) { return RunElevated(L"--install-service", err); }
-bool DisableAutostart(std::string* err) { return RunElevated(L"--uninstall-service", err); }
+// The service stays installed either way: "autostart" only switches it between automatic and manual start.
+bool EnableAutostart(std::string* err) { return RunElevated(L"--install-service --auto", err); }
+bool DisableAutostart(std::string* err) { return RunElevated(L"--install-service --manual", err); }
+
+bool InstallLocationUnsafe() { return !UnderProgramFiles(paths::DaemonExe()); }
+
+namespace {
+// A daemon started by a window without the service (an older version, or the fallback) holds the port, so the
+// service's worker could never start: ask it to quit, then force.
+void ClearStrayDaemons(const std::filesystem::path& dataDir)
+{
+    if (!ipc::Ping(dataDir, 500)) return;
+    ipc::RequestStop(dataDir);
+    WaitGone(dataDir, 1500);
+    KillDaemons();
+    WaitGone(dataDir, 2000);
+}
+std::atomic<bool> g_installTried{false};
+} // namespace
+
+bool PrepareManaged(const std::filesystem::path& dataDir, std::string* err)
+{
+    AutostartInfo a = QueryAutostart();
+    if (!a.installed || !a.current) {
+        if (g_installTried.exchange(true)) return a.installed;      // declined or failed once: do not nag again
+        ClearStrayDaemons(dataDir);
+        if (!RunElevated(L"--install-service --keep", err)) return false;
+        return true;
+    }
+    if (!a.managerRunning && ipc::Ping(dataDir, 500)) ClearStrayDaemons(dataDir);
+    return true;
+}
+
+bool ReplaceService(std::string* err)
+{
+    ClearStrayDaemons(paths::DataDir());
+    return RunElevated(L"--install-service --keep --restart", err);
+}
 
 bool StartManaged(std::string* err)
 {
@@ -435,22 +478,34 @@ int RunServiceHost()
     return 0;
 }
 
-int InstallService()
+int InstallService(int mode, bool restart)
 {
     ScHandle scm(OpenSCManagerW(nullptr, nullptr, SC_MANAGER_CONNECT | SC_MANAGER_CREATE_SERVICE));
     if (!scm) { std::fprintf(stderr, "Cannot open the service manager (run as administrator): %lu\n", GetLastError()); return 1; }
 
-    const std::wstring bin = L"\"" + paths::DaemonExe().wstring() + L"\" --service";
+    const std::wstring bin = ServiceBinPath();
     WarnIfUserWritable(paths::DaemonExe());
+    DWORD startType = mode == 1 ? SERVICE_AUTO_START : SERVICE_DEMAND_START;     // a new service starts manually
     ScHandle sv(OpenServiceW(scm.h, kName, SERVICE_ALL_ACCESS));
     if (sv) {
-        if (!ChangeServiceConfigW(sv.h, SERVICE_WIN32_OWN_PROCESS, SERVICE_AUTO_START, SERVICE_ERROR_NORMAL, bin.c_str(),
+        DWORD need = 0;
+        QueryServiceConfigW(sv.h, nullptr, 0, &need);
+        std::vector<BYTE> buf(need ? need : 1);
+        auto* cfg = reinterpret_cast<QUERY_SERVICE_CONFIGW*>(buf.data());
+        bool samePath = false;
+        if (QueryServiceConfigW(sv.h, cfg, (DWORD)buf.size(), &need)) {
+            samePath = cfg->lpBinaryPathName && _wcsicmp(cfg->lpBinaryPathName, bin.c_str()) == 0;
+            if (mode == 0) startType = cfg->dwStartType;                        // keep what is configured
+        }
+        // another exe (or an explicit restart): the running service still executes the old file - stop it first
+        if (!samePath || restart) StopServiceAndWait(sv.h, 15000);
+        if (!ChangeServiceConfigW(sv.h, SERVICE_WIN32_OWN_PROCESS, startType, SERVICE_ERROR_NORMAL, bin.c_str(),
                                   nullptr, nullptr, nullptr, nullptr, nullptr, kDisplay)) {
             std::fprintf(stderr, "ChangeServiceConfig failed: %lu\n", GetLastError());
             return 1;
         }
     } else {
-        sv.h = CreateServiceW(scm.h, kName, kDisplay, SERVICE_ALL_ACCESS, SERVICE_WIN32_OWN_PROCESS, SERVICE_AUTO_START,
+        sv.h = CreateServiceW(scm.h, kName, kDisplay, SERVICE_ALL_ACCESS, SERVICE_WIN32_OWN_PROCESS, startType,
                               SERVICE_ERROR_NORMAL, bin.c_str(), nullptr, nullptr, nullptr, nullptr, nullptr);
         if (!sv) { std::fprintf(stderr, "CreateService failed: %lu\n", GetLastError()); return 1; }
     }
@@ -476,7 +531,8 @@ int InstallService()
         std::fprintf(stderr, "Installed, but could not start: %lu\n", GetLastError());
         return 1;
     }
-    std::printf("Service \"%ls\" installed (starts automatically) and started.\n", kName);
+    std::printf("Service \"%ls\" installed (%s start) and running.\n", kName,
+                startType == SERVICE_AUTO_START ? "automatic" : "manual");
     return 0;
 }
 

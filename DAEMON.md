@@ -9,14 +9,14 @@ seamless-input is two programs:
 
 Starting the window starts the daemon if it is not running. Keep both executables in the same folder.
 
-## Autostart (Settings menu)
+## Autostart (Service menu)
 
-*Settings -> Start the background daemon at login* (Windows: *...with Windows*).
+*Service menu -> Autostart at login* (Windows: *Start service with Windows*).
 
 | OS | What it does |
 |---|---|
 | Linux | systemd **user** unit `~/.config/systemd/user/seamless-input.service` (starts with your graphical session). Without systemd: `~/.config/autostart/seamless-input-daemon.desktop`. |
-| Windows | Installs the service `SeamlessInputService` (automatic start, restarts on failure). One UAC prompt to install or remove. |
+| Windows | The service `SeamlessInputService` is **always installed** (the window installs it on first start, one UAC prompt). *Start service with Windows* only switches it between automatic start (at boot) and manual start (the window starts it when it opens). |
 
 It is a *user* service on Linux because keyboard/mouse (X11 or /dev/input) and audio (PipeWire/Pulse) belong to your login session.
 
@@ -29,15 +29,17 @@ start the unit from your session startup script.
 ## Elevated windows and UAC prompts (Windows)
 
 A normal user process cannot see input going to elevated windows (Task Manager, admin consoles) and cannot
-touch the UAC prompt, which is shown on the secure desktop. So with *Start the background daemon with Windows*
-on, the service starts the worker with its own **SYSTEM** token inside your session (still using your profile
+touch the UAC prompt, which is shown on the secure desktop. So the always-installed service starts the worker with its own **SYSTEM** token inside your session (still using your profile
 folder) and the worker follows the input desktop, so mouse/keyboard also work over elevated windows, the UAC
 prompt, Ctrl+Alt+Del and the lock screen. Started any other way (window button, `--run` in a terminal) the worker
 has your normal rights and logs a warning at start.
 
+When the build of the window and the service differ, the window asks to replace the service: it re-points it at the
+current `seamless-input-daemon.exe` and restarts it (one UAC prompt).
+
 Because the service runs as SYSTEM, install the program in a folder only administrators can write to
-(e.g. `C:\Program Files\seamless-input`); `--install-service` warns when it is not. Stop the service before
-rebuilding (the running exe is locked): `net stop SeamlessInputService`.
+(e.g. `C:\Program Files\seamless-input`); `--install-service` warns when it is not. If the linker cannot overwrite
+`seamless-input-daemon.exe`, the service is running it: `net stop SeamlessInputService` first.
 
 ## Command line (headless machines)
 

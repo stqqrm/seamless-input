@@ -16,6 +16,8 @@ struct BackendSink {
     // the motion in device units (|dx|+|dy|), or 100 for a button / key press. The engine uses
     // it to give control back to the user of a PC that is currently being controlled.
     std::function<void(int weight)> onPhysicalInput;
+    // Diagnostics for daemon.log (any thread; may be empty).
+    std::function<void(const std::string&)> onLog;
 };
 
 // One implementation per platform:

@@ -30,10 +30,16 @@ static bool WaitFor(const std::function<bool()>& pred, int waitMs)
 bool EnsureDaemon(const std::filesystem::path& dataDir, std::string* err, int waitMs)
 {
     auto up = [&] { return ipc::Ping(dataDir, 500); };
+    std::string why;
+#if defined(_WIN32)
+    if (!PrepareManaged(dataDir, &why) && !why.empty()) {
+        // no service (the UAC prompt was declined): the direct start below still works, without elevated-window support
+    }
+#endif
     if (up()) return true;
 
-    std::string why;
-    if (QueryAutostart().enabled && StartManaged(&why) && WaitFor(up, std::min(waitMs / 2, 4000))) return true;
+    const AutostartInfo ai = QueryAutostart();
+    if ((ai.enabled || ai.installed) && StartManaged(&why) && WaitFor(up, std::min(waitMs / 2, 4000))) return true;
 
     if (!SpawnDetached(&why)) {
         if (err) *err = why;

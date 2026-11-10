@@ -520,6 +520,7 @@ bool InputEngine::Start(std::string* msg)
     sink.onLocalMotion = [this](int x, int y, bool b) { d_->OnLocalMotion(x, y, b); };
     sink.onForwarded   = [this](const InputEvent& e) { d_->OnForwarded(e); };
     sink.onPhysicalInput = [this](int w) { d_->OnPhysicalInput(w); };
+    sink.onLog = [this](const std::string& m) { if (d_->log) d_->log(m); };
 
     std::string err;
     if (!d_->be->Start(std::move(sink), &err)) {

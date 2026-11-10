@@ -105,8 +105,8 @@ public:
         }
         if (err && !IsPrivileged())
             *err = "running without administrator rights: Task Manager, other elevated windows and UAC prompts cannot be "
-                   "controlled. Turn on Settings -> Start the background daemon with Windows (the service runs it with "
-                   "the rights it needs).";
+                   "controlled. Start it through the Windows service (the window does this by itself: allow its one "
+                   "UAC prompt, and keep the program in a folder only administrators can write to).";
         return true;
     }
 
@@ -162,7 +162,7 @@ public:
         in.mi.dy = (LONG)std::lround((y - vy) * 65535.0 / (vh - 1));
         in.mi.dwFlags = MOUSEEVENTF_MOVE | MOUSEEVENTF_ABSOLUTE | MOUSEEVENTF_VIRTUALDESK;
         in.mi.dwExtraInfo = kTag;
-        SendInput(1, &in, sizeof in);
+        Send(1, &in);
     }
 
     void DoButton(int button, bool down)
@@ -178,7 +178,7 @@ public:
         case 4: in.mi.dwFlags = down ? MOUSEEVENTF_XDOWN : MOUSEEVENTF_XUP; in.mi.mouseData = XBUTTON2; break;
         default: return;
         }
-        SendInput(1, &in, sizeof in);
+        Send(1, &in);
     }
 
     void DoWheel(int dx, int dy)
@@ -199,7 +199,7 @@ public:
             in[n].mi.dwExtraInfo = kTag;
             ++n;
         }
-        if (n) SendInput(n, in, sizeof(INPUT));
+        if (n) Send(n, in);
     }
 
     void DoKey(int code, bool down)
@@ -231,10 +231,33 @@ public:
         }
         if (!found) return;
         in.ki.dwFlags = fl;
-        SendInput(1, &in, sizeof in);
+        Send(1, &in);
     }
 
 private:
+    // SendInput returns 0 when Windows refuses the input. The usual reason is UIPI: the window that has the
+    // focus (Task Manager, an admin console, a UAC prompt) is more privileged than this process. Say so once
+    // in a while instead of failing silently.
+    void Send(UINT n, INPUT* in)
+    {
+        if (SendInput(n, in, sizeof(INPUT)) == n) return;
+        const DWORD e = GetLastError();
+        const ULONGLONG now = GetTickCount64();
+        if (now - lastSendWarn_ < 5000 || !sink_.onLog) return;
+        lastSendWarn_ = now;
+        sink_.onLog("Windows refused injected input (error " + std::to_string(e) + "). " +
+                    (IsPrivileged() ? "Desktop: " + Narrow(deskName_) + "."
+                                    : "This daemon has no administrator rights, so elevated windows (Task Manager, UAC) "
+                                      "ignore it: it must be started by the Windows service (restart the window and allow "
+                                      "its UAC prompt)."));
+    }
+    static std::string Narrow(const std::wstring& w)
+    {
+        std::string o;
+        for (wchar_t c : w) o += c < 128 ? (char)c : '?';
+        return o;
+    }
+
     // ------------------------------------------------------------ hook-thread plumbing
     void RunOnHookThread(std::function<void()> fn)
     {
@@ -584,6 +607,7 @@ private:
     HDESK deskOwned_ = nullptr;          // hook thread only: the input desktop handle this thread is attached to
     std::wstring deskName_, deskFailed_; // hook thread only
     unsigned deskTick_ = 0;              // hook thread only
+    ULONGLONG lastSendWarn_ = 0;         // hook thread only
     std::vector<InputRect> mons_;        // set before Start(), read on the hook thread
     std::mutex initMu_;
     std::condition_variable initCv_;
