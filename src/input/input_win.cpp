@@ -8,17 +8,21 @@
 #endif
 #include <windows.h>
 
+#include <algorithm>
 #include <atomic>
 #include <bitset>
 #include <cmath>
+#include <cstdint>
 #include <cstdlib>
 #include <cstring>
 #include <condition_variable>
+#include <chrono>
 #include <deque>
 #include <functional>
 #include <mutex>
 #include <string>
 #include <thread>
+#include <vector>
 
 #include "input/input_backend.hpp"
 
@@ -28,7 +32,6 @@ namespace {
 constexpr ULONG_PTR kTag = 0x53454D4CUL;
 constexpr UINT kMsgKbdOn  = WM_APP + 1;
 constexpr UINT kMsgKbdOff = WM_APP + 2;
-constexpr UINT kMsgDrain  = WM_APP + 4;   // run the queued injected input (see QueueInput)
 constexpr UINT kMsgTask   = WM_APP + 3;   // lParam: heap-allocated std::function<void()> to run on the hook thread
 constexpr unsigned kDeskCheckTicks = 4;   // check for a desktop switch every 4th edge poll (~120 ms)
 constexpr UINT kPollMs    = 30;           // edge polling while input is local (see PollEdge)
@@ -105,6 +108,11 @@ public:
             if (err) *err = "SetWindowsHookEx(WH_MOUSE_LL) failed, error " + std::to_string(initErr_);
             return false;
         }
+        ntSend_ = nullptr;
+        if (!std::getenv("SI_NO_NT"))       // SI_NO_NT=1: always use the documented SendInput
+            if (HMODULE w = LoadLibraryW(L"win32u.dll"))
+                ntSend_ = reinterpret_cast<NtSendFn>(reinterpret_cast<void*>(GetProcAddress(w, "NtUserSendInput")));
+        StartWorkers();
         if (err && !IsPrivileged())
             *err = "running without administrator rights: Task Manager, other elevated windows and UAC prompts cannot be "
                    "controlled. Start it through the Windows service (the window does this by itself: allow its one "
@@ -114,6 +122,7 @@ public:
 
     void Stop() override
     {
+        StopWorkers();
         if (th_.joinable()) {
             PostThreadMessageW(tid_, WM_QUIT, 0, 0);
             th_.join();
@@ -146,20 +155,23 @@ public:
     }
 
     // ------------------------------------------------------------ injection (any thread)
-    // Everything that touches the input stream runs on the hook thread: it is the one thread that follows the
-    // input desktop (see FollowInputDesktop), so the input also reaches the UAC prompt and the lock screen.
+    // Injection runs on TWO worker threads of its own, one for the mouse and one for the keyboard, so a slow
+    // mouse (a virtual machine) never delays a key press, and the hook thread stays free to answer the
+    // low-level hooks in time (Windows drops a hook that answers too slowly). Each worker injects everything it
+    // has waiting with ONE call (NtUserSendInput directly when this Windows has it, else SendInput).
     //
-    // Moves and wheel ticks arrive faster than Windows (and the apps behind it) can digest them, e.g. a
-    // held Ctrl+scroll. They are therefore not posted one by one: they go into a small ordered queue where
-    // consecutive moves collapse into the latest position and consecutive wheel ticks add up, and the hook
-    // thread is woken at most once per batch. The backlog can never grow beyond what one batch holds, so
-    // the lag stops the moment the sender stops. Buttons and keys keep their exact order.
-    void InjectMoveTo(int x, int y) override { QueueInput(QOp::Move, x, y); }
-    void InjectButton(int button, bool down) override { QueueInput(QOp::Button, button, down ? 1 : 0); }
-    void InjectWheel(int dx, int dy) override { QueueInput(QOp::Wheel, dx, dy); }
-    void InjectKey(int code, bool down) override { QueueInput(QOp::Key, code, down ? 1 : 0); }
+    //  - consecutive moves collapse into the latest position, consecutive wheel ticks add up;
+    //  - buttons and wheel are ORDERED against keys (Ctrl held while scrolling or clicking): such an operation
+    //    waits until every key / button queued before it, on the other thread, has been injected. Plain moves
+    //    never wait for anything;
+    //  - when injecting is slow, the mouse worker waits a few times as long as one injection took before the
+    //    next one, so the system is never fed faster than it can digest: what arrives meanwhile is merged.
+    void InjectMoveTo(int x, int y) override { Enqueue(QOp::Move, x, y); }
+    void InjectButton(int button, bool down) override { Enqueue(QOp::Button, button, down ? 1 : 0); }
+    void InjectWheel(int dx, int dy) override { Enqueue(QOp::Wheel, dx, dy); }
+    void InjectKey(int code, bool down) override { Enqueue(QOp::Key, code, down ? 1 : 0); }
 
-    void DoMoveTo(int x, int y)
+    void AddMove(std::vector<INPUT>& v, int x, int y)
     {
         const int vx = GetSystemMetrics(SM_XVIRTUALSCREEN), vy = GetSystemMetrics(SM_YVIRTUALSCREEN);
         const int vw = std::max(2, (int)GetSystemMetrics(SM_CXVIRTUALSCREEN));
@@ -170,10 +182,10 @@ public:
         in.mi.dy = (LONG)std::lround((y - vy) * 65535.0 / (vh - 1));
         in.mi.dwFlags = MOUSEEVENTF_MOVE | MOUSEEVENTF_ABSOLUTE | MOUSEEVENTF_VIRTUALDESK;
         in.mi.dwExtraInfo = kTag;
-        Send(1, &in);
+        v.push_back(in);
     }
 
-    void DoButton(int button, bool down)
+    void AddButton(std::vector<INPUT>& v, int button, bool down)
     {
         INPUT in{};
         in.type = INPUT_MOUSE;
@@ -186,10 +198,10 @@ public:
         case 4: in.mi.dwFlags = down ? MOUSEEVENTF_XDOWN : MOUSEEVENTF_XUP; in.mi.mouseData = XBUTTON2; break;
         default: return;
         }
-        Send(1, &in);
+        v.push_back(in);
     }
 
-    void DoWheel(int dx, int dy)
+    void AddWheel(std::vector<INPUT>& v, int dx, int dy)
     {
         INPUT in[2] = {};
         UINT n = 0;
@@ -207,10 +219,10 @@ public:
             in[n].mi.dwExtraInfo = kTag;
             ++n;
         }
-        if (n) Send(n, in);
+        for (UINT i = 0; i < n; ++i) v.push_back(in[i]);
     }
 
-    void DoKey(int code, bool down)
+    void AddKey(std::vector<INPUT>& v, int code, bool down)
     {
         INPUT in{};
         in.type = INPUT_KEYBOARD;
@@ -239,7 +251,7 @@ public:
         }
         if (!found) return;
         in.ki.dwFlags = fl;
-        Send(1, &in);
+        v.push_back(in);
     }
 
 private:
@@ -248,13 +260,22 @@ private:
     // in a while instead of failing silently.
     void Send(UINT n, INPUT* in)
     {
-        if (SendInput(n, in, sizeof(INPUT)) == n) return;
+        const int cb = (int)sizeof(INPUT);
+        NtSendFn nt = ntSend_.load();
+        UINT sent = nt ? nt(n, in, cb) : SendInput(n, in, cb);
+        if (sent == n) { ntBad_ = 0; return; }
+        if (sent == 0 && nt) {
+            // The direct call can be refused where the documented one is not: retry once through SendInput (nothing
+            // was injected, so nothing is doubled) and stop using the direct call if that keeps being the case.
+            sent = SendInput(n, in, cb);
+            if (sent == n) { if (++ntBad_ >= 3) ntSend_ = nullptr; return; }
+        }
         const DWORD e = GetLastError();
         const ULONGLONG now = GetTickCount64();
-        if (now - lastSendWarn_ < 5000 || !sink_.onLog) return;
-        lastSendWarn_ = now;
+        ULONGLONG prev = lastSendWarn_.load();
+        if (now - prev < 5000 || !sink_.onLog || !lastSendWarn_.compare_exchange_strong(prev, now)) return;
         sink_.onLog("Windows refused injected input (error " + std::to_string(e) + "). " +
-                    (IsPrivileged() ? "Desktop: " + Narrow(deskName_) + "."
+                    (IsPrivileged() ? "Desktop: " + Narrow(DeskNameCopy()) + "."
                                     : "This daemon has no administrator rights, so elevated windows (Task Manager, UAC) "
                                       "ignore it: it must be started by the Windows service (restart the window and allow "
                                       "its UAC prompt)."));
@@ -266,48 +287,202 @@ private:
         return o;
     }
 
-    // ------------------------------------------------------------ coalescing injection queue
+    // ------------------------------------------------------------ injection queues and workers
     enum class QOp : unsigned char { Move, Button, Wheel, Key };
-    struct QItem { QOp op; int a, b; };
+    struct QItem { QOp op; int a, b; std::uint64_t seq; };     // seq 0: a move (not ordered against anything)
 
-    void QueueInput(QOp op, int a, int b)
+    void Enqueue(QOp op, int a, int b)
     {
-        bool wake = false;
-        {
-            std::lock_guard<std::mutex> lk(qMu_);
-            if (!q_.empty() && q_.back().op == op) {
-                QItem& t = q_.back();
-                if (op == QOp::Move)  { t.a = a; t.b = b; return; }        // absolute target: latest wins
-                if (op == QOp::Wheel) { t.a += a; t.b += b; return; }      // a drain is already pending
+        std::lock_guard<std::mutex> lk(qMu_);
+        if (workersStop_) return;
+        switch (op) {
+        case QOp::Move:
+            for (auto it = mq_.rbegin(); it != mq_.rend(); ++it) {
+                if (it->op == QOp::Button) break;                       // the click must land where it was aimed
+                if (it->op == QOp::Move) { it->a = a; it->b = b; return; }   // absolute target: the latest wins
             }
-            q_.push_back({op, a, b});
-            if (!drainPosted_) { drainPosted_ = true; wake = true; }
+            mq_.push_back({op, a, b, 0});
+            break;
+        case QOp::Wheel:
+            for (auto it = mq_.rbegin(); it != mq_.rend(); ++it) {
+                if (it->op == QOp::Button) break;
+                if (it->op == QOp::Wheel) {
+                    if (it->seq == lastOrdered_) { it->a += a; it->b += b; return; }   // 20 ticks -> one big scroll
+                    break;                                              // a key was queued after it: keep the order
+                }
+            }
+            mq_.push_back({op, a, b, ++seq_});
+            pendBtn_.push_back(seq_);
+            lastOrdered_ = seq_;
+            break;
+        case QOp::Button:
+            mq_.push_back({op, a, b, ++seq_});
+            pendBtn_.push_back(seq_);
+            lastOrdered_ = seq_;
+            mouseUrgent_ = true;                                        // a click never waits for pacing
+            break;
+        case QOp::Key:
+            kq_.push_back({op, a, b, ++seq_});
+            pendKey_.push_back(seq_);
+            lastOrdered_ = seq_;
+            break;
         }
-        if (!wake) return;
-        if (tid_ == 0 || !PostThreadMessageW(tid_, kMsgDrain, 0, 0)) {
-            if (tid_ == 0) { DrainInput(); return; }        // hook thread is gone (shutting down)
-            std::lock_guard<std::mutex> lk(qMu_);           // message queue full: try again on the next event
-            drainPosted_ = false;
-        }
+        qCv_.notify_all();
     }
 
-    // Hook thread only.
-    void DrainInput()
+    // qMu_ held. True when everything of the OTHER kind that was queued before 'seq' has been injected.
+    bool OrderedReadyLocked(bool keyboard, std::uint64_t seq) const
     {
-        std::deque<QItem> batch;
+        const auto& other = keyboard ? pendBtn_ : pendKey_;
+        return other.empty() || other.front() > seq || (keyboard ? mouseGone_ : kbdGone_);
+    }
+
+    // Injects 'buf' with one call, then reports the ordered operations in it as done.
+    void FlushBuf(std::vector<INPUT>& buf, std::vector<std::uint64_t>& done, bool keyboard)
+    {
+        if (!buf.empty()) { Send((UINT)buf.size(), buf.data()); buf.clear(); }
+        if (done.empty()) return;
+        std::lock_guard<std::mutex> lk(qMu_);
+        auto& pend = keyboard ? pendKey_ : pendBtn_;
+        for (std::uint64_t d : done) {
+            auto it = std::find(pend.begin(), pend.end(), d);
+            if (it != pend.end()) pend.erase(it);
+        }
+        done.clear();
+        qCv_.notify_all();
+    }
+
+    // Before an ordered operation: inject what is collected so far (the other thread may be waiting for it), then
+    // wait until everything of the other kind queued earlier has been injected. No deadlock is possible: the
+    // oldest pending ordered operation overall never has anything to wait for.
+    void WaitOrdered(std::vector<INPUT>& buf, std::vector<std::uint64_t>& done, bool keyboard, std::uint64_t seq)
+    {
         {
             std::lock_guard<std::mutex> lk(qMu_);
-            batch.swap(q_);
-            drainPosted_ = false;                           // anything queued from now on posts a new drain
+            if (OrderedReadyLocked(keyboard, seq)) return;
         }
-        for (const QItem& i : batch) {
-            switch (i.op) {
-            case QOp::Move:   DoMoveTo(i.a, i.b); break;
-            case QOp::Button: DoButton(i.a, i.b != 0); break;
-            case QOp::Wheel:  DoWheel(i.a, i.b); break;
-            case QOp::Key:    DoKey(i.a, i.b != 0); break;
+        FlushBuf(buf, done, keyboard);
+        std::unique_lock<std::mutex> lk(qMu_);
+        qCv_.wait(lk, [&] { return OrderedReadyLocked(keyboard, seq); });
+    }
+
+    // Worker threads only: injected input goes to the desktop that has the input (UAC prompt, lock screen). The
+    // hook thread notices the switch (FollowInputDesktop) and bumps deskGen_; each worker then follows.
+    void FollowDesktopWorker(HDESK& mine, std::wstring& name, unsigned& seen)
+    {
+        seen = deskGen_.load();
+        HDESK in = OpenInputDesktop(0, FALSE, GENERIC_ALL);
+        if (!in) in = OpenInputDesktop(0, FALSE, DESKTOP_CREATEWINDOW | DESKTOP_HOOKCONTROL | DESKTOP_READOBJECTS |
+                                                     DESKTOP_WRITEOBJECTS | DESKTOP_SWITCHDESKTOP);
+        if (!in) return;
+        const std::wstring n = DesktopName(in);
+        if (n.empty() || n == name) { CloseDesktop(in); return; }
+        if (!SetThreadDesktop(in)) { CloseDesktop(in); return; }
+        if (mine) CloseDesktop(mine);
+        mine = in;
+        name = n;
+    }
+
+    void MouseWorker()
+    {
+        using Clock = std::chrono::steady_clock;
+        HDESK desk = nullptr;
+        std::wstring dname;
+        unsigned seen = 0;
+        FollowDesktopWorker(desk, dname, seen);
+        std::vector<INPUT> buf;
+        std::vector<std::uint64_t> done;
+        Clock::time_point last{};
+        std::chrono::microseconds cost{0};              // smoothed time of ONE injected event
+
+        std::unique_lock<std::mutex> lk(qMu_);
+        for (;;) {
+            qCv_.wait(lk, [this] { return workersStop_ || !mq_.empty(); });
+            if (mq_.empty()) break;                     // stopped and nothing left
+
+            // Adaptive flood control: injecting is slow (a VM) -> wait a few times as long as one event took.
+            auto gap = cost * 3;
+            if (gap < std::chrono::milliseconds(4)) gap = std::chrono::microseconds(0);
+            if (gap > std::chrono::milliseconds(40)) gap = std::chrono::milliseconds(40);
+            if (gap.count() > 0 && !mouseUrgent_ && !workersStop_)
+                qCv_.wait_until(lk, last + gap, [this] { return workersStop_ || mouseUrgent_; });
+
+            std::deque<QItem> batch;
+            batch.swap(mq_);
+            mouseUrgent_ = false;
+            lk.unlock();
+
+            if (deskGen_.load() != seen) FollowDesktopWorker(desk, dname, seen);
+            const auto t0 = Clock::now();
+            for (const QItem& i : batch) {
+                if (i.seq) WaitOrdered(buf, done, false, i.seq);
+                switch (i.op) {
+                case QOp::Move:   AddMove(buf, i.a, i.b); break;
+                case QOp::Button: AddButton(buf, i.a, i.b != 0); done.push_back(i.seq); break;
+                case QOp::Wheel:  AddWheel(buf, i.a, i.b); done.push_back(i.seq); break;
+                case QOp::Key:    break;
+                }
             }
+            FlushBuf(buf, done, false);
+            last = Clock::now();
+            cost = (cost * 3 + std::chrono::duration_cast<std::chrono::microseconds>(last - t0) / (int)batch.size()) / 4;
+            lk.lock();
         }
+        mouseGone_ = true;
+        qCv_.notify_all();
+    }
+
+    void KbdWorker()
+    {
+        HDESK desk = nullptr;
+        std::wstring dname;
+        unsigned seen = 0;
+        FollowDesktopWorker(desk, dname, seen);
+        std::vector<INPUT> buf;
+        std::vector<std::uint64_t> done;
+
+        std::unique_lock<std::mutex> lk(qMu_);
+        for (;;) {
+            qCv_.wait(lk, [this] { return workersStop_ || !kq_.empty(); });
+            if (kq_.empty()) break;
+            std::deque<QItem> batch;
+            batch.swap(kq_);
+            lk.unlock();
+
+            if (deskGen_.load() != seen) FollowDesktopWorker(desk, dname, seen);
+            for (const QItem& i : batch) {
+                WaitOrdered(buf, done, true, i.seq);
+                AddKey(buf, i.a, i.b != 0);
+                done.push_back(i.seq);
+            }
+            FlushBuf(buf, done, true);
+            lk.lock();
+        }
+        kbdGone_ = true;
+        qCv_.notify_all();
+    }
+
+    void StartWorkers()
+    {
+        {
+            std::lock_guard<std::mutex> lk(qMu_);
+            workersStop_ = false;
+            mouseGone_ = kbdGone_ = false;
+            mq_.clear(); kq_.clear(); pendBtn_.clear(); pendKey_.clear();
+        }
+        mouseTh_ = std::thread([this] { MouseWorker(); });
+        kbdTh_   = std::thread([this] { KbdWorker(); });
+    }
+
+    void StopWorkers()
+    {
+        {
+            std::lock_guard<std::mutex> lk(qMu_);
+            workersStop_ = true;
+            qCv_.notify_all();
+        }
+        if (mouseTh_.joinable()) mouseTh_.join();
+        if (kbdTh_.joinable())   kbdTh_.join();
     }
 
     // ------------------------------------------------------------ hook-thread plumbing
@@ -362,6 +537,8 @@ private:
         deskOwned_ = in;
         deskName_ = name;
         deskFailed_.clear();
+        { std::lock_guard<std::mutex> g(deskNameMu_); deskNameShared_ = name; }
+        ++deskGen_;                         // the injection workers follow (see FollowDesktopWorker)
         InstallHooks();
         if (fwd_) ShowOverlay();
         return true;
@@ -500,8 +677,6 @@ private:
                 } else {
                     Reassert();
                 }
-            } else if (msg.message == kMsgDrain && msg.hwnd == nullptr) {
-                DrainInput();
             } else if (msg.message == kMsgTask && msg.hwnd == nullptr) {
                 auto* task = reinterpret_cast<std::function<void()>*>(msg.lParam);
                 if (task) { (*task)(); delete task; }
@@ -661,16 +836,27 @@ private:
     HDESK deskOwned_ = nullptr;          // hook thread only: the input desktop handle this thread is attached to
     std::wstring deskName_, deskFailed_; // hook thread only
     unsigned deskTick_ = 0;              // hook thread only
-    ULONGLONG lastSendWarn_ = 0;         // hook thread only
+    std::atomic<ULONGLONG> lastSendWarn_{0};
+    using NtSendFn = UINT(WINAPI*)(UINT, LPINPUT, int);
+    std::atomic<NtSendFn> ntSend_{nullptr};   // win32u!NtUserSendInput, resolved in Start() (null: use SendInput)
+    std::atomic<int> ntBad_{0};
+    std::mutex deskNameMu_;
+    std::wstring deskNameShared_;             // copy of deskName_ for the log message written by the workers
+    std::wstring DeskNameCopy() { std::lock_guard<std::mutex> g(deskNameMu_); return deskNameShared_; }
+    std::atomic<unsigned> deskGen_{0};        // bumped by the hook thread when the input desktop changed
     std::vector<InputRect> mons_;        // set before Start(), read on the hook thread
     std::mutex initMu_;
     std::condition_variable initCv_;
     bool initDone_ = false, hookOk_ = false;
     DWORD initErr_ = 0;
 
-    std::mutex qMu_;                     // guards q_ and drainPosted_
-    std::deque<QItem> q_;
-    bool drainPosted_ = false;
+    std::mutex qMu_;                     // guards everything below up to workersStop_
+    std::condition_variable qCv_;
+    std::deque<QItem> mq_, kq_;          // mouse queue (moves, buttons, wheel) and keyboard queue
+    std::deque<std::uint64_t> pendBtn_, pendKey_;   // ordered operations not injected yet (button/wheel, key), ascending
+    std::uint64_t seq_ = 0, lastOrdered_ = 0;
+    bool mouseUrgent_ = false, mouseGone_ = false, kbdGone_ = false, workersStop_ = true;
+    std::thread mouseTh_, kbdTh_;
 
     std::atomic<bool> fwd_{false};
     std::atomic<bool> hidden_{false};

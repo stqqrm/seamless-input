@@ -2377,6 +2377,7 @@ private:
         int  vol = 100;             // 0..100, what I hear from it
         bool allowed = false;       // may it control this PC?
         bool clip = false;          // send my clipboard to this device when the cursor moves over to it
+        int  hz = 250;              // keyboard/mouse updates per second sent to this device
     };
 
     // ------------------------------------------------------------ daemon connection
@@ -3219,7 +3220,8 @@ private:
     // ---- one device card: info | share audio / microphone + allow control | mute, volume, level
     struct DevRow {
         CardPanel* card = nullptr;
-        wxStaticText *name = nullptr, *sub = nullptr, *detail = nullptr, *pct = nullptr, *audioState = nullptr;
+        wxStaticText *name = nullptr, *sub = nullptr, *detail = nullptr, *pct = nullptr, *audioState = nullptr, *hzPct = nullptr;
+        FlatSlider* hz = nullptr;           // keyboard/mouse updates per second sent to this device (units of 10 Hz)
         FlatCheck *share = nullptr, *mic = nullptr, *allow = nullptr, *clip = nullptr;
         SpeakerButton* mute = nullptr;
         FlatSlider* vol = nullptr;
@@ -3245,6 +3247,20 @@ private:
         info->Add(r.name, 0, wxBOTTOM, 3);
         info->Add(r.sub, 0, wxBOTTOM, 2);
         info->Add(r.detail, 0);
+
+        // How often my keyboard and mouse updates are sent to this device. Motion and scrolling that happens in
+        // between is merged into one update. Lower it for a slow receiver (a virtual machine), raise it for a fast one.
+        r.hz = new FlatSlider(c, theme_, 1, 100, 25, 150);          // 10 .. 1000 Hz in steps of 10
+        r.hz->SetToolTip("How many keyboard/mouse updates per second are sent to this device.\n"
+                         "Movement and scrolling in between is merged into one update (20 scroll ticks become one big scroll).\n"
+                         "Lower it if this device lags (a virtual machine, a slow network), raise it for smoother movement.");
+        r.hzPct = MakeLabel(c, "250 Hz", true);
+        r.hzPct->SetMinSize(wxSize(58, -1));
+        auto* rate = new wxBoxSizer(wxHORIZONTAL);
+        rate->Add(MakeLabel(c, "Input updates", true), 0, wxALIGN_CENTER_VERTICAL | wxRIGHT, 8);
+        rate->Add(r.hz, 0, wxALIGN_CENTER_VERTICAL | wxRIGHT, 6);
+        rate->Add(r.hzPct, 0, wxALIGN_CENTER_VERTICAL);
+        info->Add(rate, 0, wxTOP, 8);
 
         // switches
         r.share = new FlatCheck(c, theme_, "Share my audio");
@@ -3328,6 +3344,15 @@ private:
             }
             client_->Send("CONTROL " + std::to_string(id) + (e.IsChecked() ? " 1" : " 0"));
         });
+        r.hz->Bind(wxEVT_SLIDER, [this, id](wxCommandEvent& e) {
+            auto it = peers_.find(id);
+            if (it == peers_.end()) return;
+            it->second.hz = e.GetInt() * 10;
+            auto rit = devRows_.find(id);
+            if (rit != devRows_.end()) rit->second.hzPct->SetLabelText(wxString::Format("%d Hz", it->second.hz));
+            lastAudio_[id] = std::chrono::steady_clock::now();      // keep the drag until the daemon confirms it
+            client_->Send("RATE " + std::to_string(id) + " " + std::to_string(it->second.hz));
+        });
         r.mute->onToggle = [this, id](bool m) {
             auto it = peers_.find(id);
             if (it == peers_.end()) return;
@@ -3381,6 +3406,8 @@ private:
         r.mute->SetMuted(p.mute);
         r.vol->SetValue(p.vol);
         SetText(r.pct, wxString::Format("%d%%", p.vol));
+        r.hz->SetValue(std::max(1, std::min(100, p.hz / 10)));
+        SetText(r.hzPct, wxString::Format("%d Hz", p.hz));
     }
 
     void RefreshDeviceRows()
@@ -3815,11 +3842,13 @@ private:
             pi.share = p.share; pi.mic = p.mic; pi.mute = p.mute; pi.vol = p.vol;
             pi.allowed = p.allowed;
             pi.clip = p.clip;
+            pi.hz = p.hz;
             auto old = peers_.find(p.id);
             if (old != peers_.end() && recent(lastAudio_, p.id)) {      // the user is touching these right now
                 pi.share = old->second.share; pi.mic = old->second.mic;
                 pi.mute = old->second.mute;   pi.vol = old->second.vol;
                 pi.clip = old->second.clip;
+                pi.hz = old->second.hz;
             }
             np[p.id] = std::move(pi);
         }

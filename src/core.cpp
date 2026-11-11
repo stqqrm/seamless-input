@@ -562,6 +562,19 @@ void Core::CmdRegenKeys()
     CmdQuit();                                                  // network, beacons and peers all pick up the new key on restart
 }
 
+void Core::CmdRate(int id, int hz)
+{
+    auto it = peers_.find(id);
+    if (it == peers_.end()) return;
+    hz = std::clamp(hz, 10, 1000);
+    state::Peer& p = it->second;
+    if (p.hz == hz) return;
+    p.hz = hz;
+    if (input_) input_->SetPeerRate(id, hz);
+    RecordPeerAudio(p);                 // saved with the other per-device settings
+    Changed();
+}
+
 void Core::CmdClipboard(int id, bool share)
 {
     auto it = peers_.find(id);
@@ -795,6 +808,8 @@ void Core::RecordPeerAudio(const state::Peer& p, bool force)
     sp.volume = p.vol;
     sp.hasClip = true;
     sp.clip = p.clip;
+    sp.hasRate = true;
+    sp.hz = p.hz;
     if (!force) TouchCfg();
 }
 
@@ -871,6 +886,8 @@ void Core::ApplyConfigSettings()
             p.mute = false; p.vol = 100;
         }
         p.clip = sp && sp->hasClip && sp->clip;
+        p.hz = sp && sp->hasRate ? std::clamp(sp->hz, 10, 1000) : 250;
+        if (input_) input_->SetPeerRate(p.id, p.hz);
         PushPeerAudio(p);
     }
     RefreshCapture();

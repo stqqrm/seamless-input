@@ -71,6 +71,7 @@ public:
     void SetPeerOffset(int id, double ox, double oy);
     void SetPeerAllowed(int id, bool allowed);     // may this peer control THIS PC?
     void SetPeerAccepts(int id, bool accepts);     // does this peer let THIS PC control it? (its CTRL line)
+    void SetPeerRate(int id, int hz);              // keyboard/mouse updates per second sent to this peer (10..1000)
     void RemovePeer(int id);
 
     // Returns true if the line belonged to the input protocol. Call from the network thread.

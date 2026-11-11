@@ -29,6 +29,10 @@ struct SavedPeer {
     // clipboard: send mine to this device when the cursor moves over to it
     bool hasClip = false;  // false: the file had no "peerclip" line for this peer
     bool clip = false;
+
+    // keyboard/mouse: how many updates per second are sent to this device (Devices tab)
+    bool hasRate = false;  // false: the file had no "peerrate" line for this peer
+    int  hz = 250;
 };
 
 struct SavedAudio {

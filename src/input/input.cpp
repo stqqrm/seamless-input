@@ -1,5 +1,6 @@
 #include "input/input.hpp"
 
+#include <algorithm>
 #include <chrono>
 #include <climits>
 #include <cmath>
@@ -12,6 +13,7 @@
 #include <mutex>
 #include <set>
 #include <thread>
+#include <vector>
 
 #include "input/input_backend.hpp"
 
@@ -37,10 +39,15 @@ constexpr auto kRetry        = std::chrono::milliseconds(750);
 // PC owner priority: the person sitting at a PC always wins over whoever is remote controlling it.
 // After the owner touched their mouse/keyboard nobody may (re)take control of that PC for this long.
 constexpr auto kOwnerHold    = std::chrono::milliseconds(3000);
-// Mouse motion and wheel ticks are not sent one by one: everything that arrives within this window is merged into
-// ONE "M dx dy" and ONE "W dx dy" line (sum of the deltas). 4 ms = 250 updates per second, smooth enough
-// for a high-refresh pointer, and a burst of 20 wheel ticks becomes one big scroll. The first event after a pause goes out at once.
-constexpr auto kSendInterval = std::chrono::milliseconds(4);
+// Mouse motion and wheel ticks are not sent one by one: everything that arrives within one tick is merged into
+// ONE "M dx dy" and ONE "W dx dy" line (sum of the deltas), so a burst of 20 wheel ticks becomes one big scroll.
+// The tick is set PER PEER (Devices tab, updates per second). The first event after a pause goes out at once.
+// Each peer has its own queue and its own clock: a slow device never holds back another one, and nothing needs
+// to be synchronised between them (a peer only acts on what it has received).
+constexpr int kDefaultRateHz = 250;
+constexpr int kMinRateHz     = 10;
+constexpr int kMaxRateHz     = 1000;
+constexpr size_t kMaxQueue   = 256;     // per peer; when exceeded the OLDEST motion/wheel entries are dropped first
 
 std::unique_ptr<InputBackend> CreateBackend(std::string* why)
 {
@@ -109,43 +116,64 @@ struct InputEngine::Impl {
     Clock::time_point lastSwitch{};
     std::string lastErr;
 
-    // ---- outgoing queue (keeps hook callbacks fast and coalesces mouse motion)
+    // ---- outgoing queues, one per peer (keeps hook callbacks fast and coalesces mouse motion)
+    struct PeerQ {
+        std::deque<Out> q;
+        Clock::time_point next{};       // earliest time the next paced batch may go out
+        bool urgent = false;            // a click / key / control line is queued: do not wait for the tick
+        int hz = kDefaultRateHz;
+    };
     std::mutex qmu;
     std::condition_variable qcv;
-    std::deque<Out> q;
+    std::map<int, PeerQ> pq;
     bool qstop = false;
-    bool urgent = false;                // something other than motion/wheel is queued: do not wait for the next tick
     std::thread sender;
 
     // ----------------------------------------------------------------- sender
     void Push(int peer, const InputEvent& ev)
     {
         std::lock_guard<std::mutex> lk(qmu);
+        PeerQ& p = pq[peer];
         const bool motion = ev.kind == InputKind::Move || ev.kind == InputKind::Wheel;
         if (motion) {
             // Merge into the newest queued entry of the same kind, as long as nothing order-sensitive (a button,
             // a key, a control line) was queued after it. Moves and wheel ticks may pass each other: within
             // one tick that makes no difference.
-            for (auto it = q.rbegin(); it != q.rend(); ++it) {
-                if (it->isRaw || it->peer != peer) break;
+            for (auto it = p.q.rbegin(); it != p.q.rend(); ++it) {
+                if (it->isRaw) break;
                 if (it->ev.kind == ev.kind) { it->ev.a += ev.a; it->ev.b += ev.b; return; }
                 if (it->ev.kind != InputKind::Move && it->ev.kind != InputKind::Wheel) break;
             }
         } else {
-            urgent = true;                  // click / key: goes out now, after the motion queued before it
+            p.urgent = true;                // click / key: goes out now, after the motion queued before it
         }
         Out o; o.peer = peer; o.ev = ev;
-        q.push_back(std::move(o));
+        p.q.push_back(std::move(o));
+        TrimLocked(p);
         qcv.notify_one();
     }
 
     void PushRaw(int peer, std::string line)
     {
         std::lock_guard<std::mutex> lk(qmu);
+        PeerQ& p = pq[peer];
         Out o; o.peer = peer; o.raw = std::move(line); o.isRaw = true;
-        q.push_back(std::move(o));
-        urgent = true;
+        p.q.push_back(std::move(o));
+        p.urgent = true;
+        TrimLocked(p);
         qcv.notify_one();
+    }
+
+    // Bounded queue: only ever drops pointer motion / wheel (the newest state matters), never keys or buttons.
+    static void TrimLocked(PeerQ& p)
+    {
+        while (p.q.size() > kMaxQueue) {
+            auto it = std::find_if(p.q.begin(), p.q.end(), [](const Out& o) {
+                return !o.isRaw && (o.ev.kind == InputKind::Move || o.ev.kind == InputKind::Wheel);
+            });
+            if (it == p.q.end()) break;
+            p.q.erase(it);
+        }
     }
 
     static std::string Format(const Out& o)
@@ -165,17 +193,35 @@ struct InputEngine::Impl {
     {
         std::unique_lock<std::mutex> lk(qmu);
         for (;;) {
-            qcv.wait(lk, [this] { return qstop || !q.empty(); });
-            if (q.empty()) break;               // qstop and nothing left; queued lines (RELEASE/DENY) are still sent
-            std::deque<Out> batch;
-            batch.swap(q);
-            urgent = false;
-            lk.unlock();
-            for (const auto& o : batch) send(o.peer, Format(o));
-            lk.lock();
-            // One tick: motion and wheel that arrive meanwhile are merged in Push() and go out together next
-            // time. A click, key or control line ends the wait early so it is never delayed.
-            qcv.wait_for(lk, kSendInterval, [this] { return qstop || urgent; });
+            std::vector<std::pair<int, std::deque<Out>>> ready;
+            auto wake = Clock::time_point::max();
+            bool any = false;
+            const auto now = Clock::now();
+            for (auto& [id, p] : pq) {
+                if (p.q.empty()) continue;
+                any = true;
+                if (qstop || p.urgent || now >= p.next) {       // on stop everything left (RELEASE / DENY) goes out
+                    ready.emplace_back(id, std::deque<Out>());
+                    ready.back().second.swap(p.q);
+                    p.urgent = false;
+                    p.next = now + std::chrono::microseconds(1000000 / std::clamp(p.hz, kMinRateHz, kMaxRateHz));
+                } else {
+                    wake = std::min(wake, p.next);              // motion that arrives until then is merged in Push()
+                }
+            }
+            if (!ready.empty()) {
+                lk.unlock();
+                for (auto& [id, batch] : ready)
+                    for (const auto& o : batch) send(id, Format(o));
+                lk.lock();
+                continue;
+            }
+            if (!any) {
+                if (qstop) break;
+                qcv.wait(lk);
+            } else {
+                qcv.wait_until(lk, wake);
+            }
         }
     }
 
@@ -622,8 +668,18 @@ void InputEngine::SetPeerAccepts(int id, bool accepts)
         d_->StopForwardingLocked(false, -1, -1);
 }
 
+void InputEngine::SetPeerRate(int id, int hz)
+{
+    std::lock_guard<std::mutex> lk(d_->qmu);
+    d_->pq[id].hz = std::clamp(hz, kMinRateHz, kMaxRateHz);
+}
+
 void InputEngine::RemovePeer(int id)
 {
+    {
+        std::lock_guard<std::mutex> qlk(d_->qmu);
+        d_->pq.erase(id);               // nothing can be sent to it any more
+    }
     std::lock_guard<std::mutex> lk(d_->mu);
     d_->peers.erase(id);
     if (!d_->be || d_->peerId != id) return;

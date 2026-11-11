@@ -23,6 +23,7 @@ struct Peer {
     int  vol = 100;                      // 0..100, what I hear from it
     bool allowed = false;                // may it control this PC? (saved per device, off by default)
     bool clip = false;                   // share my clipboard with it when the cursor moves over to it
+    int  hz = 250;                       // how often my keyboard/mouse updates are sent to it (updates per second)
     // Version handshake (VER line, sent by both sides right after the connection is ready). An old
     // daemon never sends one: gotVer stays false.
     bool gotVer = false;
