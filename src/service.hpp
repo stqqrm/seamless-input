@@ -45,6 +45,9 @@ bool EnsureDaemon(const std::filesystem::path& dataDir, std::string* err, int wa
 int KillDaemons();
 // Waits until no daemon answers any more (after RequestStop).
 bool WaitGone(const std::filesystem::path& dataDir, int waitMs);
+// Windows: true after the service was uninstalled from the Service menu, until it is installed again. While it is
+// true nothing starts the daemon (EnsureDaemon refuses); always false elsewhere.
+bool ServiceRemoved(const std::filesystem::path& dataDir);
 
 // Windows worker only (--worker): calls onStop when the service asks the worker to stop. No-op elsewhere.
 void WatchWorkerStop(std::function<void()> onStop);

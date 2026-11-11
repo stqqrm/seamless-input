@@ -27,11 +27,26 @@ static bool WaitFor(const std::function<bool()>& pred, int waitMs)
     }
 }
 
+bool ServiceRemoved(const std::filesystem::path& dataDir)
+{
+#if defined(_WIN32)
+    std::error_code ec;
+    return std::filesystem::exists(dataDir / "service-uninstalled", ec);   // written by UninstallServiceNow
+#else
+    (void)dataDir;
+    return false;
+#endif
+}
+
 bool EnsureDaemon(const std::filesystem::path& dataDir, std::string* err, int waitMs)
 {
     auto up = [&] { return ipc::Ping(dataDir, 500); };
     std::string why;
 #if defined(_WIN32)
+    if (ServiceRemoved(dataDir)) {                  // uninstalled on purpose: stays off until it is installed again
+        if (err) *err = "the service is uninstalled; install it again from the Service menu";
+        return false;
+    }
     if (!PrepareManaged(dataDir, &why) && !why.empty()) {
         // no service (the UAC prompt was declined): the direct start below still works, without elevated-window support
     }

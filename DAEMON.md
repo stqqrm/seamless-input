@@ -20,8 +20,8 @@ The menu is called **Service** on Windows and **Daemon** on Linux.
 | Stop / Start | stops or starts the service (greyed out while not installed) | stops or starts the daemon |
 
 Stopping keeps the daemon stopped until you press Start. On Linux nothing is ever greyed out. After *Uninstall* on
-Windows the window runs a plain daemon without administrator rights (no control of elevated windows or UAC) and does not
-install the service again by itself; *Install* turns that back on.
+Windows the service executable is closed and nothing starts it again (not the window, not a restart of the window)
+until you press *Install*.
 
 | OS | What it does |
 |---|---|

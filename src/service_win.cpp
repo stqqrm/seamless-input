@@ -431,10 +431,18 @@ bool InstallServiceNow(const std::filesystem::path& dataDir, std::string* err)
 
 bool UninstallServiceNow(const std::filesystem::path& dataDir, std::string* err)
 {
-    if (!RunElevated(L"--uninstall-service", err)) return false;
+    // Marker first: from here on nothing may start the daemon again (see EnsureDaemon).
     std::error_code ec;
     std::filesystem::create_directories(dataDir, ec);
     std::ofstream(DeclinedMarker(dataDir)) << "the service was removed from the Service menu\n";
+    if (!RunElevated(L"--uninstall-service", err)) {
+        std::filesystem::remove(DeclinedMarker(dataDir), ec);       // nothing was removed
+        return false;
+    }
+    // Close every daemon that is still running (the elevated step already ended the service's own).
+    if (ipc::Ping(dataDir, 500)) { ipc::RequestStop(dataDir); WaitGone(dataDir, 1500); }
+    KillDaemons();
+    WaitGone(dataDir, 2000);
     return true;
 }
 
@@ -583,6 +591,7 @@ int UninstallService()
         return 1;
     }
     StopServiceAndWait(sv.h, 15000);
+    KillDaemons();                                  // elevated: also ends a worker the stop did not reach
     if (!DeleteService(sv.h) && GetLastError() != ERROR_SERVICE_MARKED_FOR_DELETE) {
         std::fprintf(stderr, "DeleteService failed: %lu\n", GetLastError());
         return 1;

@@ -2214,6 +2214,7 @@ public:
         local_ = GetLocalAddresses();
         localMons_ = GetLocalMonitors();      // until the daemon reports the monitors it uses itself
         dataDir_ = paths::DataDir();
+        daemonWanted_ = !svc::ServiceRemoved(dataDir_);     // uninstalled from the Service menu: stays stopped
 
         // The window holds no engine: the daemon (seamless-input-daemon) does the network, keyboard,
         // mouse and audio work and keeps running when this window is closed. We mirror its state.
@@ -2841,22 +2842,28 @@ private:
 #if defined(_WIN32)
         if (busy_) { Log("Still applying the last change, please wait..."); return; }
         const bool install = !svc::QueryAutostart().installed;
+        const bool wasWanted = daemonWanted_;
         busy_ = true;
-        daemonWanted_ = true;
+        if (!install) daemonWanted_ = false;        // the daemon is about to be closed: do not "repair" the connection
         Log(install ? "Installing the Windows service..." : "Uninstalling the Windows service...");
         auto alive = alive_;
         const auto dir = dataDir_;
-        std::thread([this, alive, dir, install] {
+        std::thread([this, alive, dir, install, wasWanted] {
             std::string err;
             const bool ok = install ? svc::InstallServiceNow(dir, &err) : svc::UninstallServiceNow(dir, &err);
-            wxTheApp->CallAfter([this, alive, ok, install, err] {
+            wxTheApp->CallAfter([this, alive, ok, install, wasWanted, err] {
                 if (!*alive) return;
                 busy_ = false;
-                if (ok) Log(install ? "Service installed: it can control elevated windows and the UAC prompt"
-                                    : "Service uninstalled: the daemon now runs without administrator rights");
-                else    wxMessageBox(wxString::FromUTF8(err), "Service", wxOK | wxICON_WARNING, this);
+                if (ok) {
+                    daemonWanted_ = install;        // uninstalled: stays closed until it is installed again
+                    Log(install ? "Service installed: it can control elevated windows and the UAC prompt"
+                                : "Service uninstalled and closed: it stays off until it is installed again");
+                } else {
+                    daemonWanted_ = wasWanted;
+                    wxMessageBox(wxString::FromUTF8(err), "Service", wxOK | wxICON_WARNING, this);
+                }
                 connFails_ = 0;
-                retry_ = 3;                         // reconnect right away
+                retry_ = 3;                         // reconnect right away (only when the daemon is wanted)
             });
         }).detach();
 #endif
