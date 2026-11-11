@@ -1,5 +1,15 @@
 cmake_minimum_required(VERSION 3.21)
 
+# --------------------------------------------------
+# Standalone Windows executables: link the C/C++ runtime statically (/MT) so no Visual C++ Redistributable is
+# needed. Must be set before any target is created; wxWidgets gets the same setting below. Turn off with
+# -DSI_STATIC_RUNTIME=OFF. Delete the build/ folder after changing it.
+# --------------------------------------------------
+option(SI_STATIC_RUNTIME "Windows: link the C/C++ runtime statically (standalone exe)" ON)
+if(WIN32 AND SI_STATIC_RUNTIME)
+    set(CMAKE_MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>")
+endif()
+
 project(seamless-input
     VERSION 1.0.0
     DESCRIPTION "Seamless input sharing across LAN"
@@ -89,6 +99,9 @@ else()
     # --------------------------------------------------
     
     set(wxBUILD_SHARED OFF CACHE BOOL "" FORCE)
+    if(WIN32 AND SI_STATIC_RUNTIME)
+        set(wxBUILD_USE_STATIC_RUNTIME ON CACHE BOOL "" FORCE)
+    endif()
     set(wxBUILD_MONOLITHIC ON CACHE BOOL "" FORCE)
     set(wxBUILD_SAMPLES OFF CACHE BOOL "" FORCE)
     set(wxBUILD_TESTS OFF CACHE BOOL "" FORCE)
@@ -250,6 +263,12 @@ if(MSVC)
     target_sources(seamless-input-daemon PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/app.manifest")
 endif()
 
+# MinGW: fold libstdc++, libgcc and winpthread into the exe as well (MSVC is handled by /MT above)
+if(WIN32 AND NOT MSVC AND SI_STATIC_RUNTIME)
+    target_link_options(seamless-input-daemon PRIVATE -static -static-libgcc -static-libstdc++)
+    target_link_options(${PROJECT_NAME} PRIVATE -static -static-libgcc -static-libstdc++)
+endif()
+
 install(TARGETS ${PROJECT_NAME} seamless-input-daemon RUNTIME DESTINATION bin)
 
 # --- themes: theme/*.theme are read at run time (Theme menu). Copied next to the GUI executable and
@@ -283,6 +302,9 @@ message(STATUS "Project:       ${PROJECT_NAME}")
 message(STATUS "Version:       ${PROJECT_VERSION}")
 message(STATUS "C++ Standard:  ${CMAKE_CXX_STANDARD}")
 message(STATUS "Build Type:    ${CMAKE_BUILD_TYPE}")
+if(WIN32)
+    message(STATUS "Static runtime: ${SI_STATIC_RUNTIME}")
+endif()
 message(STATUS "wxWidgets:     3.2.8 (${WX_TARGET})")
 message(STATUS "Boost:         ${BOOST_VERSION_TAG} (asio)")
 message(STATUS "miniaudio:     ${MINIAUDIO_VERSION}")
