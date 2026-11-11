@@ -37,6 +37,10 @@ constexpr auto kRetry        = std::chrono::milliseconds(750);
 // PC owner priority: the person sitting at a PC always wins over whoever is remote controlling it.
 // After the owner touched their mouse/keyboard nobody may (re)take control of that PC for this long.
 constexpr auto kOwnerHold    = std::chrono::milliseconds(3000);
+// Mouse motion and wheel ticks are not sent one by one: everything that arrives within this window is merged into
+// ONE "M dx dy" and ONE "W dx dy" line (sum of the deltas). 4 ms = 250 updates per second, smooth enough
+// for a high-refresh pointer, and a burst of 20 wheel ticks becomes one big scroll. The first event after a pause goes out at once.
+constexpr auto kSendInterval = std::chrono::milliseconds(4);
 
 std::unique_ptr<InputBackend> CreateBackend(std::string* why)
 {
@@ -110,20 +114,25 @@ struct InputEngine::Impl {
     std::condition_variable qcv;
     std::deque<Out> q;
     bool qstop = false;
+    bool urgent = false;                // something other than motion/wheel is queued: do not wait for the next tick
     std::thread sender;
 
     // ----------------------------------------------------------------- sender
     void Push(int peer, const InputEvent& ev)
     {
         std::lock_guard<std::mutex> lk(qmu);
-        if (!q.empty()) {
-            Out& t = q.back();
-            if (!t.isRaw && t.peer == peer && t.ev.kind == ev.kind &&
-                (ev.kind == InputKind::Move || ev.kind == InputKind::Wheel)) {
-                t.ev.a += ev.a;
-                t.ev.b += ev.b;
-                return;
+        const bool motion = ev.kind == InputKind::Move || ev.kind == InputKind::Wheel;
+        if (motion) {
+            // Merge into the newest queued entry of the same kind, as long as nothing order-sensitive (a button,
+            // a key, a control line) was queued after it. Moves and wheel ticks may pass each other: within
+            // one tick that makes no difference.
+            for (auto it = q.rbegin(); it != q.rend(); ++it) {
+                if (it->isRaw || it->peer != peer) break;
+                if (it->ev.kind == ev.kind) { it->ev.a += ev.a; it->ev.b += ev.b; return; }
+                if (it->ev.kind != InputKind::Move && it->ev.kind != InputKind::Wheel) break;
             }
+        } else {
+            urgent = true;                  // click / key: goes out now, after the motion queued before it
         }
         Out o; o.peer = peer; o.ev = ev;
         q.push_back(std::move(o));
@@ -135,6 +144,7 @@ struct InputEngine::Impl {
         std::lock_guard<std::mutex> lk(qmu);
         Out o; o.peer = peer; o.raw = std::move(line); o.isRaw = true;
         q.push_back(std::move(o));
+        urgent = true;
         qcv.notify_one();
     }
 
@@ -159,11 +169,13 @@ struct InputEngine::Impl {
             if (q.empty()) break;               // qstop and nothing left; queued lines (RELEASE/DENY) are still sent
             std::deque<Out> batch;
             batch.swap(q);
+            urgent = false;
             lk.unlock();
             for (const auto& o : batch) send(o.peer, Format(o));
-            // ~500 Hz cap: motion that arrives meanwhile is merged in Push()
-            std::this_thread::sleep_for(std::chrono::milliseconds(2));
             lk.lock();
+            // One tick: motion and wheel that arrive meanwhile are merged in Push() and go out together next
+            // time. A click, key or control line ends the wait early so it is never delayed.
+            qcv.wait_for(lk, kSendInterval, [this] { return qstop || urgent; });
         }
     }
 
