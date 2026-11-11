@@ -134,7 +134,7 @@ std::string ToUtf8(const wchar_t* w, size_t len)
     return s;
 }
 
-struct DropFilesHeader {                    // DROPFILES (shlobj.h) without the include
+struct DropFilesHeader {                    // DROPFILES
     DWORD pFiles;
     POINT pt;
     BOOL fNC;
@@ -145,6 +145,11 @@ struct DropFilesHeader {                    // DROPFILES (shlobj.h) without the 
 
 std::string Backend() { return "Windows clipboard"; }
 bool FilesSupported() { return true; }
+
+std::uint64_t ChangeToken()
+{
+    return (std::uint64_t)GetClipboardSequenceNumber();     // 0 only when the window station denies access
+}
 
 bool GetText(std::string& out, std::size_t maxBytes)
 {
@@ -249,10 +254,76 @@ bool GetFiles(std::vector<std::filesystem::path>& files)
     return !files.empty();
 }
 
-bool SetFiles(const std::vector<std::filesystem::path>& files)
+// Lets PowerShell's Set-Clipboard put the files on the clipboard: Explorer then offers Paste for them.
+static bool SetFilesPowerShell(const std::vector<std::filesystem::path>& files, std::string& err)
+{
+    wchar_t sysDir[MAX_PATH] = {};
+    if (!GetSystemDirectoryW(sysDir, MAX_PATH)) { err = "no system directory"; return false; }
+    const std::wstring exe = std::wstring(sysDir) + L"\\WindowsPowerShell\\v1.0\\powershell.exe";
+
+    wchar_t tmpDir[MAX_PATH] = {};
+    const DWORD tl = GetTempPathW(MAX_PATH, tmpDir);
+    if (!tl || tl >= MAX_PATH) { err = "no temp directory"; return false; }
+    const std::wstring listFile = std::wstring(tmpDir) + L"seamless-input-clip-" + std::to_wstring(GetCurrentProcessId()) + L".txt";
+    {
+        FILE* f = _wfopen(listFile.c_str(), L"wb");
+        if (!f) { err = "cannot write the file list for PowerShell"; return false; }
+        const unsigned char bom[3] = {0xEF, 0xBB, 0xBF};
+        std::fwrite(bom, 1, 3, f);
+        for (const auto& p : files) {
+            const std::wstring w = p.wstring();
+            const std::string u = ToUtf8(w.data(), w.size()) + "\r\n";
+            std::fwrite(u.data(), 1, u.size(), f);
+        }
+        std::fclose(f);
+    }
+    std::wstring lf = listFile;                       // single-quote escaping for PowerShell
+    for (std::size_t i = 0; i < lf.size(); ++i) if (lf[i] == L'\'') { lf.insert(i, 1, L'\''); ++i; }
+    const std::wstring script =
+        L"$ErrorActionPreference='Stop'; $p=@(Get-Content -LiteralPath '" + lf + L"' -Encoding UTF8 | Where-Object { $_ }); "
+        L"Set-Clipboard -LiteralPath $p";
+    std::wstring cmd = L"\"" + exe + L"\" -NoProfile -NonInteractive -STA -ExecutionPolicy Bypass -Command \"" + script + L"\"";
+
+    STARTUPINFOW si{};
+    si.cb = sizeof(si);
+    si.dwFlags = STARTF_USESHOWWINDOW;
+    si.wShowWindow = SW_HIDE;
+    PROCESS_INFORMATION pi{};
+    bool ok = false;
+    if (!CreateProcessW(exe.c_str(), &cmd[0], nullptr, nullptr, FALSE, CREATE_NO_WINDOW, nullptr, nullptr, &si, &pi)) {
+        err = "could not start PowerShell (error " + std::to_string(GetLastError()) + ")";
+    } else {
+        if (WaitForSingleObject(pi.hProcess, 20000) != WAIT_OBJECT_0) {
+            TerminateProcess(pi.hProcess, 1);
+            err = "PowerShell did not finish in time";
+        } else {
+            DWORD code = 1;
+            GetExitCodeProcess(pi.hProcess, &code);
+            ok = code == 0;
+            if (!ok) err = "PowerShell Set-Clipboard failed (exit code " + std::to_string(code) + ")";
+        }
+        CloseHandle(pi.hProcess);
+        CloseHandle(pi.hThread);
+    }
+    DeleteFileW(listFile.c_str());
+    return ok;
+}
+
+bool SetFiles(const std::vector<std::filesystem::path>& filesIn)
 {
     SetNote("");
-    if (files.empty()) return false;
+    if (filesIn.empty()) return false;
+    std::vector<std::filesystem::path> files;        // backslashes only: Explorer rejects mixed separators
+    for (auto f : filesIn) { f = f.lexically_normal(); f.make_preferred(); files.push_back(std::move(f)); }
+    std::string psErr;
+    if (SetFilesPowerShell(files, psErr)) {
+        std::vector<std::filesystem::path> back;
+        const bool readable = GetFiles(back);
+        SetNote(readable && back.size() == files.size() ? std::string()
+                : "file list set through PowerShell, but read back " + std::to_string(back.size()) + " of " + std::to_string(files.size()) + " entries");
+        return true;
+    }
+    // PowerShell route failed: fall back to the plain clipboard formats below
     std::wstring list;                       // path\0path\0...\0\0
     for (const auto& f : files) {
         list += f.wstring();
@@ -288,6 +359,15 @@ bool SetFiles(const std::vector<std::filesystem::path>& files)
         if (!(ok && SetClipboardData(RegisterClipboardFormatW(L"Preferred DropEffect"), effect))) GlobalFree(effect);
     }
     CloseClipboard();
+    // read back what Windows now holds, so the log shows whether the list survived
+    if (ok) {
+        std::vector<std::filesystem::path> back;
+        const std::string note = LastNote();
+        const bool readable = GetFiles(back);
+        SetNote(readable ? std::string() : note);
+        if (!readable || back.size() != files.size())
+            SetNote("file list set, but read back " + std::to_string(back.size()) + " of " + std::to_string(files.size()) + " entries");
+    }
     return ok;
 }
 
@@ -435,6 +515,45 @@ bool GnomeStyleDesktop()
 std::string Backend() { return Pick().name; }
 bool FilesSupported() { return Pick().files; }
 
+namespace {
+
+// FNV-1a over everything the command prints (only the first 4 MiB are hashed, the length is mixed in).
+// Nothing is kept in memory, so a huge text on the clipboard costs time but not memory.
+std::uint64_t HashCommand(const std::string& cmd, std::uint64_t h)
+{
+    FILE* p = popen(cmd.c_str(), "r");
+    if (!p) return h;
+    char buf[8192];
+    std::size_t n, total = 0;
+    while ((n = std::fread(buf, 1, sizeof buf, p)) > 0) {
+        for (std::size_t i = 0; i < n && total + i < (4u << 20); ++i) { h ^= (unsigned char)buf[i]; h *= 1099511628211ull; }
+        total += n;
+    }
+    pclose(p);
+    h ^= (std::uint64_t)total;
+    h *= 1099511628211ull;
+    return h;
+}
+
+} // namespace
+
+std::uint64_t ChangeToken()
+{
+    const Tools& t = Pick();
+    if (t.name.empty()) return 0;
+    std::uint64_t h = 1469598103934665603ull;
+    std::string types;
+    bool files = false;
+    if (!t.list.empty() && RunRead(t.list, 64 * 1024, types)) {
+        for (unsigned char c : types) { h ^= c; h *= 1099511628211ull; }
+        const bool gnome = types.find("x-special/gnome-copied-files") != std::string::npos;
+        const bool uri = types.find("text/uri-list") != std::string::npos;
+        if (t.files && (gnome || uri)) { files = true; h = HashCommand(gnome ? t.readGnome : t.readUri, h); }
+    }
+    if (!files) h = HashCommand(t.get, h);
+    return h ? h : 1;
+}
+
 bool GetText(std::string& out, std::size_t maxBytes)
 {
     out.clear();
@@ -497,6 +616,7 @@ bool SetFiles(const std::vector<std::filesystem::path>& files)
 #else
 std::string Backend() { return {}; }
 bool FilesSupported() { return false; }
+std::uint64_t ChangeToken() { return 0; }
 bool GetText(std::string& out, std::size_t) { out.clear(); return false; }
 bool SetText(const std::string&) { return false; }
 bool GetFiles(std::vector<std::filesystem::path>& f) { f.clear(); SetNote("files are not supported on this platform"); return false; }

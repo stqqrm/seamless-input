@@ -14,11 +14,13 @@
 #include <wtsapi32.h>
 
 #include <algorithm>
+#include <atomic>
 #include <cstdio>
 #include <fstream>
 #include <thread>
 #include <vector>
 
+#include "ipc.hpp"
 #include "paths.hpp"
 #include "service.hpp"
 
@@ -32,8 +34,9 @@ constexpr wchar_t kStopEvent[] = L"Global\\SeamlessInputWorkerStop";
 constexpr DWORD   kCtlWake     = 128;      // user-defined control: "start the worker now"
 
 // Local users may query/start/stop the service and send kCtlWake (so the GUI needs no UAC prompt
-// for that); only administrators may change or delete it. The service just starts the worker
-// as the logged-in user, so this grants nobody anything they could not do already.
+// for that); only administrators may change or delete it. kCtlWake only makes the service (re)start
+// the one worker executable it was installed with. The worker runs as SYSTEM, so that executable MUST
+// sit in a folder ordinary users cannot write to (InstallService warns when it does not).
 constexpr wchar_t kServiceSddl[] =
     L"D:(A;;CCLCSWRPWPDTLOCRRC;;;SY)(A;;CCDCLCSWRPWPDTLOCRSDRCWDWO;;;BA)"
     L"(A;;CCLCSWRPWPLOCRRC;;;IU)(A;;CCLCSWLOCRRC;;;SU)";
@@ -104,6 +107,33 @@ bool RunElevated(const wchar_t* arg, std::string* err)
     return true;
 }
 
+// The service and its worker run as SYSTEM. If a normal user can replace the executable (for example it sits
+// in Downloads or on the Desktop), that user could run code as SYSTEM through it.
+bool UnderProgramFiles(const std::filesystem::path& exe)
+{
+    std::error_code ec;
+    const std::wstring e = std::filesystem::weakly_canonical(exe, ec).wstring();
+    for (const KNOWNFOLDERID* id : {&FOLDERID_ProgramFiles, &FOLDERID_ProgramFilesX86}) {
+        PWSTR pf = nullptr;
+        std::wstring rs;
+        if (SUCCEEDED(SHGetKnownFolderPath(*id, 0, nullptr, &pf)) && pf) rs = pf;
+        if (pf) CoTaskMemFree(pf);
+        if (!rs.empty() && e.size() > rs.size() && _wcsnicmp(e.c_str(), rs.c_str(), rs.size()) == 0) return true;
+    }
+    return false;
+}
+
+void WarnIfUserWritable(const std::filesystem::path& exe)
+{
+    if (UnderProgramFiles(exe)) return;
+    std::fprintf(stderr,
+        "WARNING: the service runs as SYSTEM, but %ls is not under Program Files. Any user who can write to its\n"
+        "folder could run code as SYSTEM through it. Put the program in a folder only administrators can write to.\n",
+        exe.c_str());
+}
+
+std::wstring ServiceBinPath() { return L"\"" + paths::DaemonExe().wstring() + L"\" --service"; }
+
 // ------------------------------------------------------------------ supervisor
 SERVICE_STATUS_HANDLE g_status = nullptr;
 HANDLE g_stop = nullptr;       // service is stopping
@@ -149,17 +179,45 @@ struct Worker {
     ULONGLONG started = 0;
 };
 
+// Why SYSTEM and not the user's own token: a hook and SendInput of a normal-integrity process are blocked by
+// UIPI whenever an elevated window (Task Manager, an admin console, ...) is under the pointer or has the focus,
+// and the UAC prompt lives on the secure desktop, which only SYSTEM may open. So the worker gets this service's
+// own (SYSTEM) token, moved into the user's session, together with the user's environment block (profile paths).
+HANDLE MakeSystemTokenForSession(DWORD sid)
+{
+    HANDLE self = nullptr;
+    if (!OpenProcessToken(GetCurrentProcess(), TOKEN_DUPLICATE | TOKEN_QUERY | TOKEN_ASSIGN_PRIMARY | TOKEN_ADJUST_DEFAULT | TOKEN_ADJUST_SESSIONID, &self))
+        return nullptr;
+    HANDLE prim = nullptr;
+    const BOOL dup = DuplicateTokenEx(self, MAXIMUM_ALLOWED, nullptr, SecurityImpersonation, TokenPrimary, &prim);
+    CloseHandle(self);
+    if (!dup) return nullptr;
+    if (!SetTokenInformation(prim, TokenSessionId, &sid, sizeof(sid))) {
+        SvcLog("SetTokenInformation(TokenSessionId) failed: " + ErrText(GetLastError()));
+        CloseHandle(prim);
+        return nullptr;
+    }
+    return prim;
+}
+
 bool LaunchWorker(DWORD sid, Worker& w)
 {
-    HANDLE tok = nullptr;
-    if (!WTSQueryUserToken(sid, &tok)) return false;       // nobody logged on yet
-    HANDLE prim = nullptr;
-    const BOOL dup = DuplicateTokenEx(tok, MAXIMUM_ALLOWED, nullptr, SecurityIdentification, TokenPrimary, &prim);
-    CloseHandle(tok);
-    if (!dup) return false;
+    HANDLE userTok = nullptr;
+    if (!WTSQueryUserToken(sid, &userTok)) return false;   // nobody logged on yet
 
     LPVOID env = nullptr;
-    if (!CreateEnvironmentBlock(&env, prim, FALSE)) env = nullptr;
+    if (!CreateEnvironmentBlock(&env, userTok, FALSE)) env = nullptr;
+
+    // 1st choice: SYSTEM in the user's session. Fallback: the user's own token (then elevated windows and UAC
+    // cannot be controlled, but everything else works).
+    HANDLE prim = MakeSystemTokenForSession(sid);
+    bool asSystem = prim != nullptr;
+    if (!prim) {
+        SvcLog("could not build a SYSTEM token for the worker - falling back to the user token");
+        if (!DuplicateTokenEx(userTok, MAXIMUM_ALLOWED, nullptr, SecurityIdentification, TokenPrimary, &prim)) prim = nullptr;
+    }
+    CloseHandle(userTok);
+    if (!prim) { if (env) DestroyEnvironmentBlock(env); return false; }
 
     const std::wstring exe = paths::DaemonExe().wstring();
     std::wstring cmd = L"\"" + exe + L"\" --run --worker";
@@ -169,17 +227,33 @@ bool LaunchWorker(DWORD sid, Worker& w)
     si.cb = sizeof(si);
     si.lpDesktop = desktop;
     PROCESS_INFORMATION pi{};
-    const BOOL ok = CreateProcessAsUserW(prim, exe.c_str(), cmd.data(), nullptr, nullptr, FALSE,
-                                         CREATE_UNICODE_ENVIRONMENT | CREATE_NO_WINDOW, env, dir.c_str(), &si, &pi);
-    const DWORD err = ok ? 0 : GetLastError();
-    if (env) DestroyEnvironmentBlock(env);
+    BOOL ok = CreateProcessAsUserW(prim, exe.c_str(), cmd.data(), nullptr, nullptr, FALSE,
+                                   CREATE_UNICODE_ENVIRONMENT | CREATE_NO_WINDOW, env, dir.c_str(), &si, &pi);
+    DWORD err = ok ? 0 : GetLastError();
     CloseHandle(prim);
+    if (!ok && asSystem) {
+        SvcLog("CreateProcessAsUser (SYSTEM) failed: " + ErrText(err) + " - falling back to the user token");
+        asSystem = false;
+        HANDLE ut = nullptr;
+        HANDLE up = nullptr;
+        if (WTSQueryUserToken(sid, &ut)) {
+            if (DuplicateTokenEx(ut, MAXIMUM_ALLOWED, nullptr, SecurityIdentification, TokenPrimary, &up)) {
+                ok = CreateProcessAsUserW(up, exe.c_str(), cmd.data(), nullptr, nullptr, FALSE,
+                                          CREATE_UNICODE_ENVIRONMENT | CREATE_NO_WINDOW, env, dir.c_str(), &si, &pi);
+                err = ok ? 0 : GetLastError();
+                CloseHandle(up);
+            }
+            CloseHandle(ut);
+        }
+    }
+    if (env) DestroyEnvironmentBlock(env);
     if (!ok) { SvcLog("CreateProcessAsUser failed: " + ErrText(err)); return false; }
     CloseHandle(pi.hThread);
     w.proc = pi.hProcess;
     w.session = sid;
     w.started = GetTickCount64();
-    SvcLog("worker started in session " + std::to_string(sid) + " (pid " + std::to_string(pi.dwProcessId) + ")");
+    SvcLog("worker started in session " + std::to_string(sid) + " (pid " + std::to_string(pi.dwProcessId) + ", " +
+           (asSystem ? "SYSTEM: elevated windows and UAC can be controlled" : "user rights: elevated windows and UAC cannot be controlled") + ")");
     return true;
 }
 
@@ -287,6 +361,7 @@ AutostartInfo QueryAutostart()
     if (!scm) return i;
     ScHandle sv(OpenServiceW(scm.h, kName, SERVICE_QUERY_STATUS | SERVICE_QUERY_CONFIG));
     if (!sv) return i;
+    i.installed = true;
 
     SERVICE_STATUS_PROCESS ssp{};
     DWORD need = 0;
@@ -296,12 +371,87 @@ AutostartInfo QueryAutostart()
     QueryServiceConfigW(sv.h, nullptr, 0, &need);
     std::vector<BYTE> buf(need ? need : 1);
     auto* cfg = reinterpret_cast<QUERY_SERVICE_CONFIGW*>(buf.data());
-    if (QueryServiceConfigW(sv.h, cfg, (DWORD)buf.size(), &need)) i.enabled = cfg->dwStartType == SERVICE_AUTO_START;
+    if (QueryServiceConfigW(sv.h, cfg, (DWORD)buf.size(), &need)) {
+        i.enabled = cfg->dwStartType == SERVICE_AUTO_START;
+        i.current = cfg->lpBinaryPathName && _wcsicmp(cfg->lpBinaryPathName, ServiceBinPath().c_str()) == 0;
+    }
     return i;
 }
 
-bool EnableAutostart(std::string* err) { return RunElevated(L"--install-service", err); }
-bool DisableAutostart(std::string* err) { return RunElevated(L"--uninstall-service", err); }
+// The service stays installed either way: "autostart" only switches it between automatic and manual start.
+bool EnableAutostart(std::string* err) { return RunElevated(L"--install-service --auto", err); }
+bool DisableAutostart(std::string* err) { return RunElevated(L"--install-service --manual", err); }
+
+bool InstallLocationUnsafe() { return !UnderProgramFiles(paths::DaemonExe()); }
+
+namespace {
+// A daemon started by a window without the service (an older version, or the fallback) holds the port, so the
+// service's worker could never start: ask it to quit, then force.
+void ClearStrayDaemons(const std::filesystem::path& dataDir)
+{
+    if (!ipc::Ping(dataDir, 500)) return;
+    ipc::RequestStop(dataDir);
+    WaitGone(dataDir, 1500);
+    KillDaemons();
+    WaitGone(dataDir, 2000);
+}
+std::atomic<bool> g_installTried{false};
+} // namespace
+
+namespace {
+std::filesystem::path DeclinedMarker(const std::filesystem::path& dataDir) { return dataDir / "service-uninstalled"; }
+bool Declined(const std::filesystem::path& dataDir)
+{
+    std::error_code ec;
+    return std::filesystem::exists(DeclinedMarker(dataDir), ec);
+}
+} // namespace
+
+bool PrepareManaged(const std::filesystem::path& dataDir, std::string* err)
+{
+    AutostartInfo a = QueryAutostart();
+    if (!a.installed && Declined(dataDir)) return false;            // the user removed it on purpose: do not nag
+    if (!a.installed || !a.current) {
+        if (g_installTried.exchange(true)) return a.installed;      // declined or failed once: do not nag again
+        ClearStrayDaemons(dataDir);
+        if (!RunElevated(L"--install-service --keep", err)) return false;
+        return true;
+    }
+    if (!a.managerRunning && ipc::Ping(dataDir, 500)) ClearStrayDaemons(dataDir);
+    return true;
+}
+
+bool InstallServiceNow(const std::filesystem::path& dataDir, std::string* err)
+{
+    std::error_code ec;
+    std::filesystem::remove(DeclinedMarker(dataDir), ec);
+    ClearStrayDaemons(dataDir);                                     // a user-level daemon would hold the port
+    return RunElevated(L"--install-service --keep", err);
+}
+
+bool UninstallServiceNow(const std::filesystem::path& dataDir, std::string* err)
+{
+    if (!RunElevated(L"--uninstall-service", err)) return false;
+    std::error_code ec;
+    std::filesystem::create_directories(dataDir, ec);
+    std::ofstream(DeclinedMarker(dataDir)) << "the service was removed from the Service menu\n";
+    return true;
+}
+
+bool StopManaged(const std::filesystem::path&, std::string* err)
+{
+    ScHandle scm(OpenSCManagerW(nullptr, nullptr, SC_MANAGER_CONNECT));
+    ScHandle sv(scm ? OpenServiceW(scm.h, kName, SERVICE_STOP | SERVICE_QUERY_STATUS) : nullptr);
+    if (!sv) { if (err) *err = "the service is not installed or not accessible"; return false; }
+    if (!StopServiceAndWait(sv.h, 15000)) { if (err) *err = "the service did not stop in time"; return false; }
+    return true;
+}
+
+bool ReplaceService(std::string* err)
+{
+    ClearStrayDaemons(paths::DataDir());
+    return RunElevated(L"--install-service --keep --restart", err);
+}
 
 bool StartManaged(std::string* err)
 {
@@ -364,21 +514,34 @@ int RunServiceHost()
     return 0;
 }
 
-int InstallService()
+int InstallService(int mode, bool restart)
 {
     ScHandle scm(OpenSCManagerW(nullptr, nullptr, SC_MANAGER_CONNECT | SC_MANAGER_CREATE_SERVICE));
     if (!scm) { std::fprintf(stderr, "Cannot open the service manager (run as administrator): %lu\n", GetLastError()); return 1; }
 
-    const std::wstring bin = L"\"" + paths::DaemonExe().wstring() + L"\" --service";
+    const std::wstring bin = ServiceBinPath();
+    WarnIfUserWritable(paths::DaemonExe());
+    DWORD startType = mode == 1 ? SERVICE_AUTO_START : SERVICE_DEMAND_START;     // a new service starts manually
     ScHandle sv(OpenServiceW(scm.h, kName, SERVICE_ALL_ACCESS));
     if (sv) {
-        if (!ChangeServiceConfigW(sv.h, SERVICE_WIN32_OWN_PROCESS, SERVICE_AUTO_START, SERVICE_ERROR_NORMAL, bin.c_str(),
+        DWORD need = 0;
+        QueryServiceConfigW(sv.h, nullptr, 0, &need);
+        std::vector<BYTE> buf(need ? need : 1);
+        auto* cfg = reinterpret_cast<QUERY_SERVICE_CONFIGW*>(buf.data());
+        bool samePath = false;
+        if (QueryServiceConfigW(sv.h, cfg, (DWORD)buf.size(), &need)) {
+            samePath = cfg->lpBinaryPathName && _wcsicmp(cfg->lpBinaryPathName, bin.c_str()) == 0;
+            if (mode == 0) startType = cfg->dwStartType;                        // keep what is configured
+        }
+        // another exe (or an explicit restart): the running service still executes the old file - stop it first
+        if (!samePath || restart) StopServiceAndWait(sv.h, 15000);
+        if (!ChangeServiceConfigW(sv.h, SERVICE_WIN32_OWN_PROCESS, startType, SERVICE_ERROR_NORMAL, bin.c_str(),
                                   nullptr, nullptr, nullptr, nullptr, nullptr, kDisplay)) {
             std::fprintf(stderr, "ChangeServiceConfig failed: %lu\n", GetLastError());
             return 1;
         }
     } else {
-        sv.h = CreateServiceW(scm.h, kName, kDisplay, SERVICE_ALL_ACCESS, SERVICE_WIN32_OWN_PROCESS, SERVICE_AUTO_START,
+        sv.h = CreateServiceW(scm.h, kName, kDisplay, SERVICE_ALL_ACCESS, SERVICE_WIN32_OWN_PROCESS, startType,
                               SERVICE_ERROR_NORMAL, bin.c_str(), nullptr, nullptr, nullptr, nullptr, nullptr);
         if (!sv) { std::fprintf(stderr, "CreateService failed: %lu\n", GetLastError()); return 1; }
     }
@@ -404,7 +567,8 @@ int InstallService()
         std::fprintf(stderr, "Installed, but could not start: %lu\n", GetLastError());
         return 1;
     }
-    std::printf("Service \"%ls\" installed (starts automatically) and started.\n", kName);
+    std::printf("Service \"%ls\" installed (%s start) and running.\n", kName,
+                startType == SERVICE_AUTO_START ? "automatic" : "manual");
     return 0;
 }
 

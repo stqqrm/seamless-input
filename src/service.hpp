@@ -18,6 +18,9 @@ struct AutostartInfo {
     bool supported = false;       // can autostart be configured on this system?
     bool enabled = false;         // will the daemon start on its own at login / boot?
     bool managerRunning = false;  // the service / unit itself reports "running"
+    bool installed = false;       // Windows: the service exists (always the case once a window has run; autostart only
+                                  // switches it between automatic and manual start)
+    bool current = true;          // Windows: the installed service points at THIS build's daemon exe
     std::string kind;             // "systemd user service" | "XDG autostart entry" | "Windows service"
 };
 
@@ -29,6 +32,9 @@ bool DisableAutostart(std::string* err);    // Windows: same
 bool StartManaged(std::string* err);
 // Starts the daemon directly, detached from the caller (it survives the caller).
 bool SpawnDetached(std::string* err);
+// Stops the daemon and keeps it stopped until the next start: Windows stops the service (no UAC prompt),
+// Linux stops the systemd unit, or asks the daemon to quit / kills it when there is no unit.
+bool StopManaged(const std::filesystem::path& dataDir, std::string* err);
 
 // Makes sure a daemon answers on the IPC port: managed start when autostart is on, else a direct
 // spawn. Blocks up to waitMs. Safe to call when one already runs.
@@ -44,8 +50,24 @@ bool WaitGone(const std::filesystem::path& dataDir, int waitMs);
 void WatchWorkerStop(std::function<void()> onStop);
 
 #if defined(_WIN32)
+// Windows: the service is ALWAYS installed (it is what gives the worker the rights to control elevated windows
+// and the UAC prompt). Installs it when missing or when it points at another exe (one UAC prompt), and clears a
+// stray user-level daemon that would keep the service's worker from binding the port. Asks at most once per run.
+bool PrepareManaged(const std::filesystem::path& dataDir, std::string* err);
+// Windows: re-points the service at this build's daemon exe and restarts it (one UAC prompt): the answer to
+// "versions do not match".
+bool ReplaceService(std::string* err);
+// Windows: install / remove the service on request (Service menu, one UAC prompt each). Uninstalling leaves a
+// marker so the window does not install the service again by itself; installing removes it.
+bool InstallServiceNow(const std::filesystem::path& dataDir, std::string* err);
+bool UninstallServiceNow(const std::filesystem::path& dataDir, std::string* err);
+// Windows: true when the daemon exe sits where ordinary users can write (the service runs it as SYSTEM).
+bool InstallLocationUnsafe();
+
+// mode: 0 = keep the current start type (manual for a new service), 1 = automatic, 2 = manual.
+// restart: stop the service first and start it again with the new settings.
+int InstallService(int mode, bool restart);   // --install-service [--auto|--manual|--keep] [--restart]  (administrator)
 int RunServiceHost();        // --service  (called by the service control manager)
-int InstallService();        // --install-service    (needs administrator rights)
 int UninstallService();      // --uninstall-service  (needs administrator rights)
 #endif
 

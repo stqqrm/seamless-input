@@ -47,6 +47,7 @@
 #include "paths.hpp"
 #include "service.hpp"
 #include "state.hpp"
+#include "version.hpp"
 
 // ============================================================================
 // Canvas: every PC is a group of monitor rectangles drawn at real pixel
@@ -168,6 +169,18 @@ public:
         g.ox = ox;
         g.oy = oy;
         peers_.push_back(g);
+        Refresh();
+    }
+    // The peer's monitors changed (plugged, unplugged, rotated): same place, new shape.
+    void SetPeerMons(int id, const std::vector<wxRect>& mons)
+    {
+        Group* g = Find(id);
+        if (!g) return;
+        Group n = MakeGroup(id, g->name, g->addr, mons);
+        if (n.size == g->size && n.mons == g->mons) return;
+        n.ox = g->ox;
+        n.oy = g->oy;
+        *g = std::move(n);
         Refresh();
     }
     bool HasPeer(int id) const { for (const auto& g : peers_) if (g.id == id) return true; return false; }
@@ -392,6 +405,7 @@ private:
         wxColour fill = local ? wxColour(48, 108, 226) : wxColour(66, 54, 38);
         wxColour edge = local ? wxColour(132, 180, 255) : wxColour(255, 176, 72);
         wxColour text = local ? wxColour(246, 249, 255) : wxColour(255, 218, 160);
+        wxColour labelCol = text;          // the name above the monitors sits on the canvas, not on the monitor fill
         if (th_) {
             // this PC: solid accent; other PCs: a pale tint of the warning colour, dashed outline
             auto mix = [](const wxColour& a, const wxColour& b, int pct) {
@@ -410,6 +424,7 @@ private:
                 edge = th_->warn;
                 text = th_->dark ? mix(th_->warn, white, 35) : mix(th_->warn, black, 45);
             }
+            labelCol = local ? th_->text : text;
         }
 
         int minX = INT_MAX, minY = INT_MAX;
@@ -426,7 +441,7 @@ private:
 
         wxString label = g.name;
         if (!g.addr.empty()) label += "   " + g.addr;
-        dc.SetTextForeground(text);
+        dc.SetTextForeground(labelCol);
         wxFont f = dc.GetFont();
         f.SetWeight(wxFONTWEIGHT_BOLD);
         dc.SetFont(f);
@@ -1222,7 +1237,7 @@ private:
 };
 
 // Speaker icon that toggles between "sound on" and "muted" (drawn, no bitmaps needed).
-// Small on/off switch (green when on).
+// Small on/off switch (theme accent colour when on).
 class ToggleSwitch : public wxControl {
 public:
     std::function<void(bool on)> onToggle;
@@ -1257,13 +1272,17 @@ private:
         if (!gc) return;
         const wxSize s = GetClientSize();
         const double h = s.y - 4;
-        wxColour track = on_ ? t_.ok : t_.track;
-        if (hover_ && !on_) track = t_.border;
-        gc->SetPen(*wxTRANSPARENT_PEN);
+        wxColour track = on_ ? t_.accent : t_.track;
+        if (!on_ && !t_.dark) track = MixColour(t_.track, t_.sub, hover_ ? 70 : 55);   // light themes: the pale track vanishes on a white card
+        else if (!on_ && hover_) track = t_.border;
+        if (on_) gc->SetPen(*wxTRANSPARENT_PEN);
+        else     gc->SetPen(wxPen(MixColour(t_.track, t_.sub, t_.dark ? 40 : 80), 1));   // thin outline so the off switch is always visible
         gc->SetBrush(wxBrush(track));
-        gc->DrawRoundedRectangle(0, 2, s.x, h, h / 2);
+        gc->DrawRoundedRectangle(0.5, 2.5, s.x - 1, h - 1, (h - 1) / 2);
         const double d = h - 6;
-        gc->SetBrush(wxBrush(wxColour(255, 255, 255)));
+        // knob: white, unless the accent is so light that white would vanish on it
+        const int lum = (t_.accent.Red() * 299 + t_.accent.Green() * 587 + t_.accent.Blue() * 114) / 1000;
+        gc->SetBrush(wxBrush(on_ && lum > 190 ? wxColour(30, 32, 38) : wxColour(255, 255, 255)));
         gc->DrawEllipse(on_ ? s.x - 3 - d : 3, 2 + 3, d, d);
     }
 
@@ -2191,7 +2210,7 @@ public:
           host_(wxString::FromUTF8(paths::HostName())),
           alive_(std::make_shared<bool>(true))
     {
-        SetTitle("seamless-input - " + host_);
+        UpdateTitle();
         local_ = GetLocalAddresses();
         localMons_ = GetLocalMonitors();      // until the daemon reports the monitors it uses itself
         dataDir_ = paths::DataDir();
@@ -2273,6 +2292,12 @@ public:
         clipLimitCtl_->Bind(wxEVT_TEXT_ENTER, [this](wxCommandEvent&) { ApplyClipLimit(); });
         clipUnit_->onChange = [this](int) { ApplyClipLimit(); };
         ShowClipLimit(clipLimit_);
+        clipTelCtl_->onToggle = [this](bool on) {
+            clipTelEdited_ = std::chrono::steady_clock::now();      // do not let an old snapshot flip it back
+            clipTelOn_ = on;
+            UpdateTelemetryLabel();
+            client_->Send(std::string("CLIPTELEMETRY ") + (on ? "1" : "0"));
+        };
 
         masterMute_->onToggle = [this](bool) { SendMaster(); };
         volSlider_->Bind(wxEVT_SLIDER, [this](wxCommandEvent&) {
@@ -2319,7 +2344,7 @@ public:
 private:
     static constexpr int kTimerId     = 9000;
     static constexpr int kAnimTimerId = 9001;
-    enum { kIdAutostart = 9100, kIdSvcInfo, kIdToggleSvc, kIdQuitAll, kIdOpenFileMenu, kIdOpenSettingsMenu,
+    enum { kIdAutostart = 9100, kIdSvcInfo, kIdOpenSettingsMenu, kIdSvcInstall, kIdSvcRun,
            kIdClearCache, kIdRegenKeys, kIdViewKeys,
            kIdThemeSystem = 9400, kIdThemeReload, kIdThemeFolder, kIdThemeBase = 9500 };   // kIdThemeBase + n: the n-th theme
 
@@ -2368,6 +2393,19 @@ private:
         }).detach();
     }
 
+    // Window title: this window's version, and a warning when the background service is a different one.
+    void UpdateTitle()
+    {
+        wxString t = "seamless-input " + wxString::FromUTF8(appver::Full()) + " - " + host_;
+        if (connected_ && daemonWanted_) {
+            if (snap_.version.empty())
+                t += "  |  background service is an OLDER version - restart this window to update it";
+            else if (snap_.version != appver::Full())
+                t += "  |  background service: " + wxString::FromUTF8(snap_.version) + " - restart this window to update it";
+        }
+        SetTitle(t);
+    }
+
     void FinishConnect(bool ok, const std::string& err)
     {
         connecting_ = false;
@@ -2376,28 +2414,46 @@ private:
             lastConnErr_ = err;
             UpdateHeader();
             // A few failures in a row: whatever sits on the daemon's port is old or stuck - offer to restart it.
-            if (daemonWanted_ && ++connFails_ >= 3 && !restartAsked_) AskRestartDaemon();
+            if (daemonWanted_ && ++connFails_ >= 3 && !restartAsked_) AskRestartDaemon(std::string());
             return;
         }
         connFails_ = 0;
         restartAsked_ = false;
         lastConnErr_.clear();
+#if defined(_WIN32)
+        if (!unsafeWarned_ && svc::InstallLocationUnsafe()) {
+            unsafeWarned_ = true;
+            Log("WARNING: the background service runs as SYSTEM, but this program is not in a folder that only administrators "
+                "can write to (for example C:\\Program Files\\seamless-input). Any program running as you could replace it and "
+                "gain SYSTEM rights. Move the program there and start the window again.");
+        }
+#endif
         log_->Clear();                                  // the daemon replays its log history on attach
         connected_ = true;
         client_->Send("ATTACH");
+        UpdateTitle();
+        SendPopupTheme();
         SendMonitorsHint();
         client_->Send("SCAN");
         UpdateHeader();
     }
 
-    void AskRestartDaemon()
+    // A background service that runs a different version than this window (an old one that is still
+    // running after an update, or one that no longer understands this window): offer to restart it.
+    // svcVersion: what the service reported; empty when it reports nothing (an older build).
+    void AskRestartDaemon(const std::string& svcVersion)
     {
         restartAsked_ = true;                       // ask once; asks again only after a restart attempt failed
+        mismatchAsked_ = true;
         busy_ = true;                               // pauses the automatic retries while the question is open
+        const wxString theirs = svcVersion.empty() ? wxString("an older version (it does not report one)")
+                                                   : wxString::FromUTF8(svcVersion);
         const int r = wxMessageBox(
-            "The background service does not respond.\n\n"
-            "It may be an older version that is still running, or a stuck process. Restart it?",
-            "Background service", wxYES_NO | wxYES_DEFAULT | wxICON_QUESTION, this);
+            "Versions do not match.\n\n"
+            "This window:  " + wxString::FromUTF8(appver::Full()) + "\n"
+            "Background service:  " + theirs + "\n\n"
+            "Restart the background service so both run the same version?",
+            "Version mismatch", wxYES_NO | wxYES_DEFAULT | wxICON_QUESTION, this);
         if (r != wxYES) { busy_ = false; return; }
 
         Log("Restarting the background service ...");
@@ -2405,11 +2461,16 @@ private:
         const auto dir = dataDir_;
         std::thread([this, alive, dir] {
             std::string err;
+#if defined(_WIN32)
+            // The service is the one daemon there is: replace it (point it at THIS build's exe and restart it).
+            const bool ok = svc::ReplaceService(&err) && svc::EnsureDaemon(dir, &err);
+#else
             ipc::RequestStop(dir);                  // politely first: works when it still answers
             svc::WaitGone(dir, 1500);
             svc::KillDaemons();                     // then force: an old or hung daemon never answers
             svc::WaitGone(dir, 2000);
             const bool ok = svc::EnsureDaemon(dir, &err);
+#endif
             wxTheApp->CallAfter([this, alive, ok, err] { if (*alive) RestartDaemonDone(ok, err); });
         }).detach();
     }
@@ -2418,6 +2479,7 @@ private:
     {
         busy_ = false;
         connFails_ = 0;
+        mismatchAsked_ = false;                     // the new service is checked again with its first snapshot
         retry_ = 3;                                 // reconnect right away
         if (ok) { Log("Background service restarted"); return; }
         restartAsked_ = false;                      // may ask again after the next failures
@@ -2431,6 +2493,7 @@ private:
                           : "Background service stopped");
         retry_ = 0;
         ShowOffline();
+        UpdateTitle();
         UpdateHeader();
     }
 
@@ -2446,17 +2509,39 @@ private:
         off.inputMode = 0;
         off.inputPeer = -1;
         off.sysCapturing = off.micCapturing = false;
+        off.version.clear();
         stats_ = state::Stats{};
         ApplySnapshot(off);
         UpdateAudioStats();
     }
 
+    // What this window sees of the monitors. The daemon asks the OS itself (Windows, X11) and only uses this
+    // where it cannot (Wayland); it is re-sent whenever it changes, so a monitor that is plugged in or
+    // rotated while the program runs shows up in the layout.
+    // The clipboard progress popup is drawn by the background service: give it this window's palette.
+    void SendPopupTheme()
+    {
+        if (!connected_ || !client_) return;
+        const wxColour cols[] = {theme_.card, theme_.border, theme_.text, theme_.sub, theme_.track, theme_.accent, theme_.ok};
+        std::string l = "POPUPTHEME";
+        for (const wxColour& c : cols)
+            l += " " + std::to_string((int)c.Red()) + " " + std::to_string((int)c.Green()) + " " + std::to_string((int)c.Blue());
+        client_->Send(l);
+    }
+
     void SendMonitorsHint()
     {
-        std::string l = "MONITORS " + std::to_string(GetLocalMonitors().size());
-        for (const auto& m : GetLocalMonitors())
+        const auto mons = GetLocalMonitors();
+        lastHintMons_ = mons;
+        std::string l = "MONITORS " + std::to_string(mons.size());
+        for (const auto& m : mons)
             l += " " + std::to_string(m.x) + " " + std::to_string(m.y) + " " + std::to_string(m.width) + " " + std::to_string(m.height);
         client_->Send(l);
+    }
+
+    void UpdateTelemetryLabel()
+    {
+        if (clipTelLbl_) clipTelLbl_->SetLabelText(clipTelOn_ ? "On" : "Off");
     }
 
     void UpdateHeader()
@@ -2466,34 +2551,37 @@ private:
         wxString svcState = connected_ ? "connected"
                           : !daemonWanted_ ? "stopped"
                           : connecting_ ? "starting..." : "not connected";
-        hdrSub_->SetLabelText(wxString::Format(
+        wxString line = wxString::Format(
             "IP %s   |   Key %s   |   TCP %d   UDP %d (discovery)   UDP %d (audio)   |   Background service: %s",
             ips.empty() ? wxString("-") : ips,
             snap_.pubKey.empty() ? wxString("-") : wxString::FromUTF8(Identity::Fingerprint(snap_.pubKey)),
-            (int)kTcpPort, (int)kDiscoveryPort, (int)kAudioPort, svcState));
+            (int)kTcpPort, (int)kDiscoveryPort, (int)kAudioPort, svcState);
+        // Only a finished start-up that failed counts: while the daemon is still starting the backend is empty.
+        const bool inputBad = connected_ && (snap_.backend == "none" || !snap_.inputCanInject);
+        if (inputBad) line += "   |   This PC cannot be controlled (see the activity log)";
+        hdrSub_->SetLabelText(line);
+        hdrSub_->SetToolTip(inputBad && !snap_.inputNote.empty() ? wxString::FromUTF8(snap_.inputNote.c_str()) : wxString());
     }
 
     // ------------------------------------------------------------ service menu
     // The menus are drawn by MenuStrip (not a native wxMenuBar) so they look the same on every OS.
     void BuildMenu()
     {
-#if defined(__WXOSX__)
-        const wxString closeKey = "Cmd+W";
-#else
-        const wxString closeKey = "Ctrl+W";
-#endif
         auto item = [](int id, const wxString& label) { MenuItemDef d; d.id = id; d.label = label; return d; };
         auto sep = [] { MenuItemDef d; d.separator = true; return d; };
 
-        MenuItemDef close = item(wxID_CLOSE, "Close window");
-        close.accel = closeKey;
-        menuBar_->AddMenu("File", { close, item(kIdQuitAll, "Quit and stop the background service") });
-
-        MenuItemDef autostart = item(kIdAutostart, "Autostart");     // label and dot are set in RefreshServiceMenu
-        MenuItemDef startStop = item(kIdToggleSvc, "Background service");
+        // Labels, dots and hints are set in RefreshServiceMenu.
+        MenuItemDef autostart = item(kIdAutostart, "Autostart");
+        MenuItemDef run = item(kIdSvcRun, "Running");
         MenuItemDef info = item(kIdSvcInfo, "Background service: ...");
         info.enabled = false;
-        menuBar_->AddMenu("Service", { autostart, startStop, sep(), info });
+#if defined(__WXMSW__)
+        // Windows: a real Windows service that can be installed and removed.
+        menuBar_->AddMenu("Service", { item(kIdSvcInstall, "Installed"), autostart, run, sep(), info });
+#else
+        // Linux (and others): there is no service to install, only the daemon to enable and to run.
+        menuBar_->AddMenu("Daemon", { autostart, run, sep(), info });
+#endif
 
         menuBar_->AddMenu("Security", { item(kIdClearCache, "Clear cache"),
                                         item(kIdRegenKeys, "Regenerate keys"),
@@ -2516,9 +2604,9 @@ private:
         };
 
         Bind(wxEVT_MENU, [this](wxCommandEvent&) { Close(); }, wxID_CLOSE);
-        Bind(wxEVT_MENU, [this](wxCommandEvent&) { QuitAll(); }, kIdQuitAll);
         Bind(wxEVT_MENU, &MainFrame::OnAutostart, this, kIdAutostart);
-        Bind(wxEVT_MENU, [this](wxCommandEvent&) { ToggleService(); }, kIdToggleSvc);
+        Bind(wxEVT_MENU, &MainFrame::OnSvcInstall, this, kIdSvcInstall);
+        Bind(wxEVT_MENU, &MainFrame::OnSvcRun, this, kIdSvcRun);
         Bind(wxEVT_MENU, [this](wxCommandEvent&) { OnClearCache(); }, kIdClearCache);
         Bind(wxEVT_MENU, [this](wxCommandEvent&) { OnRegenKeys(); }, kIdRegenKeys);
         Bind(wxEVT_MENU, [this](wxCommandEvent&) { OnViewKeys(); }, kIdViewKeys);
@@ -2529,14 +2617,12 @@ private:
             const size_t i = (size_t)(e.GetId() - kIdThemeBase);
             if (i < themes_.size()) ApplyTheme(themes_[i].theme, true);
         }, kIdThemeBase, kIdThemeBase + 299);
-        Bind(wxEVT_MENU, [this](wxCommandEvent&) { menuBar_->OpenMenu(0); }, kIdOpenFileMenu);
-        Bind(wxEVT_MENU, [this](wxCommandEvent&) { menuBar_->OpenMenu(1); }, kIdOpenSettingsMenu);
+        Bind(wxEVT_MENU, [this](wxCommandEvent&) { menuBar_->OpenMenu(0); }, kIdOpenSettingsMenu);   // the Service (Daemon) menu
 
         // keyboard shortcuts (a native menu bar used to provide these)
         std::vector<wxAcceleratorEntry> keys;
         keys.emplace_back(wxACCEL_CTRL, (int)'W', wxID_CLOSE);
 #if !defined(__WXOSX__)
-        keys.emplace_back(wxACCEL_ALT, (int)'F', kIdOpenFileMenu);
         keys.emplace_back(wxACCEL_ALT, (int)'S', kIdOpenSettingsMenu);
 #endif
         SetAcceleratorTable(wxAcceleratorTable((int)keys.size(), keys.data()));
@@ -2628,8 +2714,28 @@ private:
         theme_ = nt;                                     // widgets hold a reference to this: custom-drawn ones follow at once
         themeName_ = nt.name;
         ReThemeTree(this, old, nt);
-        for (auto& kv : cliRows_) kv.second.card->SetFill(ClientTint());     // derived from the palette: recompute
+        {
+            // The client cards use a tint DERIVED from the palette, so ReThemeTree cannot remap it:
+            // repaint the card and every label on it with the new tint.
+            const wxColour tint = ClientTint();
+            for (auto& kv : cliRows_) {
+                kv.second.card->SetFill(tint);
+                ApplyBackground(kv.second.card, tint);
+                kv.second.card->Refresh();
+            }
+        }
+        if (log_) {
+            // Text already in the activity log carries the colours it was appended with: rebuild it.
+            const wxString txt = log_->GetValue();
+            log_->Clear();
+            log_->SetBackgroundColour(nt.page);
+            log_->SetForegroundColour(nt.text);
+            log_->SetDefaultStyle(wxTextAttr(nt.text, nt.page));
+            log_->AppendText(txt);
+            log_->ShowPosition(log_->GetLastPosition());
+        }
         if (canvas_) canvas_->Refresh();
+        SendPopupTheme();                                // the service's progress popup follows the theme too
         SetTitleBarDark(this, nt.dark);
         NativeLookTree(this, nt.dark);
         Thaw();
@@ -2638,38 +2744,59 @@ private:
         if (save) SaveThemeChoice(nt.name);
     }
 
-    // Service menu. Left: a dot with the name of the setting = its CURRENT state (green on / red off).
-    // Right (dim): what a click does. The items are never greyed out: the open list is a snapshot and
-    // cannot change by itself, so a greyed item would stay greyed until the menu is opened again.
-    // While a change is being applied the hint says "Working..." and clicks are ignored.
-    //   Autostart : the daemon starts by itself at boot / login.
-    //   Service   : the daemon is running right now.
+    // Service menu (Windows) / Daemon menu (Linux). Left: a dot with the name of the setting = its CURRENT
+    // state (green on / red off). Right (dim): what a click does. While a change is being applied the hint
+    // says "Working..." and clicks are ignored.
+    //   Windows:  Installed  (Install / Uninstall)   the Windows service exists. Always available.
+    //             Autostart  (Enable / Disable)      Windows starts it at boot.      Greyed out: not installed.
+    //             Running    (Stop / Start)          the service is running now.     Greyed out: not installed.
+    //   Linux:    Autostart  (Enable / Disable)      the daemon starts at login.
+    //             Running    (Stop / Start)          the daemon is running now.
+    //             Never greyed out. (The open list is a snapshot: it is refreshed every time the menu opens,
+    //             and every click closes it, so a greyed item cannot go stale.)
     void RefreshServiceMenu()
     {
         if (!menuBar_) return;
         const svc::AutostartInfo a = svc::QueryAutostart();
         autostartOn_ = a.enabled;
+        const bool running = connected_ && daemonWanted_;
+        const wxString work = "Working...";
 #if defined(__WXMSW__)
-        const wxString autoName = "Autostart with Windows";
+        const bool usable = a.installed;            // Autostart and Stop/Start need the service to exist
+        const wxString what = "Service";
+        if (MenuItemDef* m = menuBar_->Item(kIdSvcInstall)) {
+            m->dot = a.installed ? 1 : 2;
+            m->label = a.installed ? "Service installed" : "Service not installed";
+            m->accel = busy_ ? work : wxString(a.installed ? "Uninstall" : "Install");
+            m->enabled = true;
+        }
+        if (MenuItemDef* m = menuBar_->Item(kIdAutostart)) {
+            m->dot = usable ? (a.enabled ? 1 : 2) : 0;
+            m->label = "Start service with Windows";
+            m->accel = !usable ? wxString() : busy_ ? work : wxString(a.enabled ? "Disable" : "Enable");
+            m->enabled = usable;
+        }
 #else
-        const wxString autoName = "Autostart at login";
-#endif
+        const bool usable = true;
+        const wxString what = "Daemon";
         if (MenuItemDef* m = menuBar_->Item(kIdAutostart)) {
             m->dot = a.supported ? (a.enabled ? 1 : 2) : 0;
-            m->label = a.supported ? autoName : autoName + " (not supported here)";
-            m->accel = !a.supported ? wxString() : busy_ ? wxString("Working...") : wxString(a.enabled ? "Disable" : "Enable");
-            m->enabled = a.supported;
+            m->label = a.supported ? wxString("Autostart at login") : wxString("Autostart at login (not supported here)");
+            m->accel = !a.supported ? wxString() : busy_ ? work : wxString(a.enabled ? "Disable" : "Enable");
+            m->enabled = true;                      // Linux: never greyed out
         }
-        const bool running = connected_ && daemonWanted_;
-        if (MenuItemDef* m = menuBar_->Item(kIdToggleSvc)) {
-            m->dot = running ? 1 : 2;
-            m->label = "Background service";
-            m->accel = busy_ ? wxString("Working...") : running ? wxString("Stop") : wxString("Start");
-            m->enabled = true;
+#endif
+        if (MenuItemDef* m = menuBar_->Item(kIdSvcRun)) {
+            m->dot = usable ? (running ? 1 : 2) : 0;
+            m->label = what + (running ? " running" : " stopped");
+            m->accel = !usable ? wxString() : busy_ ? work : wxString(running ? "Stop" : "Start");
+            m->enabled = usable;
         }
         if (MenuItemDef* m = menuBar_->Item(kIdSvcInfo)) {
             const wxString st = running ? "running" : (daemonWanted_ && !connected_) ? "not reachable" : "stopped";
-            m->label = "Background service: " + st + (a.kind.empty() ? wxString() : "  (" + wxString::FromUTF8(a.kind) + ")");
+            wxString ver;
+            if (running) ver = snap_.version.empty() ? wxString(", older version") : ", " + wxString::FromUTF8(snap_.version);
+            m->label = "Background service: " + st + ver + (a.kind.empty() ? wxString() : "  (" + wxString::FromUTF8(a.kind) + ")");
         }
     }
 
@@ -2679,18 +2806,22 @@ private:
         busy_ = true;
         (void)e;
         const bool on = !autostartOn_;                  // the item is an action, not a check box
-        daemonWanted_ = true;
         Log(on ? "Enabling autostart of the background service..." : "Disabling autostart of the background service...");
         auto alive = alive_;
         const auto dir = dataDir_;
         std::thread([this, alive, dir, on] {
             std::string err, err2;
             bool ok = on ? svc::EnableAutostart(&err) : svc::DisableAutostart(&err);
-            if (ok) {
-                // hand the daemon over to its new owner, or keep one running for this window
-                if (ipc::Ping(dir)) { ipc::RequestStop(dir); svc::WaitGone(dir, 5000); }
+#if !defined(_WIN32)
+            if (ok && ipc::Ping(dir)) {
+                // a running daemon is handed over to its new owner (a stopped one stays stopped)
+                ipc::RequestStop(dir);
+                svc::WaitGone(dir, 5000);
                 svc::EnsureDaemon(dir, &err2);
             }
+#else
+            (void)dir;      // Windows: the service keeps running, only its start type changed
+#endif
             wxTheApp->CallAfter([this, alive, ok, on, err] { if (*alive) AutostartDone(ok, on, err); });
         }).detach();
     }
@@ -2702,6 +2833,61 @@ private:
                        : "Autostart is off");
         else    wxMessageBox(wxString::FromUTF8(err), "Autostart", wxOK | wxICON_WARNING, this);
         retry_ = 3;     // reconnect right away
+    }
+
+    // Install / Uninstall (Windows only: Linux has no service to install). One UAC prompt each.
+    void OnSvcInstall(wxCommandEvent&)
+    {
+#if defined(_WIN32)
+        if (busy_) { Log("Still applying the last change, please wait..."); return; }
+        const bool install = !svc::QueryAutostart().installed;
+        busy_ = true;
+        daemonWanted_ = true;
+        Log(install ? "Installing the Windows service..." : "Uninstalling the Windows service...");
+        auto alive = alive_;
+        const auto dir = dataDir_;
+        std::thread([this, alive, dir, install] {
+            std::string err;
+            const bool ok = install ? svc::InstallServiceNow(dir, &err) : svc::UninstallServiceNow(dir, &err);
+            wxTheApp->CallAfter([this, alive, ok, install, err] {
+                if (!*alive) return;
+                busy_ = false;
+                if (ok) Log(install ? "Service installed: it can control elevated windows and the UAC prompt"
+                                    : "Service uninstalled: the daemon now runs without administrator rights");
+                else    wxMessageBox(wxString::FromUTF8(err), "Service", wxOK | wxICON_WARNING, this);
+                connFails_ = 0;
+                retry_ = 3;                         // reconnect right away
+            });
+        }).detach();
+#endif
+    }
+
+    // Stop / Start the daemon. Stopping keeps it stopped (the window does not bring it back) until Start.
+    void OnSvcRun(wxCommandEvent&)
+    {
+        if (busy_) { Log("Still applying the last change, please wait..."); return; }
+        const bool start = !(connected_ && daemonWanted_);
+        busy_ = true;
+        daemonWanted_ = start;                      // before stopping: the lost connection must not be "repaired"
+        Log(start ? "Starting the background service..." : "Stopping the background service...");
+        auto alive = alive_;
+        const auto dir = dataDir_;
+        std::thread([this, alive, dir, start] {
+            std::string err;
+            const bool ok = start ? svc::EnsureDaemon(dir, &err) : svc::StopManaged(dir, &err);
+            wxTheApp->CallAfter([this, alive, ok, start, err] {
+                if (!*alive) return;
+                busy_ = false;
+                if (!ok) {
+                    daemonWanted_ = !start;         // it did not change: go back to what it was
+                    wxMessageBox(wxString::FromUTF8(err), start ? "Start" : "Stop", wxOK | wxICON_WARNING, this);
+                } else {
+                    Log(start ? "Background service started" : "Background service stopped");
+                }
+                connFails_ = 0;
+                retry_ = 3;                         // reconnect right away (only when it is wanted)
+            });
+        }).detach();
     }
 
     // ------------------------------------------------------------ security menu
@@ -2749,29 +2935,6 @@ private:
 #endif
         if (!wxLaunchDefaultApplication(dir))
             wxMessageBox("Could not open the folder:\n" + dir, "View keys", wxOK | wxICON_WARNING, this);
-    }
-
-    void ToggleService()
-    {
-        if (busy_) { Log("Still applying the last autostart change, please wait..."); return; }
-        if (connected_ && daemonWanted_) {
-            daemonWanted_ = false;
-            ipc::RequestStop(dataDir_);
-            ShowOffline();
-            Log("Stopping the background service (it starts again with the next window, or at login if autostart is on)");
-        } else {
-            daemonWanted_ = true;
-            retry_ = 3;
-            Log("Starting the background service...");
-        }
-        UpdateHeader();
-    }
-
-    void QuitAll()
-    {
-        daemonWanted_ = false;
-        ipc::RequestStop(dataDir_);
-        Close();
     }
 
     // ---------------------------------------------------------------- pages
@@ -2867,6 +3030,7 @@ private:
         auto* root = new wxBoxSizer(wxHORIZONTAL);
         wxStaticText* groupDesc = nullptr;
         wxStaticText* clipDesc = nullptr;
+        wxStaticText* telDesc = nullptr;
 
         // --- group
         auto* groupCard = new CardPanel(p, theme_, false);
@@ -2918,7 +3082,28 @@ private:
         }
         
 
-        // The two cards sit side by side with equal width. Their description texts wrap to the card
+        // --- clipboard telemetry
+        auto* telCard = new CardPanel(p, theme_, false);
+        {
+            auto* tv = new wxBoxSizer(wxVERTICAL);
+            tv->Add(MakeHeader(telCard, "Clipboard telemetry"), 0, wxBOTTOM, 2);
+            telDesc = MakeLabel(telCard, "While this PC uploads or downloads the clipboard, show a small semi-transparent popup with a progress bar "
+                                         "in the top right corner of the monitor the mouse is on. It is drawn by the background service, "
+                                         "so it also appears when this window is closed.", true);
+            tv->Add(telDesc, 0, wxBOTTOM, 8);
+            auto* tr = new wxBoxSizer(wxHORIZONTAL);
+            clipTelCtl_ = new ToggleSwitch(telCard, theme_);
+            clipTelLbl_ = MakeLabel(telCard, "Off", false);
+            tr->Add(clipTelCtl_, 0, wxALIGN_CENTER_VERTICAL | wxRIGHT, 10);
+            tr->Add(clipTelLbl_, 0, wxALIGN_CENTER_VERTICAL);
+            tv->Add(tr, 0);
+            auto* to = new wxBoxSizer(wxVERTICAL);
+            to->Add(tv, 1, wxEXPAND | wxALL, 14);
+            telCard->SetSizer(to);
+            ApplyBackground(telCard, theme_.card);
+        }
+
+        // The cards sit side by side with equal width. Their description texts wrap to the card
         // width, otherwise the long line would force one card wider than the other.
         auto wrapTo = [](wxPanel* card, wxStaticText* lbl) {
             // Wrap() rewrites the label with hard line breaks, so always start again from the original text.
@@ -2939,10 +3124,12 @@ private:
         };
         wrapTo(groupCard, groupDesc);
         wrapTo(clipCard, clipDesc);
+        wrapTo(telCard, telDesc);
 
         auto* row = new wxBoxSizer(wxHORIZONTAL);
         row->Add(groupCard, 1, wxEXPAND | wxRIGHT, 8);         // equal width and equal height
-        row->Add(clipCard, 1, wxEXPAND);
+        row->Add(clipCard, 1, wxEXPAND | wxRIGHT, 8);
+        row->Add(telCard, 1, wxEXPAND);
         root->Add(row, 1, wxALIGN_TOP | wxALL, 10);
         p->SetSizer(root);
         return p;
@@ -3062,7 +3249,8 @@ private:
         r.mic = new FlatCheck(c, theme_, "Share my microphone");
         r.mic->SetToolTip("Forward this PC's microphone to that device as a virtual microphone (it shows up as an input device there)");
         r.clip = new FlatCheck(c, theme_, "Share my clipboard");
-        r.clip->SetToolTip("Send this PC's clipboard (text, or one or more files) to this device when the cursor moves over to it.\n"
+        r.clip->SetToolTip("Send this PC's clipboard (text, or one or more files) to this device as soon as you copy something.\n"
+                           "The newest copy on any PC wins: it replaces the clipboards of the others and cancels transfers that are still running.\n"
                            "It is accepted there if this device may control that PC or shares its clipboard back.\n"
                            "On Linux, text needs xclip, xsel or wl-clipboard; copying files needs xclip or wl-clipboard.");
         r.allow = new FlatCheck(c, theme_, "Allow remote control");
@@ -3129,7 +3317,6 @@ private:
             if (peers_.find(id) == peers_.end()) return;
             if (e.IsChecked() && !snap_.inputCanInject) {      // cannot work: do not even try
                 if (auto it = devRows_.find(id); it != devRows_.end()) it->second.allow->SetValue(false);
-                ShowInputProblem(false);
                 return;
             }
             client_->Send("CONTROL " + std::to_string(id) + (e.IsChecked() ? " 1" : " 0"));
@@ -3202,29 +3389,6 @@ private:
             : wxString::FromUTF8("\xE2\x97\x8F  Password active"));
         groupLbl_->SetForegroundColour(groupPwd_.empty() ? theme_.warn : theme_.ok);
         groupLbl_->Refresh();
-    }
-
-    // ------------------------------------------------------------ input problems
-    // Shown at start when this PC cannot be controlled (or cannot share input at all).
-    void ShowInputProblem(bool atStart)
-    {
-        const bool none = snap_.backend == "none";
-        wxString msg;
-        if (none) msg = "Keyboard and mouse sharing could not start on this PC.\n\n";
-        else      msg = "This PC can control other PCs, but it cannot be controlled.\n\n";
-        if (!snap_.inputNote.empty()) msg += wxString::FromUTF8(snap_.inputNote.c_str()) + "\n\n";
-        msg += "Remote control of this PC is switched off until this works, so the other PC does not "
-               "lose its keyboard and mouse while trying.\n\n";
-#if defined(__WXGTK__)
-        msg += "How to fix it (Linux):\n"
-               "1. Run linux-input-setup.sh (it asks for sudo).\n"
-               "2. Log out and back in.\n\n"
-               "Being in the 'input' group is not enough by itself: the group must be active in this login "
-               "session, the 'uinput' kernel module must be loaded, and /dev/uinput must be writable for the "
-               "group (the script sets up the udev rule).";
-#endif
-        wxMessageBox(msg, atStart ? "Keyboard and mouse sharing" : "Remote control not possible",
-                     wxOK | wxICON_WARNING, this);
     }
 
     // ------------------------------------------------------------ clipboard limit (Settings tab)
@@ -3584,14 +3748,14 @@ private:
         const auto lines = ipc::SerializeSnapshot(s);
         if (lines == snapLines_) return;                // nothing visible changed
         snapLines_ = lines;
-        const bool keyChanged = snap_.pubKey != s.pubKey;
         snap_ = s;
-        if (!inputChecked_) {                           // once per start, with the first real answer from the daemon
-            inputChecked_ = true;
-            if (!s.inputCanInject || s.backend == "none")
-                wxTheApp->CallAfter([this] { ShowInputProblem(true); });
+        UpdateHeader();                                 // pubkey, connection state and input problems
+        UpdateTitle();                                  // the daemon's version arrives with the first snapshot
+        if (daemonWanted_ && connected_ && !mismatchAsked_ && s.version != appver::Full()) {
+            mismatchAsked_ = true;                      // once; a failed restart or a restart that still mismatches asks again
+            const std::string theirs = s.version;
+            wxTheApp->CallAfter([this, theirs] { if (daemonWanted_ && connected_) AskRestartDaemon(theirs); });
         }
-        if (keyChanged) UpdateHeader();
 
         using clock = std::chrono::steady_clock;
         const auto now = clock::now();
@@ -3617,6 +3781,12 @@ private:
         if (!clipInit_ || (s.clipLimit != clipLimit_ && now - clipEdited_ > std::chrono::milliseconds(1500))) {
             ShowClipLimit(s.clipLimit);
             clipInit_ = true;
+        }
+
+        if (now - clipTelEdited_ > std::chrono::milliseconds(1500)) {
+            clipTelOn_ = s.clipTelemetry;
+            clipTelCtl_->SetValue(clipTelOn_);
+            UpdateTelemetryLabel();
         }
 
         inputMode_ = s.inputMode;
@@ -3658,7 +3828,10 @@ private:
             const PeerInfo& p = kv.second;
             if (!p.placed) continue;
             if (!canvas_->HasPeer(kv.first)) canvas_->AddPeerAt(kv.first, p.name, wxString::FromUTF8(p.addr), p.mons, p.ox, p.oy);
-            else if (!canvas_->IsDragging(kv.first) && !recent(lastMove_, kv.first)) canvas_->SetPeerPos(kv.first, p.ox, p.oy);
+            else {
+                canvas_->SetPeerMons(kv.first, p.mons);                    // monitors plugged / unplugged / rotated on that PC
+                if (!canvas_->IsDragging(kv.first) && !recent(lastMove_, kv.first)) canvas_->SetPeerPos(kv.first, p.ox, p.oy);
+            }
         }
         for (int id : canvas_->PeerIds()) {
             auto it = peers_.find(id);
@@ -3771,6 +3944,7 @@ private:
             UpdateHeader();
             StartConnect();
         }
+        if (connected_ && GetLocalMonitors() != lastHintMons_) SendMonitorsHint();     // monitors changed while running
     }
 
     // Closing the window does NOT stop sharing: the daemon keeps running in the background.
@@ -3795,6 +3969,8 @@ private:
     int retry_ = 0;
     int connFails_ = 0;             // consecutive failed attempts to reach the daemon
     bool restartAsked_ = false;     // the restart question was shown (until success or a failed restart)
+    bool unsafeWarned_ = false;     // Windows: the unsafe-install-folder warning was logged
+    bool mismatchAsked_ = false;    // the "versions do not match" question was shown for this service
     std::string lastConnErr_;
     std::map<int, std::chrono::steady_clock::time_point> lastMove_, lastAudio_;
     std::chrono::steady_clock::time_point masterSent_;
@@ -3820,10 +3996,14 @@ private:
     std::map<std::string, OthRow> othRows_;
     wxTextCtrl* groupCtl_ = nullptr;
     wxTextCtrl* clipLimitCtl_ = nullptr;
+    ToggleSwitch* clipTelCtl_ = nullptr;            // Settings: Clipboard telemetry
+    wxStaticText* clipTelLbl_ = nullptr;
+    bool clipTelOn_ = false;
+    std::chrono::steady_clock::time_point clipTelEdited_{};
+    std::vector<wxRect> lastHintMons_;
     DropDown* clipUnit_ = nullptr;
     FlatButton* clipBtn_ = nullptr;
     wxStaticText* clipLbl_ = nullptr;
-    bool inputChecked_ = false;                     // the start-up check for input problems was done
     unsigned long long clipLimit_ = 1ull << 30;     // 1 GiB until the daemon tells us otherwise
     bool clipInit_ = false;
     std::chrono::steady_clock::time_point clipEdited_;

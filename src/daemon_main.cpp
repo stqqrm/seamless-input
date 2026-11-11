@@ -68,7 +68,8 @@ void Usage()
         "  --status               show whether the daemon runs and whether autostart is on\n"
         "  --stop                 ask the running daemon to quit\n"
 #if defined(_WIN32)
-        "  --install-service      install + start the Windows service (administrator)\n"
+        "  --install-service      install + start the Windows service (administrator); the window does this by itself\n"
+        "                         [--auto | --manual | --keep] start type, [--restart] restart it with this exe\n"
         "  --uninstall-service    remove the Windows service (administrator)\n"
         "  --service              (used by the service control manager)\n"
 #endif
@@ -134,15 +135,23 @@ int Status()
 int main(int argc, char** argv)
 {
     bool worker = false;
+    int startMode = 0;              // --install-service: 0 keep, 1 --auto, 2 --manual
+    bool restart = false;           // --install-service --restart
     std::string mode = "--run";
     for (int i = 1; i < argc; ++i) {
         const std::string a = argv[i];
         if (a == "--worker") worker = true;
+        else if (a == "--auto") startMode = 1;
+        else if (a == "--manual") startMode = 2;
+        else if (a == "--keep") startMode = 0;
+        else if (a == "--restart") restart = true;
         else if (a == "--help" || a == "-h") { Usage(); return 0; }
         else if (a == "--version") { std::puts(SI_VERSION); return 0; }
         else mode = a;
     }
 
+    (void)startMode;
+    (void)restart;
     if (mode == "--run") return Run(worker);
     if (mode == "--status") return Status();
     if (mode == "--stop") {
@@ -168,7 +177,7 @@ int main(int argc, char** argv)
     }
 #if defined(_WIN32)
     if (mode == "--service") return svc::RunServiceHost();
-    if (mode == "--install-service") return svc::InstallService();
+    if (mode == "--install-service") return svc::InstallService(startMode, restart);
     if (mode == "--uninstall-service") return svc::UninstallService();
 #endif
     Usage();

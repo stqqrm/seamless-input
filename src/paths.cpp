@@ -19,11 +19,39 @@
 
 namespace paths {
 
+#if defined(_WIN32)
+namespace {
+// The service starts the worker under the SYSTEM account (so it can control elevated windows and the UAC
+// prompt). SYSTEM's own "AppData" is C:\Windows\System32\config\systemprofile: the worker must keep using the
+// logged-in user's folder, which the service hands over through the environment block it builds from the user's
+// token (APPDATA).
+bool RunsAsSystem()
+{
+    HANDLE tok = nullptr;
+    if (!OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &tok)) return false;
+    BYTE buf[128];
+    DWORD need = 0;
+    bool sys = false;
+    if (GetTokenInformation(tok, TokenUser, buf, sizeof buf, &need)) {
+        BYTE sid[SECURITY_MAX_SID_SIZE];
+        DWORD n = sizeof sid;
+        if (CreateWellKnownSid(WinLocalSystemSid, nullptr, sid, &n))
+            sys = EqualSid(reinterpret_cast<TOKEN_USER*>(buf)->User.Sid, sid) != FALSE;
+    }
+    CloseHandle(tok);
+    return sys;
+}
+} // namespace
+#endif
+
 std::filesystem::path DataDir()
 {
 #if defined(_WIN32)
     PWSTR p = nullptr;
     std::filesystem::path base;
+    if (RunsAsSystem()) {
+        if (const wchar_t* ad = _wgetenv(L"APPDATA")) return std::filesystem::path(ad) / "seamless-input";
+    }
     if (SUCCEEDED(SHGetKnownFolderPath(FOLDERID_RoamingAppData, 0, nullptr, &p)) && p) base = p;
     if (p) CoTaskMemFree(p);
     if (base.empty()) {

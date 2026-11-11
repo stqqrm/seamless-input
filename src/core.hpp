@@ -27,6 +27,7 @@
 #include "layout.hpp"
 #include "localinfo.hpp"
 #include "network.hpp"
+#include "overlay.hpp"
 #include "state.hpp"
 
 class Core {
@@ -64,7 +65,10 @@ public:
     void CmdMaster(bool mute, int vol);
     void CmdControl(int id, bool allow);                    // may this PC control ours?
     void CmdClipLimit(std::uint64_t bytes);                 // largest clipboard (text / files) that is copied to another PC
-    void CmdClipboard(int id, bool share);                  // send my clipboard to this PC when the cursor moves over to it
+    void CmdClipboard(int id, bool share);                  // send my clipboard to this PC whenever I copy something
+    void CmdPopupTheme(const std::vector<int>& rgb21);      // the window's palette for the progress popup (7 colours x RGB)
+    void CmdClipTelemetry(bool on);                         // progress popup while the clipboard is uploaded / downloaded
+    bool ClipTelemetryEnabled() const { return clipTelemetry_; }
     void CmdMonitorsHint(const std::vector<InputRect>& mons);
     void CmdClearCache();                                   // forget remembered permissions and the monitor cache
     void CmdRegenKeys();                                    // new identity key pair, then restart the daemon
@@ -82,7 +86,14 @@ private:
     void ScheduleTick();
 
     void LoadMonitors();
+    // This PC's monitors changed (plugged, unplugged, rotated, resolution): follow it everywhere.
+    void ApplyLocalMonitors(const std::vector<InputRect>& mons, const char* source, bool persist);
+    void PollMonitors();                                        // the OS is asked once a second (Windows, X11)
+    void ReplacePeersAfterMonitorChange();
     std::string ScreensLine() const;
+    std::string VerLine() const;                                // version handshake line
+    void OnVersion(int id, const std::string& line);
+    std::string ClipBlocker(const state::Peer& p) const;        // empty: the peer can receive our clipboard
     void StartScan();
 
     // network events (already on the Core thread)
@@ -93,7 +104,15 @@ private:
     void SendControlState(int id);      // tell a peer whether it may control this PC (CTRL line)
 
     // clipboard sharing (Core thread)
-    void OnCursorToPeer(int id);                                   // the cursor moved over to peer 'id'
+    void OnLocalClipboardChanged();                                // the user copied something here: send it to every PC we share with
+    void SaveClipSettings();
+    // The telemetry popup (overlay.hpp) is drawn by this daemon; it is refreshed 10 times a second.
+    void ScheduleTelemetry();
+    void UpdatePopup();
+    // The watcher thread polls the clipboard's change token; changes are posted to the Core thread.
+    void StartClipWatch();
+    void StopClipWatch();
+    void ClipWatchLoop();
 
     // layout + saved configs
     void BroadcastRelative(int movedId);
@@ -150,6 +169,16 @@ private:
     bool canInject_ = true;                       // this PC can be controlled
     std::string inputNote_;                       // why not / what is limited
     std::unique_ptr<ClipShare> clip_;             // clipboard text / files shared with peers
+    bool clipTelemetry_ = false;                  // progress popup on (saved in clipboard.txt)
+    std::unique_ptr<overlay::Popup> popup_;       // created at the first transfer
+    std::unique_ptr<boost::asio::steady_timer> telTimer_;
+    bool popupShown_ = false;
+    bool popupErrorLogged_ = false;
+    std::thread clipWatch_;
+    std::atomic<bool> clipWatchRun_{false};
+    std::atomic<bool> clipWatchActive_{false};    // somebody to share with: poll
+    std::atomic<bool> clipWatchRebase_{false};    // we just wrote the clipboard ourselves: take the new token as the baseline
+    std::vector<InputRect> pendingMons_;          // a monitor change seen once: applied when the next poll agrees
 
     bool masterMute_ = false;
     int masterVol_ = 100;

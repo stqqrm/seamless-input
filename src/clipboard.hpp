@@ -37,6 +37,13 @@ bool SetFiles(const std::vector<std::filesystem::path>& files);
 // Why the last GetFiles / SetFiles call did not work ("" when it did). For the activity log.
 std::string LastNote();
 
+// A value that changes whenever the clipboard content changes (0: unknown / no backend). Used to notice
+// that the user copied something. Safe to call from any thread (the watcher thread polls it).
+//   Windows : GetClipboardSequenceNumber (free, no clipboard access)
+//   Linux   : hash of the offered formats plus the text / file list (runs the clipboard tool, so poll slowly)
+// It also changes when THIS program writes the clipboard; the caller tells those apart by content.
+std::uint64_t ChangeToken();
+
 std::string Base64Encode(const std::string& in);
 bool Base64Decode(const std::string& in, std::string& out);
 

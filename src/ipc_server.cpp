@@ -139,6 +139,12 @@ private:
             c.CmdControl((int)I(1), I(2) != 0);
         } else if (cmd == "CLIPBOARD" && t.size() >= 3) {
             c.CmdClipboard((int)I(1), I(2) != 0);
+        } else if (cmd == "POPUPTHEME" && t.size() >= 22) {
+            std::vector<int> rgb;
+            for (size_t i = 1; i <= 21; ++i) rgb.push_back((int)I(i));
+            c.CmdPopupTheme(rgb);
+        } else if (cmd == "CLIPTELEMETRY" && t.size() >= 2) {
+            c.CmdClipTelemetry(I(1) != 0);
         } else if (cmd == "CLIPLIMIT" && t.size() >= 2) {
             c.CmdClipLimit((std::uint64_t)std::strtoull(t[1].c_str(), nullptr, 10));
         } else if (cmd == "CLEARCACHE") {

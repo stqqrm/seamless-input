@@ -65,6 +65,20 @@ public:
         if (Group* g = Find(id)) { g->ox = ox; g->oy = oy; }
     }
 
+    // The peer's monitors changed (plugged, unplugged, rotated, other resolution): same place, new shape.
+    // Returns false when nothing changed.
+    bool UpdatePeerMons(int id, const std::vector<InputRect>& mons)
+    {
+        Group* g = Find(id);
+        if (!g) return false;
+        Group n = MakeGroup(id, mons);
+        if (n.w == g->w && n.h == g->h && SameRects(n.mons, g->mons)) return false;
+        n.ox = g->ox;
+        n.oy = g->oy;
+        *g = std::move(n);
+        return true;
+    }
+
     // Moves the peer there, but if one of its monitors would land on another monitor it is
     // pushed out to the nearest free edge. Returns the position it really got.
     std::pair<double, double> PlacePeer(int id, double ox, double oy)
@@ -86,6 +100,14 @@ public:
     }
 
 private:
+    static bool SameRects(const std::vector<InputRect>& a, const std::vector<InputRect>& b)
+    {
+        if (a.size() != b.size()) return false;
+        for (size_t i = 0; i < a.size(); ++i)
+            if (a[i].x != b[i].x || a[i].y != b[i].y || a[i].w != b[i].w || a[i].h != b[i].h) return false;
+        return true;
+    }
+
     Group* Find(int id)
     {
         for (auto& g : peers_) if (g.id == id) return &g;
