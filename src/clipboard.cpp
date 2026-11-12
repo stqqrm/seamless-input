@@ -390,6 +390,25 @@ bool Have(const char* tool)
     return std::system(c.c_str()) == 0;
 }
 
+// GNOME's compositor (Mutter) has no protocol that lets a background program read the clipboard. wl-paste
+// then opens a tiny window to get keyboard focus for a moment, EVERY time it runs. The clipboard watcher
+// runs it several times per second, so the focus keeps being taken away from the program you are typing
+// in and keystrokes get lost or land in the wrong place. On such a compositor wl-clipboard must never be
+// used for background polling (the X11 tools talk to XWayland, which Mutter keeps in sync, without focus).
+bool WaylandWithoutDataControl()
+{
+    std::string s;
+    for (const char* name : {"XDG_CURRENT_DESKTOP", "XDG_SESSION_DESKTOP", "DESKTOP_SESSION"}) {
+        const char* d = std::getenv(name);
+        if (d && *d) { s += d; s += ':'; }
+    }
+    std::transform(s.begin(), s.end(), s.begin(), [](unsigned char c) { return (char)std::toupper(c); });
+    if (s.find("GNOME") != std::string::npos) return true;
+    // A user unit started without desktop variables: look at the running compositor instead.
+    return std::system("pgrep -x gnome-shell >/dev/null 2>&1") == 0 ||
+           std::system("pgrep -x mutter >/dev/null 2>&1") == 0;
+}
+
 const Tools& Pick()
 {
     static const Tools t = [] {
@@ -397,7 +416,12 @@ const Tools& Pick()
         std::signal(SIGPIPE, SIG_IGN);      // a tool that exits early must not kill the daemon
         const bool wl = std::getenv("WAYLAND_DISPLAY") != nullptr;
         const bool x  = std::getenv("DISPLAY") != nullptr;
-        if (wl && Have("wl-paste") && Have("wl-copy")) {
+        // SEAMLESS_INPUT_CLIPBOARD_TOOL = wl | xclip | xsel | none  overrides the automatic choice.
+        const char* force = std::getenv("SEAMLESS_INPUT_CLIPBOARD_TOOL");
+        const std::string f = force ? force : "";
+        if (f == "none") return r;
+        const bool wlOk = f == "wl" || (f.empty() && !(wl && WaylandWithoutDataControl()));
+        if (wl && wlOk && Have("wl-paste") && Have("wl-copy")) {
             r.name = "wl-clipboard";
             r.get = "timeout 2 wl-paste --no-newline --type text/plain 2>/dev/null";
             r.set = "timeout 3 wl-copy 2>/dev/null";
@@ -407,7 +431,7 @@ const Tools& Pick()
             r.readGnome = "timeout 5 wl-paste --no-newline --type x-special/gnome-copied-files 2>/dev/null";
             r.writeUri = "timeout 5 wl-copy --type text/uri-list 2>/dev/null";
             r.writeGnome = "timeout 5 wl-copy --type x-special/gnome-copied-files 2>/dev/null";
-        } else if ((x || wl) && Have("xclip")) {
+        } else if ((x || wl) && (f.empty() || f == "xclip") && Have("xclip")) {
             r.name = "xclip";
             r.get = "timeout 2 xclip -selection clipboard -o 2>/dev/null";
             r.set = "timeout 3 xclip -selection clipboard -i 2>/dev/null";
@@ -417,7 +441,7 @@ const Tools& Pick()
             r.readGnome = "timeout 5 xclip -selection clipboard -t x-special/gnome-copied-files -o 2>/dev/null";
             r.writeUri = "timeout 5 xclip -selection clipboard -t text/uri-list -i 2>/dev/null";
             r.writeGnome = "timeout 5 xclip -selection clipboard -t x-special/gnome-copied-files -i 2>/dev/null";
-        } else if ((x || wl) && Have("xsel")) {
+        } else if ((x || wl) && (f.empty() || f == "xsel") && Have("xsel")) {
             r.name = "xsel";                // text only: xsel cannot choose the clipboard target
             r.get = "timeout 2 xsel --clipboard --output 2>/dev/null";
             r.set = "timeout 3 xsel --clipboard --input 2>/dev/null";
