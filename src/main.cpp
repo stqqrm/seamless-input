@@ -38,6 +38,7 @@
 #include <vector>
 
 #include "audio.hpp"
+#include "inputudp.hpp"
 #include "config.hpp"
 #include "identity.hpp"
 #include "input/input.hpp"
@@ -2554,10 +2555,10 @@ private:
                           : !daemonWanted_ ? "stopped"
                           : connecting_ ? "starting..." : "not connected";
         wxString line = wxString::Format(
-            "IP %s   |   Key %s   |   TCP %d   UDP %d (discovery)   UDP %d (audio)   |   Background service: %s",
+            "IP %s   |   Key %s   |   TCP %d   UDP %d (discovery)   UDP %d (audio)   UDP %d (mouse)   |   Background service: %s",
             ips.empty() ? wxString("-") : ips,
             snap_.pubKey.empty() ? wxString("-") : wxString::FromUTF8(Identity::Fingerprint(snap_.pubKey)),
-            (int)kTcpPort, (int)kDiscoveryPort, (int)kAudioPort, svcState);
+            (int)kTcpPort, (int)kDiscoveryPort, (int)kAudioPort, (int)kInputUdpPort, svcState);
         // Only a finished start-up that failed counts: while the daemon is still starting the backend is empty.
         const bool inputBad = connected_ && (snap_.backend == "none" || !snap_.inputCanInject);
         if (inputBad) line += "   |   This PC cannot be controlled (see the activity log)";

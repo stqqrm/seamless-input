@@ -1,4 +1,8 @@
 #pragma once
+#include <cstdint>
+#include <functional>
+
+#include "input/motion.hpp"
 #include <functional>
 #include <memory>
 #include <string>
@@ -72,6 +76,14 @@ public:
     void SetPeerAllowed(int id, bool allowed);     // may this peer control THIS PC?
     void SetPeerAccepts(int id, bool accepts);     // does this peer let THIS PC control it? (its CTRL line)
     void SetPeerRate(int id, int hz);              // keyboard/mouse updates per second sent to this peer (10..1000)
+
+    // Hybrid transport: pointer motion and wheel can travel over UDP (see motion.hpp). 'send' puts one datagram on
+    // the wire (false: not sent), 'usable' says whether UDP currently works towards that peer; while it does not,
+    // everything goes over TCP as before. Set before Start(). Datagrams that arrive are handed to HandleMotion().
+    using UdpSendFn = std::function<bool(int peer, std::uint64_t seq, const MotionPacket&)>;
+    using UdpUsableFn = std::function<bool(int peer)>;
+    void SetUdp(UdpSendFn send, UdpUsableFn usable);
+    void HandleMotion(int id, std::uint64_t seq, const MotionPacket& m);
     void RemovePeer(int id);
 
     // Returns true if the line belonged to the input protocol. Call from the network thread.

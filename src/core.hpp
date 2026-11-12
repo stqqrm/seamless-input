@@ -20,6 +20,7 @@
 #include <boost/asio.hpp>
 
 #include "audio.hpp"
+#include "inputudp.hpp"
 #include "clipshare.hpp"
 #include "config.hpp"
 #include "identity.hpp"
@@ -156,6 +157,7 @@ private:
 
     std::unique_ptr<Network> net_;
     std::unique_ptr<AudioEngine> audio_;
+    std::unique_ptr<InputUdp> inUdp_;       // pointer motion and wheel over UDP (the rest of the input stays on TCP)
     std::unique_ptr<InputEngine> input_;
     layout::Model layout_;
 

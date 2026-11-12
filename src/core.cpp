@@ -117,6 +117,7 @@ bool Core::Start(std::string* err)
     };
     cb.onPeerLost = [this](int id) {
         if (input_) input_->RemovePeer(id);     // hand input back immediately
+        if (inUdp_) inUdp_->RemovePeer(id);
         Post([this, id] { OnPeerLost(id); });
     };
     cb.onMessage = [this](int id, const std::string& line) {
@@ -166,6 +167,19 @@ bool Core::Start(std::string* err)
         [this](int id, const std::string& line) { net_->Send(id, line); },
         [this](const std::string& msg) { Post([this, msg] { Log("Input: " + msg); }); });
     input_->SetLocalMonitors(mons_);
+    {
+        // Pointer motion and wheel go over UDP when it works between two PCs, everything else over TCP. If UDP
+        // cannot be used (port taken, blocked by a firewall) all input simply stays on TCP.
+        inUdp_ = std::make_unique<InputUdp>(net_->Instance());
+        inUdp_->onMotion = [this](int id, std::uint64_t seq, const MotionPacket& m) {
+            if (input_) input_->HandleMotion(id, seq, m);
+        };
+        std::string ue;
+        if (inUdp_->Start(&ue)) PostLog("Mouse over UDP ready (UDP " + std::to_string((int)kInputUdpPort) + "), TCP is the fallback");
+        else                    PostLog("Mouse over UDP unavailable, using TCP: " + ue);
+        input_->SetUdp([this](int id, std::uint64_t seq, const MotionPacket& m) { return inUdp_ && inUdp_->Send(id, seq, m); },
+                       [this](int id) { return inUdp_ && inUdp_->Usable(id); });
+    }
     input_->onModeChange = [this](InputEngine::Mode m, int id) {
         Post([this, m, id] { inputMode_ = m; inputPeer_ = id; Changed(); });
     };
@@ -235,6 +249,7 @@ void Core::Stop()
         done->get_future().wait_for(std::chrono::seconds(3));
     }
     if (input_) input_->Stop();   // return the keyboard/mouse before anything else shuts down
+    if (inUdp_) inUdp_->Stop();   // after the engine: its sender thread calls into it
     if (audio_) audio_->Stop();
     if (net_) net_->Stop();       // joins the asio thread: no more callbacks after this
 
@@ -633,6 +648,7 @@ void Core::OnPeerReady(int id, std::uint32_t inst, const std::string& key, const
     Log("Connection established with " + name + " (" + addr + "), key " + Identity::Fingerprint(key) + " verified");
     audio_->AddPeer(inst, addr);
     audio_->SetPeerKeys(inst, audioKeys.tx, audioKeys.rx);      // no keys, no audio in either direction
+    if (inUdp_) inUdp_->AddPeer(id, inst, addr, audioKeys.tx, audioKeys.rx);   // mouse over UDP: keys derived from these
     if (!audio_->VirtualMicActive()) {      // microphones of other PCs come out as an input device of this PC
         std::string info;
         if (audio_->EnableVirtualMic(&info)) Log("Microphones shared by other PCs appear as the input device \"" + info + "\"");

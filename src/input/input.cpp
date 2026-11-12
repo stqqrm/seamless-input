@@ -1,10 +1,12 @@
 #include "input/input.hpp"
 
 #include <algorithm>
+#include <array>
 #include <chrono>
 #include <climits>
 #include <cmath>
 #include <condition_variable>
+#include <cstdint>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -48,6 +50,7 @@ constexpr int kDefaultRateHz = 250;
 constexpr int kMinRateHz     = 10;
 constexpr int kMaxRateHz     = 1000;
 constexpr size_t kMaxQueue   = 256;     // per peer; when exceeded the OLDEST motion/wheel entries are dropped first
+constexpr auto kRxWait       = std::chrono::milliseconds(250);  // longest a datagram waits for the key/button events before it (TCP cannot lose them, only delay)
 
 std::unique_ptr<InputBackend> CreateBackend(std::string* why)
 {
@@ -88,7 +91,20 @@ struct InputEngine::Impl {
         bool holdLogged = false;       // already logged that we are waiting for it
     };
     struct Crossing { int peer = -1; int x = 0, y = 0; };
-    struct Out { int peer = 0; InputEvent ev; std::string raw; bool isRaw = false; };
+    struct Out {
+        int peer = 0;
+        InputEvent ev;
+        std::string raw;
+        bool isRaw = false;
+        // hybrid transport
+        bool isFlush = false;               // not a line: a UDP datagram with these running totals
+        std::uint64_t seq = 0;
+        MotionPacket snap;
+        bool sync = false;                  // key/button line that carries its place in the UDP stream
+        unsigned epoch = 0, k = 0;
+        unsigned long long need = 0;        // sequence number of the newest datagram whose totals are included below
+        std::array<std::int32_t, 4> tot{};  // the exact motion totals at the moment of the event
+    };
 
     Impl(InputEngine* s, SendFn sf, LogFn lf) : self(s), send(std::move(sf)), log(std::move(lf)) {}
 
@@ -116,38 +132,177 @@ struct InputEngine::Impl {
     Clock::time_point lastSwitch{};
     std::string lastErr;
 
+    // ---- hybrid transport, receiving side (mu held). Pointer motion arrives as UDP datagrams with running
+    // totals, keys and buttons as TCP lines. A key/button line carries the exact totals of the moment it happened:
+    // before it is applied the pointer is brought to exactly there, so a click lands where it was aimed even if
+    // datagrams were lost or are late (those are then ignored, their totals are older). The other way round a
+    // datagram says how many key/button events must be applied before it ('tcpCount'): motion that happened
+    // after Ctrl went down is not applied before Ctrl. Waiting for TCP is safe: TCP loses nothing, it only delays.
+    struct RxPkt { std::uint64_t seq; MotionPacket p; Clock::time_point t; };
+    struct Rx {
+        bool have = false;                  // an EPOCH line has been seen
+        std::uint16_t epoch = 0;
+        std::uint32_t tcpApplied = 0;       // key/button events of this epoch applied so far
+        std::uint64_t udpApplied = 0;       // newest datagram sequence number whose totals are applied
+        std::array<std::int32_t, 4> base{}; // the totals applied so far
+        std::deque<RxPkt> pend;             // datagrams not applied yet (waiting for key/button events), by sequence number
+    };
+    std::map<int, Rx> rx;
+    std::condition_variable rxcv;
+    bool rxStop = false;
+    std::thread rxThread;
+
+    // Moves the pointer / wheel by what the totals in 'p' add to 'base' (and brings 'base' up to date).
+    void ApplyTotalsLocked(int id, std::array<std::int32_t, 4>& base, const std::int32_t cur[4])
+    {
+        std::int32_t d[4];
+        for (int i = 0; i < 4; ++i) {
+            d[i] = (std::int32_t)((std::uint32_t)cur[i] - (std::uint32_t)base[i]);
+            base[i] = cur[i];
+        }
+        if (d[0] || d[1]) DispatchLocked(id, 'M', d[0], d[1]);
+        if (d[2] || d[3]) DispatchLocked(id, 'W', d[2], d[3]);
+    }
+
+    // Exact totals from a TCP line (key/button, EPOCH): newer than anything applied from datagrams, so apply them
+    // and forget the datagrams they make obsolete.
+    void SyncTotalsLocked(int id, Rx& r, std::uint64_t need, const std::int32_t cur[4])
+    {
+        if (need <= r.udpApplied) return;           // the datagrams already brought it there
+        ApplyTotalsLocked(id, r.base, cur);
+        r.udpApplied = need;
+        while (!r.pend.empty() && r.pend.front().seq <= need) r.pend.pop_front();
+    }
+
+    void RxPumpLocked(int id, Rx& r)
+    {
+        const auto now = Clock::now();
+        while (!r.pend.empty()) {
+            const RxPkt& k = r.pend.front();
+            if (k.p.tcpCount > r.tcpApplied && now - k.t <= kRxWait) break;
+            const std::int32_t cur[4] = {k.p.mx, k.p.my, k.p.wx, k.p.wy};
+            r.udpApplied = k.seq;
+            ApplyTotalsLocked(id, r.base, cur);
+            r.pend.pop_front();
+        }
+    }
+
+    void RxLoop()
+    {
+        std::unique_lock<std::mutex> lk(mu);
+        while (!rxStop) {
+            bool any = false;
+            for (auto& kv : rx) if (!kv.second.pend.empty()) any = true;
+            if (any) rxcv.wait_for(lk, std::chrono::milliseconds(20));
+            else     rxcv.wait(lk);
+            if (rxStop) break;
+            for (auto& kv : rx) RxPumpLocked(kv.first, kv.second);
+        }
+    }
+
     // ---- outgoing queues, one per peer (keeps hook callbacks fast and coalesces mouse motion)
     struct PeerQ {
         std::deque<Out> q;
         Clock::time_point next{};       // earliest time the next paced batch may go out
         bool urgent = false;            // a click / key / control line is queued: do not wait for the tick
         int hz = kDefaultRateHz;
+        // ---- hybrid transport. While 'udp' is set, pointer motion and wheel are not queued: they add up in
+        // 'tot' and the sender thread sends the totals as a UDP datagram at every tick. Keys and buttons stay in
+        // the queue (TCP); a datagram with the totals up to that moment is put in front of each of them, and the
+        // line says which datagram it follows, so a click lands where it was aimed (see MotionPacket).
+        bool udp = false;
+        std::uint16_t epoch = 0;                    // restarts the totals: a new control session, or a switch of transport
+        std::array<std::int32_t, 4> tot{}, sentTot{};   // running totals: pointer x y, wheel x y
+        std::uint32_t ordCount = 0;                 // key/button lines queued in this epoch
+        std::uint64_t seq = 0;                      // last datagram sequence number (grows for the whole connection)
+        std::uint64_t epochFirstSeq = 1;
+        int repeatLeft = 0;                         // copies of the last totals still to send once the motion has stopped
+        Clock::time_point repeatAt{};
     };
     std::mutex qmu;
     std::condition_variable qcv;
     std::map<int, PeerQ> pq;
     bool qstop = false;
     std::thread sender;
+    UdpSendFn udpSend;                  // set before Start()
+    UdpUsableFn udpUsable;
+
+    static void AddWrap(std::int32_t& t, int d) { t = (std::int32_t)((std::uint32_t)t + (std::uint32_t)d); }
+
+    // qmu held. A datagram with the totals as they are now. UDP can lose it, and when the motion stops nothing
+    // would ever make up for that: so after the last one, the same totals are sent again shortly after
+    // (twice, see the sender loop). A datagram that adds nothing is harmless to the receiver.
+    Out MakeFlushLocked(int peer, PeerQ& p, bool repeat = false)
+    {
+        if (repeat) --p.repeatLeft;
+        else        p.repeatLeft = 2;
+        p.repeatAt = Clock::now() + std::chrono::milliseconds(repeat ? 60 : 25);
+        Out f;
+        f.peer = peer;
+        f.isFlush = true;
+        f.seq = ++p.seq;
+        f.snap.epoch = p.epoch;
+        f.snap.tcpCount = p.ordCount;
+        f.snap.mx = p.tot[0]; f.snap.my = p.tot[1]; f.snap.wx = p.tot[2]; f.snap.wy = p.tot[3];
+        p.sentTot = p.tot;
+        return f;
+    }
+
+    // qmu held. Starts a new epoch (totals from zero) and tells the peer, on TCP, in order with everything else.
+    // 'carry': the old epoch used UDP, so the line also carries its final totals: whatever datagram was lost or
+    // is still on its way, the peer ends up exactly where we are (a switch from UDP to TCP).
+    void NewEpochLocked(int peer, PeerQ& p, bool carry)
+    {
+        std::string line;
+        if (carry && p.udp) {
+            line = " " + std::to_string(p.tot[0]) + " " + std::to_string(p.tot[1]) + " " + std::to_string(p.tot[2]) + " " +
+                   std::to_string(p.tot[3]) + " " + std::to_string((unsigned long long)++p.seq);
+        }
+        p.udp = udpSend && udpUsable && udpUsable(peer);
+        ++p.epoch;
+        p.tot.fill(0);
+        p.sentTot.fill(0);
+        p.ordCount = 0;
+        p.epochFirstSeq = p.seq + 1;
+        p.repeatLeft = 0;
+        Out o; o.peer = peer; o.isRaw = true; o.raw = "EPOCH " + std::to_string((unsigned)p.epoch) + line;
+        p.q.push_back(std::move(o));
+        p.urgent = true;
+    }
 
     // ----------------------------------------------------------------- sender
     void Push(int peer, const InputEvent& ev)
     {
         std::lock_guard<std::mutex> lk(qmu);
         PeerQ& p = pq[peer];
+        if ((udpSend && udpUsable && udpUsable(peer)) != p.udp) NewEpochLocked(peer, p, true);
         const bool motion = ev.kind == InputKind::Move || ev.kind == InputKind::Wheel;
+        Out o; o.peer = peer; o.ev = ev;
+        if (motion && p.udp) {
+            if (ev.kind == InputKind::Move) { AddWrap(p.tot[0], ev.a); AddWrap(p.tot[1], ev.b); }
+            else                            { AddWrap(p.tot[2], ev.a); AddWrap(p.tot[3], ev.b); }
+            qcv.notify_one();               // the sender thread sends the totals at the next tick
+            return;
+        }
         if (motion) {
             // Merge into the newest queued entry of the same kind, as long as nothing order-sensitive (a button,
             // a key, a control line) was queued after it. Moves and wheel ticks may pass each other: within
             // one tick that makes no difference.
             for (auto it = p.q.rbegin(); it != p.q.rend(); ++it) {
-                if (it->isRaw) break;
+                if (it->isRaw || it->isFlush) break;
                 if (it->ev.kind == ev.kind) { it->ev.a += ev.a; it->ev.b += ev.b; return; }
                 if (it->ev.kind != InputKind::Move && it->ev.kind != InputKind::Wheel) break;
             }
         } else {
             p.urgent = true;                // click / key: goes out now, after the motion queued before it
+            if (p.udp) {                    // its place in the UDP stream, and the exact totals at this moment
+                o.sync = true;
+                o.epoch = p.epoch;
+                o.k = ++p.ordCount;
+                o.need = ++p.seq;           // a stamp in the datagram sequence: older datagrams carry older totals
+                o.tot = p.tot;
+            }
         }
-        Out o; o.peer = peer; o.ev = ev;
         p.q.push_back(std::move(o));
         TrimLocked(p);
         qcv.notify_one();
@@ -157,9 +312,11 @@ struct InputEngine::Impl {
     {
         std::lock_guard<std::mutex> lk(qmu);
         PeerQ& p = pq[peer];
+        const bool enter = line.compare(0, 6, "ENTER ") == 0;
         Out o; o.peer = peer; o.raw = std::move(line); o.isRaw = true;
         p.q.push_back(std::move(o));
         p.urgent = true;
+        if (enter) NewEpochLocked(peer, p, false);      // every control session starts a fresh set of totals
         TrimLocked(p);
         qcv.notify_one();
     }
@@ -169,7 +326,7 @@ struct InputEngine::Impl {
     {
         while (p.q.size() > kMaxQueue) {
             auto it = std::find_if(p.q.begin(), p.q.end(), [](const Out& o) {
-                return !o.isRaw && (o.ev.kind == InputKind::Move || o.ev.kind == InputKind::Wheel);
+                return !o.isRaw && !o.isFlush && (o.ev.kind == InputKind::Move || o.ev.kind == InputKind::Wheel);
             });
             if (it == p.q.end()) break;
             p.q.erase(it);
@@ -179,12 +336,18 @@ struct InputEngine::Impl {
     static std::string Format(const Out& o)
     {
         if (o.isRaw) return o.raw;
-        char b[64];
+        char b[160];
         switch (o.ev.kind) {
         case InputKind::Move:   std::snprintf(b, sizeof b, "M %d %d", o.ev.a, o.ev.b); break;
-        case InputKind::Button: std::snprintf(b, sizeof b, "B %d %d", o.ev.a, o.ev.b); break;
         case InputKind::Wheel:  std::snprintf(b, sizeof b, "W %d %d", o.ev.a, o.ev.b); break;
-        case InputKind::Key:    std::snprintf(b, sizeof b, "K %d %d", o.ev.a, o.ev.b); break;
+        case InputKind::Button:
+        case InputKind::Key: {
+            const char c = o.ev.kind == InputKind::Button ? 'B' : 'K';
+            if (o.sync) std::snprintf(b, sizeof b, "%c %d %d %u %u %llu %d %d %d %d", c, o.ev.a, o.ev.b, o.epoch, o.k, o.need,
+                                      o.tot[0], o.tot[1], o.tot[2], o.tot[3]);
+            else        std::snprintf(b, sizeof b, "%c %d %d", c, o.ev.a, o.ev.b);
+            break;
+        }
         }
         return b;
     }
@@ -198,21 +361,32 @@ struct InputEngine::Impl {
             bool any = false;
             const auto now = Clock::now();
             for (auto& [id, p] : pq) {
-                if (p.q.empty()) continue;
+                const bool dirty = p.udp && p.tot != p.sentTot;     // motion waiting to go out as a datagram
+                const bool repeating = p.udp && !dirty && p.repeatLeft > 0;
+                if (p.q.empty() && !dirty && !repeating) continue;
                 any = true;
-                if (qstop || p.urgent || now >= p.next) {       // on stop everything left (RELEASE / DENY) goes out
+                if (p.q.empty() && !dirty && now < p.repeatAt) {    // only a repeat is pending, and not yet
+                    wake = std::min(wake, p.repeatAt);
+                    continue;
+                }
+                if (qstop || p.urgent || now >= p.next) {           // on stop everything left (RELEASE / DENY) goes out
                     ready.emplace_back(id, std::deque<Out>());
                     ready.back().second.swap(p.q);
+                    if (p.udp && p.tot != p.sentTot) ready.back().second.push_back(MakeFlushLocked(id, p));
+                    else if (repeating && now >= p.repeatAt) ready.back().second.push_back(MakeFlushLocked(id, p, true));
                     p.urgent = false;
                     p.next = now + std::chrono::microseconds(1000000 / std::clamp(p.hz, kMinRateHz, kMaxRateHz));
                 } else {
-                    wake = std::min(wake, p.next);              // motion that arrives until then is merged in Push()
+                    wake = std::min(wake, p.next);                  // motion that arrives until then is merged
                 }
             }
             if (!ready.empty()) {
                 lk.unlock();
                 for (auto& [id, batch] : ready)
-                    for (const auto& o : batch) send(id, Format(o));
+                    for (const auto& o : batch) {
+                        if (o.isFlush) { if (udpSend) udpSend(id, o.seq, o.snap); }
+                        else send(id, Format(o));
+                    }
                 lk.lock();
                 continue;
             }
@@ -590,6 +764,8 @@ bool InputEngine::Start(std::string* msg)
 
     d_->qstop = false;
     d_->sender = std::thread([this] { d_->SenderLoop(); });
+    d_->rxStop = false;
+    d_->rxThread = std::thread([this] { d_->RxLoop(); });
     std::lock_guard<std::mutex> lk(d_->mu);
     d_->started = true;
     return true;
@@ -611,6 +787,12 @@ void InputEngine::Stop()
     }
     d_->qcv.notify_all();
     if (d_->sender.joinable()) d_->sender.join();
+    {
+        std::lock_guard<std::mutex> lk(d_->mu);
+        d_->rxStop = true;
+    }
+    d_->rxcv.notify_all();
+    if (d_->rxThread.joinable()) d_->rxThread.join();
     d_->be.reset();
 }
 
@@ -668,6 +850,29 @@ void InputEngine::SetPeerAccepts(int id, bool accepts)
         d_->StopForwardingLocked(false, -1, -1);
 }
 
+void InputEngine::SetUdp(UdpSendFn send, UdpUsableFn usable)
+{
+    std::lock_guard<std::mutex> lk(d_->qmu);
+    d_->udpSend = std::move(send);
+    d_->udpUsable = std::move(usable);
+}
+
+void InputEngine::HandleMotion(int id, std::uint64_t seq, const MotionPacket& m)
+{
+    std::lock_guard<std::mutex> lk(d_->mu);
+    if (!d_->started || d_->mode != Mode::Controlled || d_->peerId != id) return;
+    auto it = d_->rx.find(id);
+    if (it == d_->rx.end() || !it->second.have) return;     // before its EPOCH line a datagram means nothing
+    auto& r = it->second;
+    if (m.epoch != r.epoch) return;                          // an epoch that is over: its totals were handed over by TCP
+    if (seq <= r.udpApplied) return;                         // applied already (or older than what was)
+    auto pos = std::find_if(r.pend.begin(), r.pend.end(), [seq](const Impl::RxPkt& k) { return k.seq >= seq; });
+    if (pos != r.pend.end() && pos->seq == seq) return;      // duplicate
+    r.pend.insert(pos, Impl::RxPkt{seq, m, Clock::now()});   // datagrams may overtake each other: keep them in order
+    d_->RxPumpLocked(id, r);
+    if (!r.pend.empty()) d_->rxcv.notify_all();
+}
+
 void InputEngine::SetPeerRate(int id, int hz)
 {
     std::lock_guard<std::mutex> lk(d_->qmu);
@@ -682,6 +887,7 @@ void InputEngine::RemovePeer(int id)
     }
     std::lock_guard<std::mutex> lk(d_->mu);
     d_->peers.erase(id);
+    d_->rx.erase(id);
     if (!d_->be || d_->peerId != id) return;
     if (d_->mode == Mode::Forwarding)      d_->StopForwardingLocked(false, -1, -1);
     else if (d_->mode == Mode::Controlled) d_->StopControlledLocked(false);
@@ -695,9 +901,42 @@ bool InputEngine::HandleMessage(int id, const std::string& line)
 
     // ---- hot path: events from the controller
     if ((s[0] == 'M' || s[0] == 'B' || s[0] == 'W' || s[0] == 'K') && s[1] == ' ') {
-        if (std::sscanf(s + 2, "%d %d", &a, &b) != 2) return true;
+        unsigned ep = 0, k = 0;
+        unsigned long long need = 0;
+        std::int32_t tot[4] = {0, 0, 0, 0};
+        const int n = std::sscanf(s + 2, "%d %d %u %u %llu %d %d %d %d", &a, &b, &ep, &k, &need, &tot[0], &tot[1], &tot[2], &tot[3]);
+        if (n < 2) return true;
         std::lock_guard<std::mutex> lk(d_->mu);
-        if (d_->started) d_->DispatchLocked(id, s[0], a, b);
+        if (!d_->started) return true;
+        if ((s[0] == 'B' || s[0] == 'K') && n == 9) {
+            // With UDP motion the line says where the pointer is at this moment: bring it there first.
+            auto it = d_->rx.find(id);
+            if (it != d_->rx.end() && it->second.have && it->second.epoch == (std::uint16_t)ep) {
+                auto& r = it->second;
+                d_->SyncTotalsLocked(id, r, need, tot);
+                d_->DispatchLocked(id, s[0], a, b);
+                if (k > r.tcpApplied) r.tcpApplied = k;
+                d_->RxPumpLocked(id, r);            // datagrams that were waiting for this event
+                if (!r.pend.empty()) d_->rxcv.notify_all();
+                return true;
+            }
+        }
+        d_->DispatchLocked(id, s[0], a, b);
+        return true;
+    }
+
+    if (line.rfind("EPOCH ", 0) == 0) {         // totals restart: a new control session, or a switch UDP <-> TCP
+        unsigned e = 0;
+        unsigned long long need = 0;
+        std::int32_t tot[4] = {0, 0, 0, 0};
+        const int n = std::sscanf(s + 6, "%u %d %d %d %d %llu", &e, &tot[0], &tot[1], &tot[2], &tot[3], &need);
+        if (n < 1) return true;
+        std::lock_guard<std::mutex> lk(d_->mu);
+        auto& r = d_->rx[id];
+        if (r.have && n == 6) d_->SyncTotalsLocked(id, r, need, tot);    // the old epoch's final totals
+        r = Impl::Rx{};
+        r.have = true;
+        r.epoch = (std::uint16_t)e;
         return true;
     }
 
@@ -725,6 +964,7 @@ bool InputEngine::HandleMessage(int id, const std::string& line)
         inputgeom::ClampToAny(d_->mons, d_->cx, d_->cy);
         d_->mode = Mode::Controlled;
         d_->peerId = id;
+        d_->rx.erase(id);                   // UDP state of an earlier session; the EPOCH line that follows starts a new one
         d_->lastSwitch = Clock::now();
         d_->be->InjectMoveTo(d_->cx, d_->cy);
         d_->Notify();

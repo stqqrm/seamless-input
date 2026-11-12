@@ -108,3 +108,20 @@ clipboard sharing off. Built without CMake the id is `dev`.
 The daemon re-reads the monitors once a second (Windows, X11; the window reports them on Wayland). A change
 (plug, unplug, rotate, resolution) seen twice in a row updates the layout, restarts the input edges, and is
 sent to the other PCs without reconnecting; PCs that now overlap a new monitor are pushed aside.
+
+
+## Mouse over UDP
+
+Pointer movement and scrolling travel over **UDP port 45457**, everything else (keys, clicks, control) stays on TCP.
+Both PCs must allow incoming UDP on that port (Windows Firewall asks the first time). If UDP does not work between two
+PCs (blocked, NAT, an older version on the other side) the program notices within a second and sends everything over
+TCP, and switches back by itself when UDP works again.
+
+* Movement and scrolling are sent as running totals, so a lost datagram costs nothing: the next one makes up for it.
+* A key or click carries the exact totals of its moment, so it always lands where it was aimed, and Ctrl is never
+  applied after the scroll that belongs to it.
+* The datagrams are sealed with XChaCha20-Poly1305 with keys derived from the TCP handshake of the same connection
+  (never equal to the TCP or audio keys), the sequence number is the nonce, replays are dropped.
+* The send rate of the *Input updates* slider (Devices tab) applies to this stream as well.
+
+`tests/` has a simulation of the whole transport (loss, jitter, switching UDP <-> TCP) and a test of the UDP layer.
